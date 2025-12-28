@@ -31,6 +31,9 @@ enum {
     kCallLoadRegisters = 30,
     kCallStoreRegisters = 31,
 
+    kCallFutexWait = 40,
+    kCallFutexWake = 41,
+
     kCallCreateThread = 50,
     kCallQueryThreadStats = 51,
     kCallYield = 52,
@@ -38,7 +41,7 @@ enum {
     kCallKillThread = 54,
     kCallInterruptThread = 55,
 
-    kCallCreateQueue = 60,
+    kCallCreateStream = 60,
 
     kCallSubmitDescriptor = 70,
 
@@ -115,6 +118,16 @@ enum {
     kThisThread = -2,
 };
 
+enum {
+    kActionDismiss,
+    kActionOffer,
+    kActionAccept,
+    kActionSendFromBuffer,
+    kActionRecvToBuffer,
+    kActionPushDescriptor,
+    kActionPullDescriptor,
+};
+
 typedef struct k_action {
     int type;
     uint32_t flags;
@@ -129,3 +142,5 @@ typedef struct k_queue_parameters {
     unsigned int num_chunks;
     size_t chunk_size;
 } k_queue_parameters_t;
+
+#define KCALL_SUBMIT_NO_RECEIVING (1UL << 0)

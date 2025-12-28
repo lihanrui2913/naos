@@ -177,14 +177,24 @@ static inline k_error_t kReadGsBase(void **pointer) {
     return (k_error_t)syscall(kCallBase + kCallReadGsBase, pointer);
 };
 
-static inline k_error_t kCreateQueue(const k_queue_parameters_t *params,
-                                     handle_id_t *handle_out) {
-    return (k_error_t)syscall(kCallBase + kCallCreateQueue, params, handle_out);
+static inline k_error_t kFutexWait(int *pointer, int except, int64_t deadline) {
+    return (k_error_t)syscall(kCallBase + kCallFutexWait, pointer, except,
+                              deadline);
 }
 
-static inline k_error_t
-kSubmitDescriptor(handle_id_t handle, const k_action_t *action, size_t count,
-                  handle_id_t queue_handle, uintptr_t context, uint32_t flags) {
-    return (k_error_t)syscall(kCallBase + kCallSubmitDescriptor, handle, action,
-                              count, queue_handle, context, flags);
+static inline k_error_t kFutexWake(int *pointer, int count) {
+    return (k_error_t)syscall(kCallBase + kCallFutexWake, pointer, count);
+}
+
+static inline k_error_t kCreateStream(handle_id_t *handle_out1,
+                                      handle_id_t *handle_out2) {
+    return (k_error_t)syscall(kCallBase + kCallCreateStream, handle_out1,
+                              handle_out2);
+}
+
+static inline k_error_t kSubmitDescriptor(handle_id_t lane_handle_id,
+                                          k_action_t *action, size_t count,
+                                          uint32_t flags) {
+    return (k_error_t)syscall(kCallBase + kCallSubmitDescriptor, lane_handle_id,
+                              action, count, flags);
 }

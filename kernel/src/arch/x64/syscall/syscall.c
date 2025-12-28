@@ -53,10 +53,14 @@ void syscall_handler_init() {
         (syscall_handle_t)kCallGetRandomBytesImpl;
     kcall_handlers[kCallGetClock] = (syscall_handle_t)kCallGetClockImpl;
     kcall_handlers[kCallCreateUniverse] = (syscall_handle_t)kCreateUniverseImpl;
+    kcall_handlers[kCallTransferDescriptor] =
+        (syscall_handle_t)kTransferDescriptorImpl;
     kcall_handlers[kCallGetDescriptorInfo] =
         (syscall_handle_t)kGetDescriptorInfoImpl;
     kcall_handlers[kCallCloseDescriptor] =
         (syscall_handle_t)kCloseDescriptorImpl;
+    kcall_handlers[kCallFutexWait] = (syscall_handle_t)kFutexWaitImpl;
+    kcall_handlers[kCallFutexWake] = (syscall_handle_t)kFutexWakeImpl;
     kcall_handlers[kCallAllocateMemory] = (syscall_handle_t)kAllocateMemoryImpl;
     kcall_handlers[kCallResizeMemory] = (syscall_handle_t)kResizeMemoryImpl;
     kcall_handlers[kCallGetMemoryInfo] = (syscall_handle_t)kGetMemoryInfoImpl;
@@ -64,7 +68,10 @@ void syscall_handler_init() {
     kcall_handlers[kCallMapMemory] = (syscall_handle_t)kMapMemoryImpl;
     kcall_handlers[kCallCreatePhysicalMemory] =
         (syscall_handle_t)kCreatePhysicalMemoryImpl;
+    kcall_handlers[kCallCreateStream] = (syscall_handle_t)kCreateStreamImpl;
     kcall_handlers[kCallCreateThread] = (syscall_handle_t)kCreateThreadImpl;
+    kcall_handlers[kCallSubmitDescriptor] =
+        (syscall_handle_t)kSubmitDescriptorImpl;
 }
 
 spinlock_t syscall_debug_lock = SPIN_INIT;

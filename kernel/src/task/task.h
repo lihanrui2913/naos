@@ -8,6 +8,7 @@
 #include <task/universe.h>
 
 extern struct llist_header tasks_list;
+extern struct llist_header default_blocking_list;
 extern spinlock_t tasks_list_lock;
 extern uint64_t next_pid;
 extern spinlock_t pid_alloc_lock;
@@ -30,6 +31,8 @@ typedef struct task {
     bool user;
     uint64_t pid;
     struct task *parent;
+    int *futex_pointer;
+    uint64_t force_wakeup_time;
     uint64_t cap;
     char *name;
     task_state_t state;
@@ -50,6 +53,10 @@ void schedule(uint64_t flags);
 
 void task_free(task_t *task);
 void task_exit(uint64_t code);
+
+void task_block(task_t *task, struct llist_header *blocking_list,
+                uint64_t timeout, const char *reason);
+void task_unblock(task_t *task);
 
 task_t *task_create(const char *name, uint64_t cap, int priority,
                     uint64_t entry, uint64_t arg, bool is_idle);

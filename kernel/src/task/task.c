@@ -7,6 +7,7 @@ bool can_schedule = false;
 bool task_initialized = false;
 
 struct llist_header tasks_list;
+struct llist_header default_blocking_list;
 spinlock_t tasks_list_lock = SPIN_INIT;
 uint64_t next_pid = 1;
 spinlock_t pid_alloc_lock = SPIN_INIT;
@@ -120,6 +121,9 @@ task_t *task_create_user(universe_t *universe, void *ip, void *sp,
     task->state = TASK_READY;
     task->block_reason = NULL;
     task->mm = task_mm_create(task);
+    task_mm_info_t *new_mm = clone_page_table(task->mm, 0);
+    free(task->mm);
+    task->mm = new_mm;
     task_arch_init_user(task, task->kernel_stack, (uint64_t)ip, (uint64_t)sp);
 
     universe->refcount++;
@@ -136,6 +140,32 @@ task_t *task_create_user(universe_t *universe, void *ip, void *sp,
     return task;
 }
 
+void task_block(task_t *task, struct llist_header *blocking_list,
+                uint64_t timeout, const char *reason) {
+    if (task->block_reason)
+        return;
+    remove_sched_entity(task, &schedulers[task->cpu_id]);
+    task->state = TASK_BLOCKING;
+    task->force_wakeup_time = nano_time() + timeout;
+    task->block_reason = strdup(reason);
+    if (blocking_list) {
+        llist_delete(&task->node);
+        llist_append(blocking_list, &task->node);
+    }
+    schedule(SCHED_YIELD);
+}
+
+void task_unblock(task_t *task) {
+    if (task->block_reason) {
+        free(task->block_reason);
+        task->block_reason = NULL;
+        task->state = TASK_READY;
+        llist_delete(&task->node);
+        llist_append(&tasks_list, &task->node);
+        add_sched_entity(task, &schedulers[task->cpu_id]);
+    }
+}
+
 void idle_entry() {
     while (1) {
         schedule(SCHED_YIELD);
@@ -146,6 +176,7 @@ extern void init_thread();
 
 void task_init() {
     llist_init_head(&tasks_list);
+    llist_init_head(&default_blocking_list);
     for (uint64_t cpu = 0; cpu < cpu_count; cpu++) {
         idle_tasks[cpu] =
             task_create("idle", 0, 0, (uint64_t)idle_entry, 0, true);

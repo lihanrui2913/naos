@@ -12,6 +12,8 @@
 
 #include "endian.h"
 
+#define _cleanup_free_ __attribute__((cleanup(free)))
+
 void panic(const char *file, int line, const char *func, const char *cond);
 
 #define ASSERT(condition)                                                      \

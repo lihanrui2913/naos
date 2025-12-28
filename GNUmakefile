@@ -275,4 +275,4 @@ assets/ovmf-code-$(ARCH).fd:
 .PHONY: initramfs-$(ARCH).img
 initramfs-$(ARCH).img:
 	$(MAKE) -C posix
-	dd if=/dev/zero of=initramfs-$(ARCH).img bs=1M count=1
+	sh mkinitcpio.sh

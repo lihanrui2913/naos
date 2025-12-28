@@ -69,6 +69,8 @@ k_error_t kCallLogImpl(enum kLogSeverity severity, const char *string,
         default:
             break;
         }
+
+        offset += chunk;
     }
 
     return kErrNone;
@@ -118,6 +120,7 @@ k_error_t kCallGetClockImpl(int64_t *clock) {
 
 k_error_t kCreateUniverseImpl(handle_id_t *out) {
     handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
     handle->handle_type = UNIVERSE;
     handle->universe.universe = create_universe();
     handle_id_t id = attach_handle(current_task->universe, handle);
@@ -126,6 +129,39 @@ k_error_t kCreateUniverseImpl(handle_id_t *out) {
     }
     if (!write_user_memory(out, &id, sizeof(handle_id_t)))
         return kErrFault;
+    return kErrNone;
+}
+
+k_error_t kTransferDescriptorImpl(handle_id_t handle_id,
+                                  handle_id_t universe_handle,
+                                  enum kTransferDescriptorFlags dir,
+                                  handle_id_t *out_handle) {
+    universe_t *this_universe = current_task->universe;
+    universe_t *another_uinverse = get_universe(universe_handle);
+    if (!another_uinverse) {
+        return kErrBadDescriptor;
+    }
+
+    universe_t *dst, *src;
+    if (dir == kTransferDescriptorOut) {
+        src = this_universe;
+        dst = another_uinverse;
+    } else {
+        src = another_uinverse;
+        dst = this_universe;
+    }
+
+    if (handle_id < 0 || handle_id > src->max_handle_count)
+        return kErrBadDescriptor;
+    handle_t *handle = src->handles[handle_id];
+    if (!handle) {
+        return kErrBadDescriptor;
+    }
+
+    handle_id_t out_handle_id = attach_handle(dst, handle);
+
+    *out_handle = out_handle_id;
+
     return kErrNone;
 }
 
@@ -155,6 +191,36 @@ k_error_t kCloseDescriptorImpl(handle_id_t universe_handle,
     return kErrNone;
 }
 
+struct llist_header futexing_tasks = {
+    .prev = &futexing_tasks,
+    .next = &futexing_tasks,
+};
+
+k_error_t kFutexWaitImpl(int *pointer, int except, int64_t deadline) {
+    int key;
+    if (!read_user_memory(&key, pointer, sizeof(int)))
+        return kErrFault;
+    if (key != except)
+        return kErrCancelled;
+    current_task->futex_pointer = pointer;
+    task_block(current_task, &futexing_tasks, deadline, __func__);
+    return kErrNone;
+}
+
+k_error_t kFutexWakeImpl(int *pointer, int count) {
+    task_t *task, *tmp;
+    int wakeup = 0;
+    llist_for_each(task, tmp, &futexing_tasks, node) {
+        if (wakeup >= count)
+            break;
+        if (task->futex_pointer == pointer) {
+            task_unblock(task);
+            wakeup++;
+        }
+    }
+    return kErrNone;
+}
+
 k_error_t kAllocateMemoryImpl(size_t size, uint32_t flags,
                               const k_allocate_restrictions_t *res,
                               handle_id_t *out) {
@@ -164,6 +230,7 @@ k_error_t kAllocateMemoryImpl(size_t size, uint32_t flags,
     size = PADDING_UP(size, DEFAULT_PAGE_SIZE);
     size_t pages = size / DEFAULT_PAGE_SIZE;
     handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
     handle->handle_type = MEMORY;
     if (r.address_bits <= 32) {
         handle->memory.address = alloc_frames_dma32(pages);
@@ -280,6 +347,7 @@ k_error_t kCreatePhysicalMemoryImpl(uintptr_t paddr, size_t size, size_t info,
     size = PADDING_UP(size, DEFAULT_PAGE_SIZE);
     size_t pages = size / DEFAULT_PAGE_SIZE;
     handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
     handle->handle_type = MEMORY;
     handle->memory.address = paddr;
     handle->memory.len = size;
@@ -293,6 +361,44 @@ k_error_t kCreatePhysicalMemoryImpl(uintptr_t paddr, size_t size, size_t info,
     return kErrNone;
 }
 
+k_error_t kCreateStreamImpl(handle_id_t *handle_out1,
+                            handle_id_t *handle_out2) {
+    lane_t *lane1 = malloc(sizeof(lane_t));
+    spin_init(&lane1->lock);
+    lane1->recv_pos = 0;
+    lane1->recv_size = 0;
+    lane1->recv_buff = calloc(1, LANE_BUFFER_SIZE);
+    lane1->pending_descs = calloc(LANE_PENDING_DESC_NUM, sizeof(handle_t *));
+
+    lane_t *lane2 = malloc(sizeof(lane_t));
+    spin_init(&lane2->lock);
+    lane2->recv_pos = 0;
+    lane2->recv_size = 0;
+    lane2->recv_buff = calloc(1, LANE_BUFFER_SIZE);
+    lane2->pending_descs = calloc(LANE_PENDING_DESC_NUM, sizeof(handle_t *));
+
+    lane2->peer = lane1;
+    lane1->peer = lane2;
+
+    handle_t *handle1 = malloc(sizeof(handle_t));
+    handle1->refcount = 1;
+    handle1->handle_type = LANE;
+    handle1->lane.lane = lane1;
+
+    handle_t *handle2 = malloc(sizeof(handle_t));
+    handle2->refcount = 1;
+    handle2->handle_type = LANE;
+    handle2->lane.lane = lane2;
+
+    handle_id_t id1 = attach_handle(current_task->universe, handle1);
+    handle_id_t id2 = attach_handle(current_task->universe, handle2);
+
+    *handle_out1 = id1;
+    *handle_out2 = id2;
+
+    return kErrNone;
+}
+
 k_error_t kCreateThreadImpl(handle_id_t universe_id, void *ip, void *sp,
                             uint32_t flags, handle_id_t *thread_handle_out) {
     universe_t *universe = get_universe(universe_id);
@@ -301,6 +407,7 @@ k_error_t kCreateThreadImpl(handle_id_t universe_id, void *ip, void *sp,
     }
 
     handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
     handle->handle_type = THREAD;
     handle_id_t id = attach_handle(current_task->universe, handle);
     if (K_RES_IS_ERR(id)) {
@@ -313,6 +420,130 @@ k_error_t kCreateThreadImpl(handle_id_t universe_id, void *ip, void *sp,
     }
     task_t *task = task_create_user(universe, ip, sp, flags);
     handle->thread.task = task;
+
+    return kErrNone;
+}
+
+k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
+                                size_t count, uint32_t flags) {
+    k_action_t actions[128];
+
+    if (handle_id < 0 || handle_id > current_task->universe->max_handle_count)
+        return kErrBadDescriptor;
+    handle_t *handle = current_task->universe->handles[handle_id];
+    if (!handle) {
+        return kErrBadDescriptor;
+    }
+    if (handle->handle_type != LANE) {
+        return kErrBadDescriptor;
+    }
+
+    lane_t *self = handle->lane.lane;
+    if (!self) {
+        return kErrBadDescriptor;
+    }
+    lane_t *peer = self->peer;
+    if (!peer) {
+        return kErrDismissed;
+    }
+
+    if (!read_user_memory(actions, action, sizeof(k_action_t) * count))
+        return kErrFault;
+
+    size_t recv_pos = peer->recv_pos;
+    for (size_t i = 0; i < count; i++) {
+        k_action_t *recipe = &actions[i];
+
+        switch (recipe->type) {
+        case kActionDismiss:
+            break;
+        case kActionOffer:
+            break;
+        case kActionAccept:
+            break;
+        case kActionSendFromBuffer:
+            // TODO: Now we ensure the length < recv_size
+            spin_lock(&peer->lock);
+            read_user_memory(peer->recv_buff + recv_pos, action->buffer,
+                             action->length);
+            recv_pos += action->length;
+            spin_unlock(&peer->lock);
+            break;
+        case kActionRecvToBuffer:
+            break;
+        case kActionPushDescriptor:
+            spin_lock(&peer->lock);
+            handle_t *handle = current_task->universe->handles[action->handle];
+            for (int i = 0; i < LANE_PENDING_DESC_NUM; i++) {
+                if (!peer->pending_descs[i]) {
+                    handle->refcount++;
+                    peer->pending_descs[i] = handle;
+                    break;
+                }
+            }
+            spin_unlock(&peer->lock);
+            break;
+        case kActionPullDescriptor:
+            break;
+        default:
+            break;
+        }
+    }
+    peer->recv_pos = recv_pos;
+
+    if (flags & KCALL_SUBMIT_NO_RECEIVING) {
+        return kErrNone;
+    }
+
+    while (!self->recv_pos) {
+        schedule(SCHED_YIELD);
+    }
+
+    recv_pos = self->recv_pos;
+    for (size_t i = 0; i < count; i++) {
+        k_action_t *recipe = &actions[i];
+
+        switch (recipe->type) {
+        case kActionDismiss:
+            break;
+        case kActionOffer:
+            break;
+        case kActionAccept:
+            break;
+        case kActionSendFromBuffer:
+            break;
+        case kActionRecvToBuffer:
+            if (!recv_pos) {
+                return kErrEndOfLane;
+            }
+            if (recipe->length > self->recv_size) {
+                return kErrBufferTooSmall;
+            }
+            spin_lock(&self->lock);
+            memcpy(recipe->buffer, self->recv_buff + recv_pos, recv_pos);
+            memmove(self->recv_buff, &self->recv_buff[recv_pos], recv_pos);
+            recipe->length = recv_pos;
+            recv_pos = 0;
+            spin_unlock(&self->lock);
+            break;
+        case kActionPushDescriptor:
+            break;
+        case kActionPullDescriptor:
+            spin_lock(&self->lock);
+            for (int i = 0; i < LANE_PENDING_DESC_NUM; i++) {
+                if (self->pending_descs[i]) {
+                    handle_id_t id = attach_handle(current_task->universe,
+                                                   self->pending_descs[i]);
+                    self->pending_descs[i] = NULL;
+                }
+            }
+            spin_unlock(&self->lock);
+            break;
+        default:
+            break;
+        }
+    }
+    self->recv_pos = recv_pos;
 
     return kErrNone;
 }
