@@ -309,6 +309,8 @@ spinlock_t ap_startup_lock = SPIN_INIT;
 
 extern bool task_initialized;
 
+extern task_t *idle_tasks[MAX_CPU_NUM];
+
 uint64_t general_ap_entry() {
     close_interrupt;
 

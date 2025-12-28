@@ -2,9 +2,8 @@
 /.zed
 /kernel-deps
 /assets
-/modules-*
 /initramfs-*
-/obj-modules-*
+/obj-posix-*
 /nvidia-open
 /nvidia-open-install-dir
 *.iso

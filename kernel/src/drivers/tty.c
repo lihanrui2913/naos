@@ -41,7 +41,7 @@ tty_device_t *get_tty_device(const char *name) {
     return NULL;
 }
 
-// 全局默认控制台路径（初始为 /dev/ttyS0）
+// 全局默认控制台路径
 char *default_console = NULL;
 
 void parse_cmdline_console(const char *cmdline) {
@@ -71,15 +71,6 @@ void parse_cmdline_console(const char *cmdline) {
     console_name[i] = '\0';
 
 next:
-    // 输出调试信息
-    printk("Detected console device: %s\n", console_name);
-
-    char buf[64];
-    sprintf(buf, "/dev/%s", console_name);
-
-    default_console = strdup(buf);
-
-    printk("Set default to %s\n", default_console);
 }
 
 void tty_init() {
@@ -135,16 +126,6 @@ void tty_init() {
 extern void create_session_terminal(tty_t *tty);
 extern void create_session_terminal_serial(tty_t *tty);
 
-int tty_ioctl(void *dev, int cmd, void *args) {
-    tty_t *tty = dev;
-    return tty->ops.ioctl(tty, cmd, (uint64_t)args);
-}
-
-int tty_poll(void *dev, int events) {
-    tty_t *tty = dev;
-    return tty->ops.poll(tty, events);
-}
-
 int tty_read(void *dev, void *buf, uint64_t offset, size_t size,
              uint64_t flags) {
     tty_t *tty = dev;
@@ -169,8 +150,6 @@ void tty_init_session() {
     tty_t *tty = calloc(1, sizeof(tty_t));
     tty->device = device;
     create_session_terminal(tty);
-    device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, tty_ioctl, tty_poll,
-                   tty_read, tty_write, NULL);
 
     kernel_session = tty;
 }
@@ -186,8 +165,6 @@ void tty_init_session_serial() {
     tty_t *tty = calloc(1, sizeof(tty_t));
     tty->device = device;
     create_session_terminal_serial(tty);
-    device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, tty_ioctl, tty_poll,
-                   tty_read, tty_write, NULL);
 
     kernel_session = tty;
 }

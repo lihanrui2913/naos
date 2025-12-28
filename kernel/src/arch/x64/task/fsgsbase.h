@@ -25,3 +25,7 @@ static inline uint32_t has_fsgsbase() {
 }
 
 uint64_t fsgsbase_init();
+
+struct task;
+struct task *arch_get_current();
+void arch_set_current(struct task *t);

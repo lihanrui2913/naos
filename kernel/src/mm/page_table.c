@@ -2,6 +2,7 @@
 #include <mm/mm.h>
 #include <mm/page.h>
 #include <task/task.h>
+#include <uapi/kernel.h>
 
 uint64_t translate_address(uint64_t *pgdir, uint64_t vaddr) {
     if (!vaddr)
@@ -277,13 +278,13 @@ static void free_page_table_recursive(uint64_t *table, int level) {
 }
 
 task_mm_info_t *clone_page_table(task_mm_info_t *old, uint64_t clone_flags) {
-    if ((clone_flags & CLONE_VM) && old) {
+    if ((clone_flags & KERNEL_IS_VM_CLONE) && old) {
         old->ref_count++;
         return old;
     }
     task_mm_info_t *new_mm = (task_mm_info_t *)malloc(sizeof(task_mm_info_t));
     memset(new_mm, 0, sizeof(task_mm_info_t));
-    new_mm->page_table_addr = virt_to_phys((uint64_t)copy_page_table_recursive(
+    new_mm->page_table_addr = virt_to_phys(copy_page_table_recursive(
         (uint64_t *)old->page_table_addr, ARCH_MAX_PT_LEVEL));
 #if defined(__x86_64__) || defined(__riscv__)
     memcpy((uint64_t *)phys_to_virt(new_mm->page_table_addr) + 256,
@@ -293,9 +294,6 @@ task_mm_info_t *clone_page_table(task_mm_info_t *old, uint64_t clone_flags) {
     new_mm->ref_count = 1;
     vma_manager_copy(&new_mm->task_vma_mgr, &old->task_vma_mgr);
     new_mm->task_vma_mgr.initialized = true;
-    new_mm->brk_start = old->brk_start;
-    new_mm->brk_current = old->brk_current;
-    new_mm->brk_end = old->brk_end;
     return new_mm;
 }
 

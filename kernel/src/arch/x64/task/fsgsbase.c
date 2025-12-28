@@ -49,3 +49,6 @@ uint64_t fsgsbase_init() {
 
     return 0;
 }
+
+struct task *arch_get_current() { return (struct task *)read_kgsbase(); }
+void arch_set_current(struct task *t) { write_kgsbase((uint64_t)t); }

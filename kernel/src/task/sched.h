@@ -15,6 +15,10 @@ typedef struct rrs_scheduler {
     struct sched_entity *curr;
 } rrs_t;
 
-void add_rrs_entity(task_t *task, rrs_t *scheduler);
-void remove_rrs_entity(task_t *thread, rrs_t *scheduler);
-task_t *rrs_pick_next_task(rrs_t *scheduler);
+extern rrs_t schedulers[MAX_CPU_NUM];
+
+void add_sched_entity(task_t *task, void *scheduler);
+void remove_sched_entity(task_t *thread, void *scheduler);
+task_t *sched_pick_next_task(void *scheduler);
+
+void sched_init();

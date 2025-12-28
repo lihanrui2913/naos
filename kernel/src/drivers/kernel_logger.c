@@ -3,7 +3,6 @@
 #include <arch/arch.h>
 #include <mm/mm.h>
 #include <drivers/fb.h>
-#include <fs/vfs/dev.h>
 #include <boot/boot.h>
 
 #define PAD_ZERO 1 // 0填充
@@ -428,9 +427,7 @@ int printk(const char *fmt, ...) {
 
     va_end(args);
 
-    device_t *device = device_find(DEV_TTY, 0);
-    if (device)
-        device_write(device->dev, buf, 0, len, 0);
+    tty_write(kernel_session, buf, 0, len, 0);
 
     spin_unlock(&printk_lock);
 

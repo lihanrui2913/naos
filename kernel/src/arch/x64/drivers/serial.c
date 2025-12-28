@@ -1,4 +1,5 @@
 #include <arch/arch.h>
+#include <task/task.h>
 
 int init_serial() {
     io_out8(SERIAL_PORT + 1, 0x00); // 禁止COM的中断发生
@@ -25,13 +26,13 @@ int init_serial() {
 
 char read_serial() {
     while ((io_in8(SERIAL_PORT + 5) & 1) == 0)
-        arch_yield();
+        schedule(SCHED_YIELD);
     return io_in8(SERIAL_PORT);
 }
 
 void write_serial(char a) {
     while ((io_in8(SERIAL_PORT + 5) & 0x20) == 0)
-        arch_yield();
+        schedule(SCHED_YIELD);
     io_out8(SERIAL_PORT, a);
 }
 

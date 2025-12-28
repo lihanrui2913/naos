@@ -1,6 +1,9 @@
-#include "task/sched.h"
+#include <task/sched.h>
 
-void add_rrs_entity(task_t *task, rrs_t *scheduler) {
+rrs_t schedulers[MAX_CPU_NUM];
+
+void add_sched_entity(task_t *task, void *sched) {
+    rrs_t *scheduler = sched;
     struct sched_entity *entity = task->sched_info;
     if (!entity->on_rq) {
         entity->on_rq = true;
@@ -9,8 +12,9 @@ void add_rrs_entity(task_t *task, rrs_t *scheduler) {
     }
 }
 
-void remove_rrs_entity(task_t *thread, rrs_t *scheduler) {
+void remove_sched_entity(task_t *thread, void *sched) {
     struct sched_entity *entity = thread->sched_info;
+    rrs_t *scheduler = sched;
     if (entity->on_rq) {
         entity->on_rq = false;
 
@@ -37,7 +41,8 @@ void remove_rrs_entity(task_t *thread, rrs_t *scheduler) {
     }
 }
 
-task_t *rrs_pick_next_task(rrs_t *scheduler) {
+task_t *sched_pick_next_task(void *sched) {
+    rrs_t *scheduler = sched;
     spin_lock(&scheduler->sched_queue->lock);
     struct sched_entity *entity = scheduler->curr;
     list_node_t *nextL = NULL;
@@ -77,4 +82,11 @@ task_t *rrs_pick_next_task(rrs_t *scheduler) {
     scheduler->curr = scheduler->idle;
     spin_unlock(&scheduler->sched_queue->lock);
     return scheduler->idle->task;
+}
+
+void sched_init() {
+    memset(schedulers, 0, sizeof(schedulers));
+    for (uint64_t i = 0; i < cpu_count; i++) {
+        schedulers[i].sched_queue = create_llist_queue();
+    }
 }

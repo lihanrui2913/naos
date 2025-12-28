@@ -7,8 +7,7 @@ page_fault_result_t handle_page_fault(task_t *task, uint64_t vaddr) {
 
     vaddr = PADDING_DOWN(vaddr, DEFAULT_PAGE_SIZE);
 
-    uint64_t *pgdir =
-        (uint64_t *)phys_to_virt(task->arch_context->mm->page_table_addr);
+    uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
 
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < ARCH_MAX_PT_LEVEL; i++) {
@@ -32,7 +31,7 @@ page_fault_result_t handle_page_fault(task_t *task, uint64_t vaddr) {
     uint64_t paddr = ARCH_READ_PTE(pgdir[index]);
     uint64_t flags = ARCH_READ_PTE_FLAG(pgdir[index]);
 
-    vma_manager_t *mgr = &current_task->arch_context->mm->task_vma_mgr;
+    vma_manager_t *mgr = &task->mm->task_vma_mgr;
 
     if (flags & ARCH_PT_FLAG_COW) {
         flags |= ARCH_PT_FLAG_WRITEABLE;

@@ -164,18 +164,13 @@ override LDFLAGS += \
 # object and header dependency file names.
 override SRCFILES := $(shell find $(ARCH_DIR) -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/acpi -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/bpf -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/dev -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/drivers -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/fs -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/irq -name "*.[Sc]" | LC_ALL=C sort)
+override SRCFILES += $(shell find src/kcall -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/libs -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/mm -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/mod -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/init -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/task -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/block -name "*.[Sc]" | LC_ALL=C sort)
-override SRCFILES += $(shell find src/net -name "*.[Sc]" | LC_ALL=C sort)
 ifeq ($(BOOT_PROTOCOL), limine)
 override SRCFILES += src/boot/limine_boot.c
 endif

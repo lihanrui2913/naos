@@ -1,7 +1,6 @@
 #include <mm/mm.h>
 #include <drivers/kernel_logger.h>
 #include <drivers/bus/pci.h>
-#include <libs/aether/pci.h>
 #include <uacpi/acpi.h>
 #include <uacpi/tables.h>
 
@@ -653,8 +652,6 @@ void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group) {
     pci_scan_bus(op, segment_group, 0);
 }
 
-extern pci_driver_t *pci_drivers[MAX_PCI_DRIVERS];
-
 void pci_controller_init() {
     struct uacpi_table mcfg_table;
     uacpi_status status = uacpi_table_find_by_signature("MCFG", &mcfg_table);
@@ -678,27 +675,6 @@ void pci_controller_init() {
 
             uint16_t segment_group = mcfg_entries[i]->segment;
             pci_scan_segment(&pcie_device_op, segment_group);
-        }
-    }
-}
-
-void pci_init() {
-    for (uint64_t i = 0; i < pci_device_number; i++) {
-        pci_device_t *device = pci_devices[i];
-
-        for (uint64_t d = 0; d < MAX_PCI_DRIVERS; d++) {
-            if (pci_drivers[d] && (pci_drivers[d]->flags == 0) &&
-                ((pci_drivers[d]->class_id == device->class_code) ||
-                 ((pci_drivers[d]->vendor_device_id & 0xFFFF0000) ==
-                  ((uint32_t)device->vendor_id << 16)))) {
-                int ret = pci_drivers[d]->probe(
-                    device,
-                    ((uint32_t)device->vendor_id << 16) | (device->device_id));
-                if (ret < 0) {
-                    printk("PCI driver %s probe failed!!!\n",
-                           pci_drivers[d]->name);
-                }
-            }
         }
     }
 }

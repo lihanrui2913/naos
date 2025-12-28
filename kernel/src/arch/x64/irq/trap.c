@@ -4,7 +4,6 @@
 #include <drivers/kernel_logger.h>
 #include <drivers/tty.h>
 #include <task/task.h>
-#include <mod/dlinker.h>
 #include <mm/fault.h>
 
 extern const uint64_t kallsyms_address[] __attribute__((weak));
@@ -85,25 +84,11 @@ void traceback(struct pt_regs *regs) {
 
 check_user_fault:
     if (current_task) {
-        rb_node_t *node =
-            rb_first(&current_task->arch_context->mm->task_vma_mgr.vma_tree);
+        rb_node_t *node = rb_first(&current_task->mm->task_vma_mgr.vma_tree);
 
         while (node) {
             vma_t *vma = rb_entry(node, vma_t, vm_rb);
-            vfs_node_t vfs_node = vma->node;
-
-            if (vma->vm_name) {
-                if (ret_addr >= vma->vm_start && ret_addr <= vma->vm_end) {
-                    printk("Fault in this vma: %s, vma->vm_start = %#018lx, "
-                           "offset_in_vma = %#018lx\n",
-                           vma->vm_name, vma->vm_start,
-                           ret_addr - vma->vm_start);
-                } else {
-                    printk("Faulting task vma: %s, vma->vm_start = %#018lx\n",
-                           vma->vm_name, vma->vm_start);
-                }
-            }
-
+            // TODO: print vmas
             node = rb_next(node);
         }
     }
@@ -168,7 +153,7 @@ void do_divide_error(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -186,7 +171,7 @@ void do_nmi(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -204,7 +189,7 @@ void do_overflow(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -219,7 +204,7 @@ void do_bounds(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -234,7 +219,7 @@ void do_undefined_opcode(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -249,7 +234,7 @@ void do_dev_not_avaliable(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -273,7 +258,7 @@ void do_coprocessor_segment_overrun(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -288,7 +273,7 @@ void do_invalid_TSS(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -303,7 +288,7 @@ void do_segment_not_exists(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -318,7 +303,7 @@ void do_stack_segment_fault(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -333,7 +318,7 @@ void do_general_protection(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -356,7 +341,7 @@ void do_page_fault(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -373,7 +358,7 @@ void do_x87_FPU_error(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -388,7 +373,7 @@ void do_alignment_check(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -403,7 +388,7 @@ void do_machine_check(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -418,7 +403,7 @@ void do_SIMD_exception(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 
@@ -433,7 +418,7 @@ void do_virtualization_exception(struct pt_regs *regs, uint64_t error_code) {
 
     if ((regs->cs & 3) == 3) {
         can_schedule = true;
-        task_exit(128 + SIGSEGV);
+        task_exit(K_SIGNAL_SEGMENTATION_FAULT);
         return;
     }
 

@@ -11,9 +11,8 @@
 #include "arch/x64/irq/irq.h"
 #include "arch/x64/drivers/serial.h"
 #include "arch/x64/drivers/apic_timer.h"
-#include "arch/x64/drivers/chars/ps2.h"
 #include "arch/x64/drivers/msi_arch.h"
-#include "arch/x64/task/arch_context.h"
+#include "arch/x64/task/arch.h"
 #include "arch/x64/task/fsgsbase.h"
 #include "arch/x64/syscall/nr.h"
 #include "arch/x64/syscall/syscall.h"
@@ -22,7 +21,6 @@
 void arch_early_init();
 void arch_init();
 void arch_init_after_thread();
-void arch_input_dev_init();
 
 static inline void arch_pause() { asm volatile("pause"); }
 

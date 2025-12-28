@@ -5,16 +5,9 @@
 #include <mm/heap.h>
 #include <arch/arch.h>
 #include <irq/irq_manager.h>
-#include <dev/device.h>
 #include <drivers/tty.h>
-#include <mod/dlinker.h>
-#include <task/signal.h>
+#include <task/sched.h>
 #include <task/task.h>
-#include <fs/vfs/vfs.h>
-#include <fs/vfs/dev.h>
-#include <fs/vfs/tmp.h>
-#include <fs/vfs/proc.h>
-#include <fs/initramfs.h>
 
 extern void acpi_init();
 
@@ -31,31 +24,15 @@ void kmain(void) {
 
     irq_manager_init();
 
+    tty_init();
+
     acpi_init();
 
     arch_early_init();
 
-    device_init();
-
-    vfs_init();
-
-    devtmpfs_init();
-
-    tty_init();
-
     printk("Aether-OS starting...\n");
 
-    devfs_nodes_init();
-
-    proc_init();
-
-    tmpfs_init();
-
-    initramfs_init();
-
-    dlinker_init();
-
-    signal_init();
+    sched_init();
 
     task_init();
 

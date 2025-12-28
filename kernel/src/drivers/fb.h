@@ -1,7 +1,6 @@
 #pragma once
 
 #include <libs/klibc.h>
-#include <fs/vfs/vfs.h>
 #include <boot/boot.h>
 
 #define FB_TYPE_PACKED_PIXELS 0      /* Packed Pixels	*/

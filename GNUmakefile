@@ -117,10 +117,7 @@ libgcc_$(ARCH).a:
 	wget https://github.com/osdev0/libgcc-binaries/releases/download/$(LIBGCC_VERSION)/libgcc-$(ARCH).a -O libgcc_$(ARCH).a
 
 .PHONY: all
-all: $(IMAGE_NAME).img rootfs-$(ARCH).img
-
-.PHONY: all
-all-single: single-$(IMAGE_NAME).img
+all: $(IMAGE_NAME).img
 
 .PHONY: kernel
 kernel:
@@ -136,23 +133,15 @@ clean:
 	$(MAKE) -C kernel clean
 	$(MAKE) -C user clean
 	rm -rf $(IMAGE_NAME).img
-	rm -rf rootfs-$(ARCH) obj-modules-$(ARCH) modules-$(ARCH)
 
 .PHONY: distclean
 distclean:
 	$(MAKE) -C kernel distclean
 	$(MAKE) -C user distclean
-	rm -rf *.img assets
-	rm -rf rootfs-$(ARCH) obj-modules-$(ARCH) modules-$(ARCH)
+	rm -rf $(IMAGE_NAME).img assets
 
 clippy:
 	$(MAKE) -C kernel clippy
-
-ROOTFS_IMG_SIZE ?= 4096
-
-rootfs-$(ARCH).img: user/.build-stamp-$(ARCH)
-	dd if=/dev/zero bs=1M count=0 seek=$(ROOTFS_IMG_SIZE) of=rootfs-$(ARCH).img
-	sudo mkfs.ext4 -O ^metadata_csum  -F -q -d user/rootfs-$(ARCH) rootfs-$(ARCH).img
 
 ifeq ($(ARCH),x86_64)
 EFI_FILE_SINGLE = assets/limine/BOOTX64.EFI
@@ -164,7 +153,7 @@ else ifeq ($(ARCH),loongarch64)
 EFI_FILE_SINGLE = assets/limine/BOOTLOONGARCH64.EFI
 endif
 
-$(IMAGE_NAME).img: assets/limine modules kernel initramfs-$(ARCH).img rootfs-$(ARCH).img
+$(IMAGE_NAME).img: assets/limine kernel initramfs-$(ARCH).img
 	dd if=/dev/zero of=$(IMAGE_NAME).img bs=1M count=512
 	sgdisk --new=1:1M:511M $(IMAGE_NAME).img
 	mkfs.vfat -F 32 --offset 2048 -S 512 $(IMAGE_NAME).img
@@ -187,33 +176,8 @@ ifeq ($(BOOT_PROTOCOL), multiboot2)
 	mcopy -i $(IMAGE_NAME).img@@1M limine_multiboot2_$(KERNEL_MODULE).conf ::/limine/limine.conf
 endif
 
-TOTAL_IMG_SIZE=$$(( $(ROOTFS_IMG_SIZE) + 32 ))
-
-single-$(IMAGE_NAME).img: assets/limine modules kernel initramfs-$(ARCH).img rootfs-$(ARCH).img
-	dd if=/dev/zero of=single-$(IMAGE_NAME).img bs=1M count=$(TOTAL_IMG_SIZE)
-	sgdisk --new=1:1M:31M --new=2:32M:0 single-$(IMAGE_NAME).img
-	mkfs.vfat -F 32 --offset 2048 -S 512 single-$(IMAGE_NAME).img
-	mcopy -i single-$(IMAGE_NAME).img@@1M kernel/bin-$(ARCH)/kernel ::/
-ifeq ($(KERNEL_MODULE), mixed)
-	mcopy -i single-$(IMAGE_NAME).img@@1M initramfs-$(ARCH).img ::/initramfs.img
-endif
-ifeq ($(BOOT_PROTOCOL), limine)
-	mmd -i single-$(IMAGE_NAME).img@@1M ::/EFI ::/EFI/BOOT ::/limine
-	mcopy -i single-$(IMAGE_NAME).img@@1M $(EFI_FILE_SINGLE) ::/EFI/BOOT
-ifeq ($(ARCH), x86_64)
-	mcopy -i single-$(IMAGE_NAME).img@@1M limine_x86_64_$(KERNEL_MODULE).conf ::/limine/limine.conf
-else
-	mcopy -i single-$(IMAGE_NAME).img@@1M limine_$(KERNEL_MODULE).conf ::/limine/limine.conf
-endif
-endif
-
-	dd if=rootfs-$(ARCH).img of=single-$(IMAGE_NAME).img bs=1M count=$(ROOTFS_IMG_SIZE) seek=32
-
 .PHONY: run
 run: run-$(ARCH)
-
-.PHONY: run-single
-run-single: run-$(ARCH)-single
 
 .PHONY: run-x86_64
 run-x86_64: assets/ovmf-code-$(ARCH).fd all
@@ -221,27 +185,12 @@ run-x86_64: assets/ovmf-code-$(ARCH).fd all
 		-M q35 \
 		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
 		-drive if=none,file=$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-drive if=none,file=rootfs-$(ARCH).img,format=raw,id=rootdisk \
 		-device qemu-xhci,id=xhci \
 		-device ahci,id=ahci \
 		-device ide-hd,drive=harddisk,bus=ahci.0 \
-		-device nvme,drive=rootdisk,serial=5678 \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
 		-rtc base=utc \
-		-vga vmware \
-		$(QEMUFLAGS)
-
-.PHONY: run-x86_64-single
-run-x86_64-single: assets/ovmf-code-$(ARCH).fd all-single
-	qemu-system-$(ARCH) \
-		-M q35 \
-		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
-		-drive if=none,file=single-$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd \
-		-device usb-mouse \
-		-device usb-storage,drive=harddisk,bus=xhci.0 \
 		-vga vmware \
 		$(QEMUFLAGS)
 
@@ -256,23 +205,7 @@ run-aarch64: assets/ovmf-code-$(ARCH).fd all
 		-device usb-mouse \
 		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
 		-drive if=none,file=$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-drive if=none,file=rootfs-$(ARCH).img,format=raw,id=rootdisk \
 		-device virtio-blk-pci,drive=harddisk \
-		-device usb-storage,drive=rootdisk \
-		$(QEMUFLAGS)
-
-.PHONY: run-aarch64-single
-run-aarch64-single: assets/ovmf-code-$(ARCH).fd all-single
-	qemu-system-$(ARCH) \
-		-M virt,gic-version=3 \
-		-cpu cortex-a76 \
-		-device ramfb \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd \
-		-device usb-mouse \
-		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
-		-drive if=none,file=single-$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-device usb-storage,drive=harddisk \
 		$(QEMUFLAGS)
 
 .PHONY: run-riscv64
@@ -286,8 +219,6 @@ ifeq ($(BOOT_PROTOCOL), opensbi)
 		-device usb-kbd \
 		-device usb-mouse \
 		-kernel kernel/bin-$(ARCH)/kernel \
-		-drive if=none,file=rootfs-$(ARCH).img,format=raw,id=rootdisk \
-		-device virtio-blk-device,drive=rootdisk,bus=virtio-mmio-bus.0 \
 		-netdev user,id=net0 \
 		-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1 \
 		$(QEMUFLAGS)
@@ -301,27 +232,11 @@ else
 		-device usb-mouse \
 		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
 		-drive if=none,file=$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-drive if=none,file=rootfs-$(ARCH).img,format=raw,id=rootdisk \
 		-device nvme,drive=harddisk,serial=1234 \
-		-device nvme,drive=rootdisk,serial=5678 \
 		-netdev user,id=net0 \
 		-device virtio-net-pci,netdev=net0 \
 		$(QEMUFLAGS)
 endif
-
-.PHONY: run-riscv64
-run-riscv64-single: assets/ovmf-code-$(ARCH).fd all-single
-	qemu-system-$(ARCH) \
-		-M virt \
-		-cpu rv64 \
-		-device ramfb \
-		-device qemu-xhci \
-		-device usb-kbd \
-		-device usb-mouse \
-		-drive if=pflash,unit=0,format=raw,file=assets/ovmf-code-$(ARCH).fd,readonly=on \
-		-drive if=none,file=single-$(IMAGE_NAME).img,format=raw,id=harddisk \
-		-device usb-storage,drive=harddisk \
-		$(QEMUFLAGS)
 
 .PHONY: run-loongarch64
 run-loongarch64: assets/ovmf-code-$(ARCH).fd $(IMAGE_NAME).img
@@ -357,10 +272,7 @@ assets/ovmf-code-$(ARCH).fd:
 		riscv64) dd if=/dev/zero of=$@ bs=1 count=0 seek=33554432 2>/dev/null;; \
 	esac
 
-.PHONY: modules
-modules:
-	$(MAKE) -C modules -j$(shell nproc)
-
 .PHONY: initramfs-$(ARCH).img
-initramfs-$(ARCH).img: rootfs-$(ARCH).img
-	sh mkinitcpio.sh
+initramfs-$(ARCH).img:
+	$(MAKE) -C posix
+	dd if=/dev/zero of=initramfs-$(ARCH).img bs=1M count=1

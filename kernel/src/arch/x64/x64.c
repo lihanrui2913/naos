@@ -12,12 +12,13 @@ void arch_early_init() {
     generic_interrupt_table_init_early();
     hpet_init();
     apic_init();
-    tss_init();
 
     apic_timer_init();
     local_apic_init();
 
     smp_init();
+
+    tss_init();
 
     fsgsbase_init();
 }
@@ -29,10 +30,3 @@ void arch_init() {
 }
 
 void arch_init_after_thread() {}
-
-void arch_input_dev_init() {
-    if (ps2_init()) {
-        ps2_keyboard_init();
-        ps2_mouse_init();
-    }
-}

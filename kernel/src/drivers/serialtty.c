@@ -1,8 +1,6 @@
 #include <drivers/tty.h>
 #include <drivers/serialtty.h>
 #include <mm/mm.h>
-#include <libs/keys.h>
-#include <fs/fs_syscall.h>
 
 void terminal_flush_serial(tty_t *session) {
     // flanterm_flush(session->terminal);
@@ -10,78 +8,6 @@ void terminal_flush_serial(tty_t *session) {
 }
 
 extern bool serial_initialized;
-
-size_t terminal_read_serial(tty_t *device, char *buf, size_t count) {
-    size_t read = 0;
-
-    while (read < count) {
-        char c = read_serial();
-        if (c) {
-            // 非0表示读到了字符。
-            buf[read++] = c;
-        } else {
-            // 都没数据，允许调度/等待
-            arch_enable_interrupt();
-            arch_yield();
-        }
-    }
-
-    return read;
-}
-
-int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
-    switch (cmd) {
-    case TIOCGWINSZ:
-        *(struct winsize *)arg = (struct winsize){
-            .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
-        return 0;
-
-    case TIOCSCTTY:
-    case TIOCNOTTY:
-        return 0;
-
-    case TIOCGPGRP: {
-        int *pid = (int *)arg;
-        *pid = device->at_process_group_id;
-        return 0;
-    }
-
-    case TIOCSPGRP:
-        device->at_process_group_id = *(int *)arg;
-        return 0;
-
-    case TCGETS:
-        memcpy((void *)arg, &device->termios, sizeof(termios));
-        return 0;
-    case TCSETS:
-    case TCSETSW:
-    case TCSETSF:
-        memcpy(&device->termios, (void *)arg, sizeof(termios));
-        return 0;
-
-    case TCFLSH:
-        return 0;
-
-    default:
-        return -EINVAL; // 不支持的命令
-    }
-}
-
-bool io_switch_serial = false;
-
-int terminal_poll_serial(tty_t *device, int events) {
-    ssize_t revents = 0;
-    if ((events & EPOLLERR) || (events & EPOLLPRI))
-        return 0;
-
-    if ((events & EPOLLIN) && io_switch_serial)
-        revents |= EPOLLIN;
-    if (events & EPOLLOUT)
-        revents |= EPOLLOUT;
-    io_switch_serial = !io_switch_serial;
-
-    return revents;
-}
 
 spinlock_t terminal_write_serial_lock = SPIN_INIT;
 
@@ -128,9 +54,7 @@ uint64_t create_session_terminal_serial(tty_t *session) {
     session->tty_kbmode = K_XLATE;
     // session->terminal = fl_context;
     session->ops.flush = terminal_flush_serial;
-    session->ops.ioctl = terminal_ioctl_serial;
-    session->ops.poll = terminal_poll_serial;
-    session->ops.read = terminal_read_serial;
+    session->ops.read = NULL;
     session->ops.write = terminal_write_serial;
 
     return EOK;

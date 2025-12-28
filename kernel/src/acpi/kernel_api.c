@@ -5,7 +5,6 @@
 #include <drivers/bus/pci.h>
 #include <irq/irq_manager.h>
 #include <arch/arch.h>
-#include <task/task.h>
 
 uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out_rsdp_address) {
     if (boot_get_acpi_rsdp()) {
@@ -235,7 +234,7 @@ uacpi_kernel_handle_firmware_request(uacpi_firmware_request *request) {
     return UACPI_STATUS_OK;
 }
 
-uacpi_thread_id uacpi_kernel_get_thread_id(void) { return current_task; }
+uacpi_thread_id uacpi_kernel_get_thread_id(void) { return NULL; }
 
 #if defined(__x86_64__)
 

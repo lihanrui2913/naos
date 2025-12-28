@@ -1,5 +1,4 @@
 #include <mm/vma.h>
-#include <fs/vfs/vfs.h>
 
 void *malloc(size_t size);
 void free(void *ptr);
@@ -374,8 +373,6 @@ vma_t *vma_copy(vma_t *src) {
     dst->vm_flags = src->vm_flags;
     dst->vm_type = src->vm_type;
     dst->node = src->node;
-    if (dst->node)
-        dst->node->refcount++;
     dst->vm_offset = src->vm_offset;
     dst->shm_id = src->shm_id;
 
