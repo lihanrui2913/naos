@@ -4,6 +4,59 @@
 #include <task/task.h>
 #include <task/sched.h>
 
+#define USER_MMAP_START 0x0000100000000000
+#define USER_MMAP_END 0x0000600000000000
+
+static uint64_t find_unmapped_area(vma_manager_t *mgr, uint64_t hint,
+                                   uint64_t len) {
+    vma_t *vma;
+
+    // 参数校验
+    if (len == 0 || len > USER_MMAP_END - USER_MMAP_START) {
+        return (uint64_t)-ENOMEM;
+    }
+
+    // 尝试hint
+    if (hint) {
+        hint = PADDING_UP(hint, DEFAULT_PAGE_SIZE);
+        if (hint >= USER_MMAP_START && hint <= USER_MMAP_END - len &&
+            !vma_find_intersection(mgr, hint, hint + len)) {
+            return hint;
+        }
+    }
+
+    // 使用红黑树找到第一个VMA
+    rb_node_t *node = rb_first(&mgr->vma_tree);
+
+    if (!node) {
+        // 没有VMA，整个空间可用
+        return USER_MMAP_START + len <= USER_MMAP_END ? USER_MMAP_START
+                                                      : (uint64_t)-ENOMEM;
+    }
+
+    vma = rb_entry(node, vma_t, vm_rb);
+
+    // 检查第一个VMA之前的gap
+    if (vma->vm_start >= USER_MMAP_START + len) {
+        return USER_MMAP_START;
+    }
+
+    // 扫描VMA间的gaps
+    while ((node = rb_next(node)) != NULL) {
+        vma_t *next_vma = rb_entry(node, vma_t, vm_rb);
+        uint64_t gap_start = vma->vm_end;
+        uint64_t gap_end = next_vma->vm_start;
+
+        if (gap_end >= gap_start + len) {
+            return gap_start;
+        }
+
+        vma = next_vma;
+    }
+
+    return (uint64_t)-ENOMEM;
+}
+
 universe_t *get_universe(handle_id_t handle_id) {
     if (handle_id == kThisUniverse) {
         return current_task->universe;
@@ -86,6 +139,8 @@ void kCallPanicImpl(const char *string, size_t length) {
             return;
 
         printk("[PANIC]: %s", log);
+
+        offset += chunk;
     }
 
     task_exit(0);
@@ -238,7 +293,7 @@ k_error_t kAllocateMemoryImpl(size_t size, uint32_t flags,
         handle->memory.address = alloc_frames(pages);
     }
     handle->memory.len = size;
-    handle->memory.info = 0;
+    handle->memory.info = flags;
     handle_id_t id = attach_handle(current_task->universe, handle);
     if (!write_user_memory(out, &id, sizeof(handle_id_t))) {
         detatch_handle(current_task->universe, id);
@@ -317,6 +372,10 @@ k_error_t kMapMemoryImpl(handle_id_t memory_handle, void *pointer,
     }
     if (handle->handle_type != MEMORY) {
         return kErrBadDescriptor;
+    }
+    if (!pointer) {
+        pointer = (void *)find_unmapped_area(&current_task->mm->task_vma_mgr,
+                                             (uint64_t)pointer, size);
     }
     if (!write_user_memory(actual_pointer, &pointer, sizeof(void *))) {
         return kErrFault;

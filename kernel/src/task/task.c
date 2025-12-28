@@ -40,6 +40,7 @@ void task_free(task_t *task) {
 void task_exit(uint64_t code) {
     remove_sched_entity(current_task, &schedulers[current_task->cpu_id]);
     current_task->state = TASK_DIED;
+    schedule(SCHED_YIELD);
 }
 
 void schedule(uint64_t flags) {
@@ -69,6 +70,7 @@ task_mm_info_t *task_mm_create(task_t *task) {
     mm->page_table_addr = virt_to_phys(get_current_page_dir(false));
     mm->ref_count = 1;
     memset(&mm->task_vma_mgr, 0, sizeof(vma_manager_t));
+    mm->task_vma_mgr.initialized = true;
     return mm;
 }
 
@@ -100,7 +102,10 @@ task_t *task_create(const char *name, uint64_t cap, int priority,
     task->sched_info = malloc(sizeof(struct sched_entity));
     memset(task->sched_info, 0, sizeof(struct sched_entity));
     add_sched_entity(task, &schedulers[task->cpu_id]);
-
+    if (is_idle) {
+        schedulers[task->cpu_id].idle = task->sched_info;
+        remove_sched_entity(task, &schedulers[task->cpu_id]);
+    }
     return task;
 }
 

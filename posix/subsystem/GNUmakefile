@@ -7,9 +7,9 @@ override ASFILES := $(filter %.S,$(SRCFILES))
 override OBJ := $(addprefix $(PROJECT_ROOT)/obj-posix-$(ARCH)/$(NAME)/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o))
 
 all: $(OBJ)
-	$(CC) $(CFLAGS) -shared $(OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a -o $(PROJECT_ROOT)/initramfs-$(ARCH)/posix-$(NAME)
+	$(CC) $(CFLAGS) -static $(OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a $(PROJECT_ROOT)/liballoc-$(ARCH).a -o $(PROJECT_ROOT)/initramfs-$(ARCH)/posix-$(NAME)
 
 # Compilation rules for *.c files.
 $(PROJECT_ROOT)/obj-posix-$(ARCH)/$(NAME)/%.c.o: %.c GNUmakefile
 	mkdir -p "$$(dirname $@)"
-	$(CC) $(CFLAGS) -I$(shell pwd)/ -c $< -o $@
+	$(CC) $(CFLAGS) -static -I$(shell pwd)/ -c $< -o $@
