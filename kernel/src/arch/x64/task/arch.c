@@ -43,7 +43,7 @@ void task_arch_init(struct task *task, uint64_t stack, uint64_t entry,
 extern void ret_from_intr();
 
 void task_arch_init_user(struct task *task, uint64_t stack, uint64_t entry,
-                         uint64_t usp) {
+                         uint64_t usp, uint64_t arg) {
 
     task->arch = malloc(sizeof(task_arch_info_t));
     memset(task->arch, 0, sizeof(task_arch_info_t));
@@ -53,6 +53,7 @@ void task_arch_init_user(struct task *task, uint64_t stack, uint64_t entry,
     task->arch->ctx->ss = SELECTOR_USER_DS;
     task->arch->ctx->rip = entry;
     task->arch->ctx->rsp = usp;
+    task->arch->ctx->rdi = arg;
     task->arch->fpu_ctx = alloc_frames_bytes(sizeof(fpu_context_t));
     task->arch->fsbase = 0;
     task->arch->gsbase = 0;

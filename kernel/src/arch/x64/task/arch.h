@@ -48,4 +48,4 @@ struct task;
 void task_arch_init(struct task *task, uint64_t stack, uint64_t entry,
                     uint64_t arg);
 void task_arch_init_user(struct task *task, uint64_t stack, uint64_t entry,
-                         uint64_t usp);
+                         uint64_t usp, uint64_t arg);

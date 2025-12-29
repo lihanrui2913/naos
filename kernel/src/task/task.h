@@ -41,6 +41,8 @@ typedef struct task {
     task_mm_info_t *mm;
     universe_t *universe;
     void *sched_info;
+    // For syscall
+    handle_t *posix_lane;
 } task_t;
 
 extern task_t *arch_get_current();
@@ -60,7 +62,7 @@ void task_unblock(task_t *task);
 
 task_t *task_create(const char *name, uint64_t cap, int priority,
                     uint64_t entry, uint64_t arg, bool is_idle);
-task_t *task_create_user(universe_t *universe, void *ip, void *sp,
-                         uint64_t flags);
+task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
+                         void *sp, uint64_t arg, uint64_t flags);
 
 void task_init();

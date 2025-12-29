@@ -12,6 +12,7 @@
 
 #include "endian.h"
 
+typedef int64_t handle_id_t;
 #define _cleanup_free_ __attribute__((cleanup(free)))
 
 void panic(const char *file, int line, const char *func, const char *cond);

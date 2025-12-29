@@ -109,8 +109,8 @@ task_t *task_create(const char *name, uint64_t cap, int priority,
     return task;
 }
 
-task_t *task_create_user(universe_t *universe, void *ip, void *sp,
-                         uint64_t flags) {
+task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
+                         void *sp, uint64_t arg, uint64_t flags) {
     task_t *task = malloc(sizeof(task_t));
     memset(task, 0, sizeof(task_t));
     task->kernel_stack = (uint64_t)alloc_frames_bytes(STACK_SIZE);
@@ -125,11 +125,14 @@ task_t *task_create_user(universe_t *universe, void *ip, void *sp,
     task->name = strdup("USER");
     task->state = TASK_READY;
     task->block_reason = NULL;
-    task->mm = task_mm_create(task);
-    task_mm_info_t *new_mm = clone_page_table(task->mm, 0);
-    free(task->mm);
-    task->mm = new_mm;
-    task_arch_init_user(task, task->kernel_stack, (uint64_t)ip, (uint64_t)sp);
+    task_mm_info_t *mm = malloc(sizeof(task_mm_info_t));
+    mm->page_table_addr = virt_to_phys(space);
+    mm->ref_count = 1;
+    memset(&mm->task_vma_mgr, 0, sizeof(vma_manager_t));
+    mm->task_vma_mgr.initialized = true;
+    task->mm = mm;
+    task_arch_init_user(task, task->kernel_stack, (uint64_t)ip, (uint64_t)sp,
+                        arg);
 
     universe->refcount++;
     task->universe = universe;

@@ -170,6 +170,7 @@ override SRCFILES += $(shell find src/kcall -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/libs -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/mm -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/init -name "*.[Sc]" | LC_ALL=C sort)
+override SRCFILES += $(shell find src/syscall -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/task -name "*.[Sc]" | LC_ALL=C sort)
 ifeq ($(BOOT_PROTOCOL), limine)
 override SRCFILES += src/boot/limine_boot.c

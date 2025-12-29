@@ -13,3 +13,8 @@ all: $(OBJ)
 $(PROJECT_ROOT)/obj-posix-$(ARCH)/$(NAME)/%.c.o: %.c GNUmakefile
 	mkdir -p "$$(dirname $@)"
 	$(CC) $(CFLAGS) -static -I$(shell pwd)/ -c $< -o $@
+
+# Compilation rules for *.S files.
+$(PROJECT_ROOT)/obj-posix-$(ARCH)/$(NAME)/%.S.o: %.S GNUmakefile
+	mkdir -p "$$(dirname $@)"
+	$(CC) $(CFLAGS) -static -I$(shell pwd)/ -c $< -o $@

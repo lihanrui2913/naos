@@ -1,7 +1,6 @@
 #pragma once
 
 #include <libs/klibc.h>
-#include <task/universe.h>
 
 enum {
     kCallBase = 0x80000000,
@@ -42,6 +41,7 @@ enum {
     kCallInterruptThread = 55,
 
     kCallCreateStream = 60,
+    kCallCreateSpace = 61,
 
     kCallSubmitDescriptor = 70,
 
@@ -115,6 +115,7 @@ typedef struct k_thread_stats {
 enum {
     kNullHandle = 0,
     kThisUniverse = -1,
+    kThisSpace = -3,
     kThisThread = -2,
 };
 

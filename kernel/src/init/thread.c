@@ -1,5 +1,7 @@
 #include <arch/arch.h>
 #include <task/task.h>
+#include <kcall/handle.h>
+#include <kcall/kcall.h>
 
 #include <drivers/bus/pci.h>
 #include <drivers/fb.h>
@@ -11,8 +13,8 @@
 #define USER_STACK_END 0x00007ffffffff000
 #define USER_STACK_START 0x00007fffff000000
 
-void load_elf(const char *path) {
-    initramfs_handle_t *handle = initramfs_lookup("posix-subsystem");
+void load_service(const char *path, uint64_t handle_id) {
+    _cleanup_free_ initramfs_handle_t *handle = initramfs_lookup(path);
     if (!handle)
         return;
     Elf64_Ehdr ehdr;
@@ -57,9 +59,18 @@ void load_elf(const char *path) {
                    PT_FLAG_R | PT_FLAG_W | PT_FLAG_U);
 
     universe_t *u = create_universe();
+    if (handle_id >= 0 &&
+        handle_id < current_task->universe->max_handle_count) {
+        handle_t *handle_id_handle = current_task->universe->handles[handle_id];
+        if (handle_id_handle) {
+            handle_id_handle->refcount++;
+            handle_id = attach_handle(u, handle_id_handle);
+        }
+    }
     can_schedule = false;
     task_t *task =
-        task_create_user(u, (void *)e_entry, (void *)USER_STACK_END, 0);
+        task_create_user(u, clone_page_table(get_current_page_dir(false), 0),
+                         (void *)e_entry, (void *)USER_STACK_END, handle_id, 0);
     drop_universe(u);
     vma_t *vma = vma_alloc();
     vma->vm_start = load_low;
@@ -82,6 +93,18 @@ void load_elf(const char *path) {
     }
     unmap_page_range(get_current_page_dir(false), USER_STACK_START,
                      USER_STACK_END - USER_STACK_START);
+}
+
+handle_t *posix_lane = NULL;
+
+void run_services() {
+    handle_id_t client_out, posix_lane_id;
+    kCreateStreamImpl(&client_out, &posix_lane_id);
+    posix_lane = current_task->universe->handles[posix_lane_id];
+    posix_lane->refcount++;
+    detatch_handle(current_task->universe, posix_lane_id);
+    load_service("posix-subsystem", client_out);
+    detatch_handle(current_task->universe, client_out);
 }
 
 extern void acpi_init_after_pci();
@@ -107,7 +130,7 @@ void init_thread() {
 
     printk("System initialized, ready to go to userland.\n");
 
-    load_elf("/posix-subsystem");
+    run_services();
 
     while (1) {
         arch_enable_interrupt();

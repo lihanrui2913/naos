@@ -1,4 +1,5 @@
-export CFLAGS := -g3 -O0 -nostdlib -isystem $(PROJECT_ROOT)/kernel/freestnd-c-hdrs -I$(PROJECT_ROOT)/kernel/src/
+export CFLAGS := -g3 -O0 -nostdlib -isystem $(PROJECT_ROOT)/kernel/freestnd-c-hdrs -I$(PROJECT_ROOT)/kernel/src/ -I$(shell pwd)/subsystem
 
 all:
+	$(MAKE) -C init
 	$(MAKE) -C subsystem

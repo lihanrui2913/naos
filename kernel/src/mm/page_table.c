@@ -277,33 +277,19 @@ static void free_page_table_recursive(uint64_t *table, int level) {
     free_frames((uint64_t)virt_to_phys((uint64_t)table), 1);
 }
 
-task_mm_info_t *clone_page_table(task_mm_info_t *old, uint64_t clone_flags) {
-    if ((clone_flags & KERNEL_IS_VM_CLONE) && old) {
-        old->ref_count++;
-        return old;
-    }
-    task_mm_info_t *new_mm = (task_mm_info_t *)malloc(sizeof(task_mm_info_t));
-    memset(new_mm, 0, sizeof(task_mm_info_t));
-    new_mm->page_table_addr = virt_to_phys(copy_page_table_recursive(
-        (uint64_t *)old->page_table_addr, ARCH_MAX_PT_LEVEL));
+uint64_t *clone_page_table(uint64_t *old, uint64_t clone_flags) {
+    uint64_t *page_table_addr = virt_to_phys(
+        copy_page_table_recursive((uint64_t *)old, ARCH_MAX_PT_LEVEL));
 #if defined(__x86_64__) || defined(__riscv__)
-    memcpy((uint64_t *)phys_to_virt(new_mm->page_table_addr) + 256,
-           (uint64_t *)phys_to_virt(old->page_table_addr) + 256,
-           DEFAULT_PAGE_SIZE / 2);
+    memcpy((uint64_t *)phys_to_virt(page_table_addr) + 256,
+           (uint64_t *)phys_to_virt(old) + 256, DEFAULT_PAGE_SIZE / 2);
 #endif
-    new_mm->ref_count = 1;
-    vma_manager_copy(&new_mm->task_vma_mgr, &old->task_vma_mgr);
-    new_mm->task_vma_mgr.initialized = true;
-    return new_mm;
+    return phys_to_virt(page_table_addr);
 }
 
-void free_page_table(task_mm_info_t *directory) {
-    if (--directory->ref_count <= 0) {
-        free_page_table_recursive(
-            (uint64_t *)phys_to_virt(directory->page_table_addr),
-            ARCH_MAX_PT_LEVEL);
-        free(directory);
-    }
+void free_page_table(uint64_t *directory) {
+    free_page_table_recursive((uint64_t *)phys_to_virt(directory),
+                              ARCH_MAX_PT_LEVEL);
 }
 
 void page_table_init() {

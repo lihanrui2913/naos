@@ -125,20 +125,17 @@ kernel:
 
 user: user/.build-stamp-$(ARCH)
 user/.build-stamp-$(ARCH):
-	$(MAKE) -C user
 	touch $@
 
 .PHONY: clean
 clean:
 	$(MAKE) -C kernel clean
-	$(MAKE) -C user clean
-	rm -rf $(IMAGE_NAME).img
+	rm -rf $(IMAGE_NAME).img obj-posix-*
 
 .PHONY: distclean
 distclean:
 	$(MAKE) -C kernel distclean
-	$(MAKE) -C user distclean
-	rm -rf $(IMAGE_NAME).img assets
+	rm -rf $(IMAGE_NAME).img obj-posix-* assets
 
 clippy:
 	$(MAKE) -C kernel clippy

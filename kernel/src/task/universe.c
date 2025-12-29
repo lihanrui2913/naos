@@ -24,16 +24,24 @@ handle_id_t attach_handle(universe_t *u, handle_t *h) {
 
 void detatch_handle(universe_t *u, handle_id_t id) {
     if (u->handles[id]) {
-        free(u->handles[id]);
+        u->handles[id]->refcount--;
+        handle_t *handle = u->handles[id];
         u->handles[id] = NULL;
+        if (handle->refcount > 0)
+            return;
+        free(handle);
     }
 }
 
 void drop_universe(universe_t *u) {
     u->refcount--;
     if (u->refcount <= 0) {
-        if (u->handles)
+        if (u->handles) {
+            for (uint64_t i = 0; i < u->max_handle_count; i++) {
+                detatch_handle(u, i);
+            }
             free(u->handles);
+        }
         free(u);
     }
 }

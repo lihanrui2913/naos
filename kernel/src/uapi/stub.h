@@ -100,11 +100,12 @@ static inline k_error_t kSetMemoryInfo(handle_id_t handle, size_t info) {
     return (k_error_t)syscall(kCallBase + kCallSetMemoryInfo, handle, info);
 }
 
-static inline k_error_t kMapMemory(handle_id_t memory_handle, void *pointer,
-                                   uintptr_t offset, size_t size,
-                                   uint32_t flags, void **actual_pointer) {
+static inline k_error_t kMapMemory(handle_id_t memory_handle,
+                                   handle_id_t space_id, void *pointer,
+                                   size_t size, uint32_t flags,
+                                   void **actual_pointer) {
     return (k_error_t)syscall(kCallBase + kCallMapMemory, memory_handle,
-                              pointer, offset, size, flags, actual_pointer);
+                              space_id, pointer, size, flags, actual_pointer);
 }
 
 static inline k_error_t kUnmapMemory(handle_id_t memory_handle, void *pointer,
@@ -119,11 +120,15 @@ static inline k_error_t kCreatePhysicalMemory(uintptr_t paddr, size_t size,
                               size, info, out);
 }
 
-static inline k_error_t kCreateThread(handle_id_t universe, void *ip, void *sp,
-                                      uint32_t flags,
+static inline k_error_t kCreateSpace(handle_id_t *out) {
+    return (k_error_t)syscall(kCallBase + kCallCreateSpace, out);
+}
+
+static inline k_error_t kCreateThread(handle_id_t universe, handle_id_t space,
+                                      void *ip, void *sp, uint64_t arg,
                                       handle_id_t *thread_handle_out) {
-    return (k_error_t)syscall(kCallBase + kCallCreateThread, universe, ip, sp,
-                              flags, thread_handle_out);
+    return (k_error_t)syscall(kCallBase + kCallCreateThread, universe, space,
+                              ip, sp, arg, thread_handle_out);
 }
 
 static inline k_error_t kQueryThreadStats(handle_id_t thread_handle,

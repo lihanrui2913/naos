@@ -24,15 +24,19 @@ k_error_t kAllocateMemoryImpl(size_t size, uint32_t flags,
 k_error_t kResizeMemoryImpl(handle_id_t handle, size_t new_size);
 k_error_t kGetMemoryInfoImpl(handle_id_t handle, size_t *len, size_t *info);
 k_error_t kSetMemoryInfoImpl(handle_id_t handle, size_t info);
-k_error_t kMapMemoryImpl(handle_id_t memory_handle, void *pointer,
-                         uintptr_t offset, size_t size, uint32_t flags,
+k_error_t kMapMemoryImpl(handle_id_t memory_handle, handle_id_t space_id,
+                         void *pointer, size_t size, uint32_t flags,
                          void **actual_pointer);
 k_error_t kUnmapMemoryImpl(handle_id_t memory_handle, void *pointer,
                            size_t size);
 k_error_t kCreatePhysicalMemoryImpl(uintptr_t paddr, size_t size, size_t info,
                                     handle_id_t *out);
 k_error_t kCreateStreamImpl(handle_id_t *handle_out1, handle_id_t *handle_out2);
-k_error_t kCreateThreadImpl(handle_id_t universe, void *ip, void *sp,
-                            uint32_t flags, handle_id_t *thread_handle_out);
+k_error_t kCreateSpaceImpl(handle_id_t *out);
+k_error_t kCreateThreadImpl(handle_id_t universe, handle_id_t space, void *ip,
+                            void *sp, uint64_t arg,
+                            handle_id_t *thread_handle_out);
+k_error_t kLoadRegistersImpl(handle_id_t handle, int set, void *image);
+k_error_t kStoreRegistersImpl(handle_id_t handle, int set, const void *image);
 k_error_t kSubmitDescriptorImpl(handle_id_t handle, k_action_t *action,
                                 size_t count, uint32_t flags);

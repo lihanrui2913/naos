@@ -20,19 +20,17 @@ typedef struct thread_handle {
     task_t *task;
 } thread_handle_t;
 
-typedef struct queue_node {
-    struct llist_header node;
-    int action_type;
-    char *buffer;
-    size_t length;
-} queue_node_t;
+typedef struct space {
+    uint64_t *page_table_addr;
+} space_t;
 
-typedef struct queue_handle {
-    struct llist_header nodes;
-} queue_handle_t;
+typedef struct space_handle {
+    space_t *space;
+} space_handle_t;
 
 #define LANE_BUFFER_SIZE 65536
 #define LANE_PENDING_DESC_NUM 64
+#define LANE_MAX_CONNECTIONS 16
 
 typedef struct lane {
     spinlock_t lock;
@@ -42,6 +40,8 @@ typedef struct lane {
     size_t recv_size;
 
     struct lane *peer;
+    struct lane *connections[LANE_MAX_CONNECTIONS];
+    bool peer_connected;
 } lane_t;
 
 typedef struct lane_handle {
@@ -53,7 +53,7 @@ typedef struct handle {
         UNIVERSE,
         MEMORY,
         THREAD,
-        QUEUE,
+        SPACE,
         LANE,
     } handle_type;
     int refcount;
@@ -61,7 +61,7 @@ typedef struct handle {
         universe_handle_t universe;
         memory_handle_t memory;
         thread_handle_t thread;
-        queue_handle_t queue;
+        space_handle_t space;
         lane_handle_t lane;
     };
 } handle_t;

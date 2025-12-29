@@ -1,7 +1,9 @@
 #include <arch/arch.h>
 #include <arch/x64/syscall/nr.h>
 #include <libs/strerror.h>
+#include <kcall/handle.h>
 #include <kcall/kcall.h>
+#include <task/task.h>
 
 void syscall_init() {
     uint64_t efer;
@@ -76,6 +78,8 @@ void syscall_handler_init() {
 
 spinlock_t syscall_debug_lock = SPIN_INIT;
 
+extern handle_t *posix_lane;
+
 void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     regs->rip = regs->rcx;
     regs->rflags = regs->r11;
@@ -96,16 +100,27 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
         goto maybe_kcall;
     }
 
+    if (!current_task->posix_lane) {
+        handle_id_t handle1, handle2;
+        kCreateStreamImpl(&handle1, handle2);
+        current_task->posix_lane =
+            current_task->universe->handles[handle1]->lane.lane;
+        posix_lane->lane.lane->peer->connections[0] =
+            current_task->universe->handles[handle2]->lane.lane;
+    }
+
     if (idx > MAX_SYSCALL_NUM) {
+        printk("Syscall %d not implemented\n", idx);
         regs->rax = (uint64_t)-ENOSYS;
     }
 
     syscall_handle_t handler = syscall_handlers[idx];
     if (!handler) {
+        printk("Syscall %d not implemented\n", idx);
         regs->rax = (uint64_t)-ENOSYS;
     }
 
-    regs->rax = 0;
+    regs->rax = handler(arg1, arg2, arg3, arg4, arg5, arg6);
 
     goto done;
 

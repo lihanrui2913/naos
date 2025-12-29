@@ -4,8 +4,6 @@
 #include <mm/mm.h>
 #include <uapi/kernel.h>
 
-typedef int64_t handle_id_t;
-
 struct handle;
 typedef struct handle handle_t;
 

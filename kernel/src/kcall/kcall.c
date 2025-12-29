@@ -70,6 +70,20 @@ universe_t *get_universe(handle_id_t handle_id) {
     return current_task->universe->handles[handle_id]->universe.universe;
 }
 
+uint64_t *get_space(handle_id_t handle_id) {
+    if (handle_id == kThisSpace) {
+        return phys_to_virt(current_task->mm->page_table_addr);
+    }
+    if (handle_id < 0 || handle_id > current_task->universe->max_handle_count)
+        return NULL;
+    if (!current_task->universe->handles[handle_id])
+        return NULL;
+    if (current_task->universe->handles[handle_id]->handle_type != SPACE)
+        return NULL;
+    return phys_to_virt(current_task->universe->handles[handle_id]
+                            ->space.space->page_table_addr);
+}
+
 bool read_user_memory(void *kptr, const void *uptr, size_t size) {
     uintptr_t limit;
     if (__builtin_add_overflow((uint64_t)uptr, size, &limit))
@@ -241,6 +255,7 @@ k_error_t kCloseDescriptorImpl(handle_id_t universe_handle,
     if (!handle) {
         return kErrBadDescriptor;
     }
+    // TODO: Free inner handles
     detatch_handle(universe, handle_id);
     free(handle);
     return kErrNone;
@@ -360,8 +375,8 @@ k_error_t kSetMemoryInfoImpl(handle_id_t handle_id, size_t info) {
     return kErrNone;
 }
 
-k_error_t kMapMemoryImpl(handle_id_t memory_handle, void *pointer,
-                         uintptr_t offset, size_t size, uint32_t flags,
+k_error_t kMapMemoryImpl(handle_id_t memory_handle, handle_id_t space_id,
+                         void *pointer, size_t size, uint32_t flags,
                          void **actual_pointer) {
     if (memory_handle < 0 ||
         memory_handle > current_task->universe->max_handle_count)
@@ -373,6 +388,10 @@ k_error_t kMapMemoryImpl(handle_id_t memory_handle, void *pointer,
     if (handle->handle_type != MEMORY) {
         return kErrBadDescriptor;
     }
+    uint64_t *space = get_space(space_id);
+    if (!space) {
+        return kErrBadDescriptor;
+    }
     if (!pointer) {
         pointer = (void *)find_unmapped_area(&current_task->mm->task_vma_mgr,
                                              (uint64_t)pointer, size);
@@ -380,8 +399,8 @@ k_error_t kMapMemoryImpl(handle_id_t memory_handle, void *pointer,
     if (!write_user_memory(actual_pointer, &pointer, sizeof(void *))) {
         return kErrFault;
     }
-    map_page_range(get_current_page_dir(false), (uint64_t)pointer,
-                   handle->memory.address, size, handle->memory.info);
+    map_page_range(space, (uint64_t)pointer, handle->memory.address, size,
+                   handle->memory.info);
     return kErrNone;
 }
 
@@ -437,7 +456,9 @@ k_error_t kCreateStreamImpl(handle_id_t *handle_out1,
     lane2->pending_descs = calloc(LANE_PENDING_DESC_NUM, sizeof(handle_t *));
 
     lane2->peer = lane1;
+    lane2->peer_connected = true;
     lane1->peer = lane2;
+    lane1->peer_connected = true;
 
     handle_t *handle1 = malloc(sizeof(handle_t));
     handle1->refcount = 1;
@@ -458,10 +479,28 @@ k_error_t kCreateStreamImpl(handle_id_t *handle_out1,
     return kErrNone;
 }
 
-k_error_t kCreateThreadImpl(handle_id_t universe_id, void *ip, void *sp,
-                            uint32_t flags, handle_id_t *thread_handle_out) {
+k_error_t kCreateSpaceImpl(handle_id_t *out) {
+    handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
+    handle->handle_type = SPACE;
+    handle->space.space = clone_page_table(get_current_page_dir(false), 0);
+
+    handle_id_t id = attach_handle(current_task->universe, handle);
+
+    *out = id;
+
+    return kErrNone;
+}
+
+k_error_t kCreateThreadImpl(handle_id_t universe_id, handle_id_t space_id,
+                            void *ip, void *sp, uint64_t arg,
+                            handle_id_t *thread_handle_out) {
     universe_t *universe = get_universe(universe_id);
     if (!universe) {
+        return kErrBadDescriptor;
+    }
+    uint64_t *page_table_addr = get_space(space_id);
+    if (!page_table_addr) {
         return kErrBadDescriptor;
     }
 
@@ -477,11 +516,15 @@ k_error_t kCreateThreadImpl(handle_id_t universe_id, void *ip, void *sp,
         free(handle);
         return kErrFault;
     }
-    task_t *task = task_create_user(universe, ip, sp, flags);
+    task_t *task = task_create_user(universe, page_table_addr, ip, sp, arg, 0);
     handle->thread.task = task;
 
     return kErrNone;
 }
+
+k_error_t kLoadRegistersImpl(handle_id_t handle, int set, void *image) {}
+
+k_error_t kStoreRegistersImpl(handle_id_t handle, int set, const void *image) {}
 
 k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
                                 size_t count, uint32_t flags) {
@@ -501,15 +544,12 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
     if (!self) {
         return kErrBadDescriptor;
     }
-    lane_t *peer = self->peer;
-    if (!peer) {
-        return kErrDismissed;
-    }
 
     if (!read_user_memory(actions, action, sizeof(k_action_t) * count))
         return kErrFault;
 
-    size_t recv_pos = peer->recv_pos;
+    size_t recv_pos =
+        (self->peer && self->peer->peer_connected) ? self->peer->recv_pos : 0;
     for (size_t i = 0; i < count; i++) {
         k_action_t *recipe = &actions[i];
 
@@ -517,30 +557,51 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
         case kActionDismiss:
             break;
         case kActionOffer:
+            handle_t *remote_handle =
+                current_task->universe->handles[recipe->handle];
+            if (remote_handle->handle_type != LANE)
+                continue;
+            remote_handle->refcount++;
+            detatch_handle(current_task->universe, recipe->handle);
+            lane_t *remote_lane = remote_handle->lane.lane;
+            spin_lock(&self->peer->lock);
+            for (int i = 0; i < LANE_MAX_CONNECTIONS; i++) {
+                if (!self->peer->connections[i]) {
+                    self->peer->connections[i] = remote_lane;
+                    break;
+                }
+            }
+            spin_unlock(&self->peer->lock);
             break;
         case kActionAccept:
             break;
         case kActionSendFromBuffer:
+            if (!self->peer || !self->peer->peer_connected) {
+                return kErrDismissed;
+            }
             // TODO: Now we ensure the length < recv_size
-            spin_lock(&peer->lock);
-            read_user_memory(peer->recv_buff + recv_pos, action->buffer,
+            spin_lock(&self->peer->lock);
+            read_user_memory(self->peer->recv_buff + recv_pos, action->buffer,
                              action->length);
             recv_pos += action->length;
-            spin_unlock(&peer->lock);
+            spin_unlock(&self->peer->lock);
             break;
         case kActionRecvToBuffer:
             break;
         case kActionPushDescriptor:
-            spin_lock(&peer->lock);
+            if (!self->peer || !self->peer->peer_connected) {
+                return kErrDismissed;
+            }
+            spin_lock(&self->peer->lock);
             handle_t *handle = current_task->universe->handles[action->handle];
             for (int i = 0; i < LANE_PENDING_DESC_NUM; i++) {
-                if (!peer->pending_descs[i]) {
+                if (!self->peer->pending_descs[i]) {
                     handle->refcount++;
-                    peer->pending_descs[i] = handle;
+                    self->peer->pending_descs[i] = handle;
                     break;
                 }
             }
-            spin_unlock(&peer->lock);
+            spin_unlock(&self->peer->lock);
             break;
         case kActionPullDescriptor:
             break;
@@ -548,13 +609,15 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
             break;
         }
     }
-    peer->recv_pos = recv_pos;
+    if (self->peer && self->peer->peer_connected) {
+        self->peer->recv_pos = recv_pos;
+    }
 
     if (flags & KCALL_SUBMIT_NO_RECEIVING) {
         return kErrNone;
     }
 
-    while (!self->recv_pos) {
+    while (self->peer ? !self->recv_pos : self->connections[0]) {
         schedule(SCHED_YIELD);
     }
 
@@ -568,6 +631,19 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
         case kActionOffer:
             break;
         case kActionAccept:
+            if (self->connections[0]) {
+                lane_t *remote = self->connections[0];
+
+                handle_t *handle = malloc(sizeof(handle_t));
+                handle->refcount = 1;
+                handle->handle_type = LANE;
+                handle->lane.lane = remote;
+
+                recipe->handle = attach_handle(current_task->universe, handle);
+
+                memmove(self->connections, &self->connections[1],
+                        sizeof(struct lane *) * (LANE_MAX_CONNECTIONS - 1));
+            }
             break;
         case kActionSendFromBuffer:
             break;
