@@ -1,5 +1,6 @@
 #pragma once
 
+#include <libs/llist.h>
 #include <mm/page_table_flags.h>
 #include <uapi/kcall.h>
 #include <uapi/stub.h>
@@ -23,7 +24,9 @@ typedef struct posix_timer_context {
 } posix_timer_context_t;
 
 typedef struct process {
+    struct llist_header node;
     handle_id_t thread_handle;
+    uint64_t thread_id;
     vm_context_t *vm_ctx;
     fs_context_t *fs_ctx;
     file_context_t *file_ctx;
@@ -33,6 +36,8 @@ typedef struct process {
 
 typedef struct posix_process_arg {
     handle_id_t space_handle;
+    uint64_t load_start;
+    uint64_t load_end;
     void *ip;
     int argc;
     char **argv;
@@ -43,6 +48,10 @@ typedef struct posix_process_arg {
 posix_process_arg_t *process_arg_new(char *path, char *argv[], char *envp[]);
 void process_arg_free(posix_process_arg_t *arg);
 
+process_t *process_find(uint64_t thread_id);
+
 process_t *process_new(const posix_process_arg_t *arg);
 
-void spawn_init_process();
+process_t *spawn_init_process();
+
+void process_init();

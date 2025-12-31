@@ -115,6 +115,7 @@ typedef struct k_create_thread_arg {
 } k_create_thread_arg_t;
 
 typedef struct k_thread_stats {
+    uint64_t thread_id;
     uint64_t user_time;
 } k_thread_stats_t;
 

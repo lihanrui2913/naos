@@ -43,11 +43,13 @@ void posix_main(int lane) {
 
         server_res->type = client_req.type;
 
+        process_t *proc = process_find(client_req.pid);
+
         switch (client_req.opcode) {
         case REQUEST_VM_MAP:
             map_request_t *req = request_data;
             server_res->res_code =
-                posix_vm_map(req->address_hint, req->size, req->mode,
+                posix_vm_map(proc, req->address_hint, req->size, req->mode,
                              req->flags, req->fd, req->rel_offset);
             break;
 
@@ -74,7 +76,9 @@ void main(int lane) {
 
     vfs_init();
 
-    spawn_init_process();
+    process_init();
+
+    process_t *init_process = spawn_init_process();
 
     while (1) {
         k_action_t accept_action = {
@@ -83,12 +87,6 @@ void main(int lane) {
         };
         k_error_t error = kSubmitDescriptor(lane, &accept_action, 1, 0);
         if (error == kErrNone) {
-            handle_id_t universe_handle;
-            kCreateUniverse(&universe_handle);
-            handle_id_t remote_handle;
-            kTransferDescriptor(accept_action.handle, universe_handle,
-                                kTransferDescriptorOut, &remote_handle);
-
             handle_id_t space_handle;
             kCreateSpace(&space_handle);
             kForkMemory(kThisSpace, space_handle);
@@ -106,8 +104,8 @@ void main(int lane) {
             k_create_thread_arg_t arg;
             arg.ip = _posix_main;
             arg.sp = stack_start + USER_STACK_SIZE;
-            arg.arg = remote_handle;
-            kCreateThread(universe_handle, space_handle, &arg, 0,
+            arg.arg = accept_action.handle;
+            kCreateThread(kThisUniverse, space_handle, &arg, 0,
                           &service_handle);
         }
     }

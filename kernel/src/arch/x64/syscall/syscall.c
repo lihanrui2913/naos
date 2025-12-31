@@ -42,12 +42,37 @@ void syscall_init() {
     wrmsr(MSR_SYSCALL_MASK, (1 << 9));
 }
 
+#define ARCH_SET_GS 0x1001
+#define ARCH_SET_FS 0x1002
+#define ARCH_GET_FS 0x1003
+#define ARCH_GET_GS 0x1004
+
+uint64_t sys_arch_prctl(uint64_t cmd, uint64_t arg) {
+    switch (cmd) {
+    case ARCH_SET_FS:
+        current_task->arch->fsbase = arg;
+        write_fsbase(current_task->arch->fsbase);
+        return 0;
+    case ARCH_SET_GS:
+        current_task->arch->gsbase = arg;
+        write_gsbase(current_task->arch->gsbase);
+        return 0;
+    case ARCH_GET_FS:
+        return current_task->arch->fsbase;
+    case ARCH_GET_GS:
+        return current_task->arch->gsbase;
+    default:
+        return (uint64_t)(-ENOSYS);
+    }
+}
+
 syscall_handle_t syscall_handlers[MAX_SYSCALL_NUM];
 syscall_handle_t kcall_handlers[110];
 
 void syscall_handler_init() {
     memset(syscall_handlers, 0, sizeof(syscall_handlers));
     syscall_handlers[SYS_MMAP] = (syscall_handle_t)sys_mmap;
+    syscall_handlers[SYS_ARCH_PRCTL] = (syscall_handle_t)sys_arch_prctl;
 
     memset(kcall_handlers, 0, sizeof(kcall_handlers));
     kcall_handlers[kCallLog] = (syscall_handle_t)kCallLogImpl;
@@ -77,6 +102,8 @@ void syscall_handler_init() {
     kcall_handlers[kCallCreateStream] = (syscall_handle_t)kCreateStreamImpl;
     kcall_handlers[kCallCreateSpace] = (syscall_handle_t)kCreateSpaceImpl;
     kcall_handlers[kCallCreateThread] = (syscall_handle_t)kCreateThreadImpl;
+    kcall_handlers[kCallQueryThreadStats] =
+        (syscall_handle_t)kQueryThreadStatsImpl;
     kcall_handlers[kCallSubmitDescriptor] =
         (syscall_handle_t)kSubmitDescriptorImpl;
     kcall_handlers[kCallLookupInitramfs] =

@@ -37,6 +37,8 @@ k_error_t kCreateSpaceImpl(handle_id_t *out);
 k_error_t kCreateThreadImpl(handle_id_t universe, handle_id_t space,
                             const k_create_thread_arg_t *arg, uint64_t flags,
                             handle_id_t *thread_handle_out);
+k_error_t kQueryThreadStatsImpl(handle_id_t thread_handle,
+                                k_thread_stats_t *stats);
 k_error_t kLoadRegistersImpl(handle_id_t handle, int set, void *image);
 k_error_t kStoreRegistersImpl(handle_id_t handle, int set, const void *image);
 k_error_t kSubmitDescriptorImpl(handle_id_t handle, k_action_t *action,

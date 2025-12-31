@@ -84,6 +84,20 @@ uint64_t *get_space(handle_id_t handle_id) {
                             ->space.space->page_table_addr);
 }
 
+task_t *get_thread(handle_id_t handle_id) {
+    if (handle_id == kThisThread) {
+        return current_task;
+    }
+    if (handle_id < 0 || handle_id > current_task->universe->max_handle_count)
+        return NULL;
+    if (!current_task->universe->handles[handle_id])
+        return NULL;
+    if (current_task->universe->handles[handle_id]->handle_type != THREAD)
+        return NULL;
+    return phys_to_virt(
+        current_task->universe->handles[handle_id]->thread.task);
+}
+
 bool read_user_memory(void *kptr, const void *uptr, size_t size) {
     uintptr_t limit;
     if (__builtin_add_overflow((uint64_t)uptr, size, &limit))
@@ -602,6 +616,16 @@ k_error_t kCreateThreadImpl(handle_id_t universe_id, handle_id_t space_id,
                                     arg->arg, flags);
     handle->thread.task = task;
 
+    return kErrNone;
+}
+
+k_error_t kQueryThreadStatsImpl(handle_id_t thread_handle,
+                                k_thread_stats_t *stats) {
+    task_t *task = get_thread(thread_handle);
+    if (!task) {
+        return kErrBadDescriptor;
+    }
+    stats->thread_id = task->pid;
     return kErrNone;
 }
 

@@ -77,6 +77,8 @@ task_mm_info_t *task_mm_create(task_t *task) {
 
 task_t *task_create(const char *name, uint64_t cap, int priority,
                     uint64_t entry, uint64_t arg, bool is_idle) {
+    spin_lock(&tasks_list_lock);
+
     task_t *task = malloc(sizeof(task_t));
     memset(task, 0, sizeof(task_t));
     task->kernel_stack = (uint64_t)alloc_frames_bytes(STACK_SIZE);
@@ -96,9 +98,7 @@ task_t *task_create(const char *name, uint64_t cap, int priority,
 
     task->universe = create_universe();
 
-    spin_lock(&tasks_list_lock);
     llist_append(&tasks_list, &task->node);
-    spin_unlock(&tasks_list_lock);
 
     task->sched_info = malloc(sizeof(struct sched_entity));
     memset(task->sched_info, 0, sizeof(struct sched_entity));
@@ -107,11 +107,16 @@ task_t *task_create(const char *name, uint64_t cap, int priority,
         schedulers[task->cpu_id].idle = task->sched_info;
         remove_sched_entity(task, &schedulers[task->cpu_id]);
     }
+
+    spin_unlock(&tasks_list_lock);
+
     return task;
 }
 
 task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
                          void *sp, uint64_t arg, uint64_t flags) {
+    spin_lock(&tasks_list_lock);
+
     task_t *task = malloc(sizeof(task_t));
     memset(task, 0, sizeof(task_t));
     task->kernel_stack = (uint64_t)alloc_frames_bytes(STACK_SIZE);
@@ -142,13 +147,13 @@ task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
     universe->refcount++;
     task->universe = universe;
 
-    spin_lock(&tasks_list_lock);
     llist_append(&tasks_list, &task->node);
-    spin_unlock(&tasks_list_lock);
 
     task->sched_info = malloc(sizeof(struct sched_entity));
     memset(task->sched_info, 0, sizeof(struct sched_entity));
     add_sched_entity(task, &schedulers[task->cpu_id]);
+
+    spin_unlock(&tasks_list_lock);
 
     return task;
 }

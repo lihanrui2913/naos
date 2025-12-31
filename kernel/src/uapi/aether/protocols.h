@@ -342,6 +342,7 @@ typedef struct request {
     uint64_t magic;
     uint64_t type;
     uint64_t opcode;
+    uint64_t pid;
     uint64_t data_len;
     char data[];
 } request_t;

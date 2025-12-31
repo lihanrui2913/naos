@@ -9,11 +9,6 @@
 
 #define MAX_USABLE_REGIONS_COUNT 128
 
-#define PROT_NONE 0x00
-#define PROT_READ 0x01
-#define PROT_WRITE 0x02
-#define PROT_EXEC 0x04
-
 typedef struct task_mm_info {
     uint64_t *page_table_addr;
     int ref_count;

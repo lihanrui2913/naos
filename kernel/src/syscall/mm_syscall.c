@@ -9,6 +9,7 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
     mmap_request->magic = REQUEST_MAGIC;
     mmap_request->type = REQUEST_TYPE_POSIX;
     mmap_request->opcode = REQUEST_VM_MAP;
+    mmap_request->pid = current_task->pid;
     mmap_request->data_len = sizeof(map_request_t);
     map_request_t *map_request = (map_request_t *)mmap_request->data;
     map_request->address_hint = addr;

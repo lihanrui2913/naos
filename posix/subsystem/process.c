@@ -2,9 +2,11 @@
 #include "process.h"
 #include "elf.h"
 
-vm_context_t *vm_context_new() {
+struct llist_header processes_list;
+
+vm_context_t *vm_context_new(handle_id_t space_handle) {
     vm_context_t *ctx = malloc(sizeof(vm_context_t));
-    kCreateSpace(&ctx->space_handle);
+    ctx->space_handle = space_handle;
     memset(&ctx->vma_mgr, 0, sizeof(vma_manager_t));
     ctx->vma_mgr.initialized = true;
     return ctx;
@@ -12,6 +14,7 @@ vm_context_t *vm_context_new() {
 
 posix_process_arg_t *process_arg_new(char *path, char *argv[], char *envp[]) {
     // TODO
+    return NULL;
 }
 
 void process_arg_free(posix_process_arg_t *arg) {
@@ -133,12 +136,22 @@ void *push_infos(void *current_stack, char *argv[], int argv_count,
     return tmp_stack;
 }
 
+process_t *process_find(uint64_t thread_id) {
+    process_t *proc, *tmp;
+    llist_for_each(proc, tmp, &processes_list, node) {
+        if (proc->thread_id == thread_id)
+            return proc;
+    }
+    return NULL;
+}
+
 #define USER_STACK_START 0x00005fffff000000
 #define USER_STACK_END 0x0000600000000000
 
 process_t *process_new(const posix_process_arg_t *arg) {
     process_t *p = malloc(sizeof(process_t));
-    p->vm_ctx = vm_context_new();
+    memset(p, 0, sizeof(process_t));
+    p->vm_ctx = vm_context_new(arg->space_handle);
     // Other
     handle_id_t stack_memory_handle;
     k_allocate_restrictions_t res = {.address_bits = 64};
@@ -150,7 +163,7 @@ process_t *process_new(const posix_process_arg_t *arg) {
                USER_STACK_END - USER_STACK_START, 0, &current_stack);
     current_stack += (USER_STACK_END - USER_STACK_START);
     void *this_space_current_stack;
-    kMapMemory(stack_memory_handle, kThisSpace, (void *)USER_STACK_START,
+    kMapMemory(stack_memory_handle, kThisSpace, NULL,
                USER_STACK_END - USER_STACK_START, 0, &this_space_current_stack);
     void *new_stack = push_infos(
         this_space_current_stack + (USER_STACK_END - USER_STACK_START),
@@ -169,12 +182,27 @@ process_t *process_new(const posix_process_arg_t *arg) {
     kCreateThread(universe_handle, arg->space_handle, &kcarg,
                   K_THREAD_FLAGS_POSIX, &thread_handle);
     p->thread_handle = thread_handle;
+    k_thread_stats_t stats;
+    kQueryThreadStats(p->thread_handle, &stats);
+    p->thread_id = stats.thread_id;
+    llist_init_head(&p->node);
+    llist_append(&processes_list, &p->node);
+
+    vma_t *exec_vma = vma_alloc();
+    exec_vma->vm_start = arg->load_start;
+    exec_vma->vm_end = arg->load_end;
+    vma_insert(&p->vm_ctx->vma_mgr, exec_vma);
+    vma_t *stack_vma = vma_alloc();
+    stack_vma->vm_start = USER_STACK_START;
+    stack_vma->vm_end = USER_STACK_END;
+    vma_insert(&p->vm_ctx->vma_mgr, stack_vma);
+
     return p;
 }
 
 #define INIT_PROCESS "posix-init"
 
-void spawn_init_process() {
+process_t *spawn_init_process() {
     handle_id_t initramfs_handle;
     kLookupInitramfs(INIT_PROCESS, &initramfs_handle);
     posix_process_arg_t *arg = malloc(sizeof(posix_process_arg_t));
@@ -186,10 +214,18 @@ void spawn_init_process() {
                    ehdr.e_phnum * sizeof(Elf64_Phdr));
     handle_id_t space_handle;
     kCreateSpace(&space_handle);
+    uint64_t load_low = UINT64_MAX;
+    uint64_t load_high = 0;
     for (Elf64_Half i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr *phdr = &phdrs[i];
         if (phdr->p_type != PT_LOAD)
             continue;
+        if (phdr->p_vaddr < load_low) {
+            load_low = phdr->p_vaddr;
+        }
+        if (phdr->p_vaddr + phdr->p_memsz > load_high) {
+            load_high = phdr->p_vaddr + phdr->p_memsz;
+        }
         size_t start = PADDING_DOWN(phdr->p_vaddr, DEFAULT_PAGE_SIZE);
         size_t offset = phdr->p_vaddr - start;
         size_t size =
@@ -215,10 +251,17 @@ void spawn_init_process() {
     }
     kCloseDescriptor(kThisUniverse, initramfs_handle);
     arg->space_handle = space_handle;
+    load_low = PADDING_DOWN(load_low, DEFAULT_PAGE_SIZE);
+    load_high = PADDING_UP(load_high, DEFAULT_PAGE_SIZE);
+    arg->load_start = load_low;
+    arg->load_end = load_high;
     arg->ip = (void *)ehdr.e_entry;
     arg->argc = 1;
     arg->argv = calloc(1, sizeof(char *));
     arg->argv[0] = strdup(INIT_PROCESS);
     process_t *process = process_new(arg);
     process_arg_free(arg);
+    return process;
 }
+
+void process_init() { llist_init_head(&processes_list); }

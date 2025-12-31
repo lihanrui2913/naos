@@ -13,13 +13,16 @@ universe_t *create_universe() {
 }
 
 handle_id_t attach_handle(universe_t *u, handle_t *h) {
-    for (handle_id_t id = 0; id < u->max_handle_count; id++) {
-        if (u->handles[id])
-            continue;
-        u->handles[id] = h;
-        return id;
+    while (1) {
+        for (handle_id_t id = 0; id < u->max_handle_count; id++) {
+            if (u->handles[id])
+                continue;
+            u->handles[id] = h;
+            return id;
+        }
+        u->max_handle_count *= 2;
+        u->handles = realloc(u->handles, u->max_handle_count);
     }
-    return K_ERR_NO_SPACE_FOR_FILE;
 }
 
 void detatch_handle(universe_t *u, handle_id_t id) {

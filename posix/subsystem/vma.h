@@ -24,7 +24,6 @@ typedef struct vma {
     unsigned long vm_end;   // 结束地址
     unsigned long vm_flags; // 权限标志
     vma_type_t vm_type;     // VMA类型
-    handle_id_t mhandle;    // 内存区域句柄
     int64_t vm_offset;      // 文件偏移量
     int shm_id;             // 共享内存ID
     char *vm_name;          // VMA名
