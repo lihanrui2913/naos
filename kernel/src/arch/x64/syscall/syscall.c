@@ -73,6 +73,11 @@ void syscall_handler_init() {
     memset(syscall_handlers, 0, sizeof(syscall_handlers));
     syscall_handlers[SYS_MMAP] = (syscall_handle_t)sys_mmap;
     syscall_handlers[SYS_ARCH_PRCTL] = (syscall_handle_t)sys_arch_prctl;
+    syscall_handlers[SYS_SET_TID_ADDRESS] =
+        (syscall_handle_t)dummy_syscall_handler;
+    syscall_handlers[SYS_SET_ROBUST_LIST] =
+        (syscall_handle_t)dummy_syscall_handler;
+    syscall_handlers[SYS_RSEQ] = (syscall_handle_t)dummy_syscall_handler;
 
     memset(kcall_handlers, 0, sizeof(kcall_handlers));
     kcall_handlers[kCallLog] = (syscall_handle_t)kCallLogImpl;

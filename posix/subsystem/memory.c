@@ -172,6 +172,10 @@ uint64_t posix_vm_map(process_t *proc, uint64_t addr, uint64_t len,
 
     void *out_pointer;
     kMapMemory(mhandle, space_handle, (void *)start_addr, len, 0, &out_pointer);
+    void *this_space_out_pointer;
+    kMapMemory(mhandle, kThisSpace, NULL, len, 0, &this_space_out_pointer);
+    memset(this_space_out_pointer, 0, len);
+    kUnmapMemory(mhandle, kThisSpace, this_space_out_pointer, len);
 
     return (uint64_t)out_pointer;
 }
