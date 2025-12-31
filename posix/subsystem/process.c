@@ -45,16 +45,17 @@ void process_arg_free(posix_process_arg_t *arg) {
 #define ALIGN_STACK_DOWN(stack_ptr, alignment)                                 \
     stack_ptr = (stack_ptr) & ~((alignment) - 1)
 
-void *push_infos(void *current_stack, char *argv[], int argv_count,
-                 char *envp[], int envp_count, uint64_t e_entry, uint64_t phdr,
-                 uint64_t phnum, uint64_t at_base) {
+void *push_infos(void *current_stack, void *real_stack, char *argv[],
+                 int argv_count, char *envp[], int envp_count, uint64_t e_entry,
+                 uint64_t phdr, uint64_t phnum, uint64_t at_base) {
     void *tmp_stack = current_stack;
 
     uint64_t random_values[2];
     kGetClock((int64_t *)&random_values[0]);
     kGetClock((int64_t *)&random_values[1]);
     PUSH_BYTES_TO_STACK(tmp_stack, random_values, 16);
-    uint64_t random_ptr = (uint64_t)tmp_stack;
+    uint64_t random_ptr =
+        (uint64_t)real_stack - (uint64_t)(current_stack - tmp_stack);
 
     uint64_t *envp_addrs = NULL;
     if (envp_count > 0 && envp != NULL) {
@@ -165,9 +166,10 @@ process_t *process_new(const posix_process_arg_t *arg) {
     void *this_space_current_stack;
     kMapMemory(stack_memory_handle, kThisSpace, NULL,
                USER_STACK_END - USER_STACK_START, 0, &this_space_current_stack);
-    void *new_stack = push_infos(
-        this_space_current_stack + (USER_STACK_END - USER_STACK_START),
-        arg->argv, arg->argc, arg->envp, arg->envc, (uint64_t)arg->ip, 0, 0, 0);
+    void *new_stack = push_infos(this_space_current_stack +
+                                     (USER_STACK_END - USER_STACK_START),
+                                 current_stack, arg->argv, arg->argc, arg->envp,
+                                 arg->envc, (uint64_t)arg->ip, 0, 0, 0);
     current_stack -= (this_space_current_stack +
                       (USER_STACK_END - USER_STACK_START) - new_stack);
 
