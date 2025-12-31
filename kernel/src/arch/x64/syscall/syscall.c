@@ -3,6 +3,7 @@
 #include <libs/strerror.h>
 #include <kcall/handle.h>
 #include <kcall/kcall.h>
+#include <syscall/syscall.h>
 #include <task/task.h>
 
 void syscall_init() {
@@ -46,6 +47,7 @@ syscall_handle_t kcall_handlers[110];
 
 void syscall_handler_init() {
     memset(syscall_handlers, 0, sizeof(syscall_handlers));
+    syscall_handlers[SYS_MMAP] = (syscall_handle_t)sys_mmap;
 
     memset(kcall_handlers, 0, sizeof(kcall_handlers));
     kcall_handlers[kCallLog] = (syscall_handle_t)kCallLogImpl;
@@ -71,6 +73,7 @@ void syscall_handler_init() {
     kcall_handlers[kCallUnMapMemory] = (syscall_handle_t)kUnmapMemoryImpl;
     kcall_handlers[kCallCreatePhysicalMemory] =
         (syscall_handle_t)kCreatePhysicalMemoryImpl;
+    kcall_handlers[kCallForkMemory] = (syscall_handle_t)kForkMemoryImpl;
     kcall_handlers[kCallCreateStream] = (syscall_handle_t)kCreateStreamImpl;
     kcall_handlers[kCallCreateSpace] = (syscall_handle_t)kCreateSpaceImpl;
     kcall_handlers[kCallCreateThread] = (syscall_handle_t)kCreateThreadImpl;

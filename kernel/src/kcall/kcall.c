@@ -455,20 +455,77 @@ k_error_t kCreatePhysicalMemoryImpl(uintptr_t paddr, size_t size, size_t info,
     return kErrNone;
 }
 
+static void kForkMemoryHelper(uint64_t *source, uint64_t *dest, int level) {
+    if (!source || !dest)
+        return;
+
+    uint64_t entry = *source;
+
+    if (!entry & ARCH_PT_FLAG_VALID) {
+        *dest = 0;
+        return;
+    }
+
+    uint64_t src_phys = entry & ARCH_ADDR_MASK;
+    uint64_t flags = entry & ~ARCH_ADDR_MASK;
+
+    uint64_t new_phys = alloc_frames(1);
+    if (!new_phys) {
+        *dest = 0;
+        return;
+    }
+
+    void *src_virt = (void *)phys_to_virt(src_phys);
+    void *dst_virt = (void *)phys_to_virt(new_phys);
+
+    if (level == 0) {
+        memcpy(dst_virt, src_virt, DEFAULT_PAGE_SIZE);
+    } else {
+        uint64_t *src_table = (uint64_t *)src_virt;
+        uint64_t *dst_table = (uint64_t *)dst_virt;
+
+        memset(dst_virt, 0, DEFAULT_PAGE_SIZE);
+
+        for (int i = 0; i < 512; i++) {
+            kForkMemoryHelper(&src_table[i], &dst_table[i], level - 1);
+        }
+    }
+
+    *dest = new_phys | flags;
+}
+
+k_error_t kForkMemoryImpl(handle_id_t source_id, handle_id_t dest_id) {
+    uint64_t *source = get_space(source_id);
+    uint64_t *dest = get_space(dest_id);
+
+    for (int i = 0; i <
+#if defined(__x86_64__) || defined(__riscv__)
+                    256
+#else
+                    512
+#endif
+         ;
+         i++) {
+        kForkMemoryHelper(source + i, dest + i, ARCH_MAX_PT_LEVEL - 1);
+    }
+
+    return kErrNone;
+}
+
 k_error_t kCreateStreamImpl(handle_id_t *handle_out1,
                             handle_id_t *handle_out2) {
     lane_t *lane1 = malloc(sizeof(lane_t));
     spin_init(&lane1->lock);
     lane1->recv_pos = 0;
-    lane1->recv_size = 0;
-    lane1->recv_buff = calloc(1, LANE_BUFFER_SIZE);
+    lane1->recv_size = LANE_BUFFER_SIZE;
+    lane1->recv_buff = calloc(1, lane1->recv_size);
     lane1->pending_descs = calloc(LANE_PENDING_DESC_NUM, sizeof(handle_t *));
 
     lane_t *lane2 = malloc(sizeof(lane_t));
     spin_init(&lane2->lock);
     lane2->recv_pos = 0;
-    lane2->recv_size = 0;
-    lane2->recv_buff = calloc(1, LANE_BUFFER_SIZE);
+    lane2->recv_size = LANE_BUFFER_SIZE;
+    lane2->recv_buff = calloc(1, lane2->recv_size);
     lane2->pending_descs = calloc(LANE_PENDING_DESC_NUM, sizeof(handle_t *));
 
     lane2->peer = lane1;
@@ -552,10 +609,8 @@ k_error_t kLoadRegistersImpl(handle_id_t handle, int set, void *image) {}
 
 k_error_t kStoreRegistersImpl(handle_id_t handle, int set, const void *image) {}
 
-k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
+k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *actions,
                                 size_t count, uint32_t flags) {
-    k_action_t actions[128];
-
     if (handle_id < 0 || handle_id > current_task->universe->max_handle_count)
         return kErrBadDescriptor;
     handle_t *handle = current_task->universe->handles[handle_id];
@@ -570,9 +625,6 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
     if (!self) {
         return kErrBadDescriptor;
     }
-
-    if (!read_user_memory(actions, action, sizeof(k_action_t) * count))
-        return kErrFault;
 
     size_t recv_pos =
         (self->peer && self->peer->peer_connected) ? self->peer->recv_pos : 0;
@@ -607,9 +659,9 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
             }
             // TODO: Now we ensure the length < recv_size
             spin_lock(&self->peer->lock);
-            read_user_memory(self->peer->recv_buff + recv_pos, action->buffer,
-                             action->length);
-            recv_pos += action->length;
+            read_user_memory(self->peer->recv_buff + recv_pos, recipe->buffer,
+                             recipe->length);
+            recv_pos += recipe->length;
             spin_unlock(&self->peer->lock);
             break;
         case kActionRecvToBuffer:
@@ -619,7 +671,7 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
                 return kErrDismissed;
             }
             spin_lock(&self->peer->lock);
-            handle_t *handle = current_task->universe->handles[action->handle];
+            handle_t *handle = current_task->universe->handles[recipe->handle];
             for (int i = 0; i < LANE_PENDING_DESC_NUM; i++) {
                 if (!self->peer->pending_descs[i]) {
                     handle->refcount++;
@@ -643,7 +695,7 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
         return kErrNone;
     }
 
-    while (self->peer ? !self->recv_pos : self->connections[0]) {
+    while (!self->recv_pos && !self->connections[0]) {
         schedule(SCHED_YIELD);
     }
 
@@ -680,11 +732,12 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
             if (recipe->length > self->recv_size) {
                 return kErrBufferTooSmall;
             }
+            size_t to_copy = MIN(recipe->length, recv_pos);
             spin_lock(&self->lock);
-            memcpy(recipe->buffer, self->recv_buff + recv_pos, recv_pos);
-            memmove(self->recv_buff, &self->recv_buff[recv_pos], recv_pos);
-            recipe->length = recv_pos;
-            recv_pos = 0;
+            memcpy(recipe->buffer, self->recv_buff, to_copy);
+            memmove(self->recv_buff, &self->recv_buff[to_copy], to_copy);
+            recipe->length = to_copy;
+            recv_pos -= to_copy;
             spin_unlock(&self->lock);
             break;
         case kActionPushDescriptor:

@@ -36,10 +36,8 @@ typedef size_t (*vfs_getsockname_t)(struct vfs_fd *fd, void *addr,
                                     uint32_t *addrlen);
 typedef size_t (*vfs_getpeername_t)(struct vfs_fd *fd, void *addr,
                                     uint32_t *len);
-typedef size_t (*vfs_recv_msg_t)(struct vfs_fd *fd, struct msghdr_linux *msg,
-                                 int flags);
-typedef size_t (*vfs_send_msg_t)(struct vfs_fd *fd, struct msghdr_linux *msg,
-                                 int flags);
+typedef size_t (*vfs_recv_msg_t)(struct vfs_fd *fd, void *msg, int flags);
+typedef size_t (*vfs_send_msg_t)(struct vfs_fd *fd, void *msg, int flags);
 
 typedef struct vfs_op {
     // general operations

@@ -172,9 +172,11 @@ process_t *process_new(const posix_process_arg_t *arg) {
     return p;
 }
 
+#define INIT_PROCESS "posix-init"
+
 void spawn_init_process() {
     handle_id_t initramfs_handle;
-    kLookupInitramfs("posix-init", &initramfs_handle);
+    kLookupInitramfs(INIT_PROCESS, &initramfs_handle);
     posix_process_arg_t *arg = malloc(sizeof(posix_process_arg_t));
     memset(arg, 0, sizeof(posix_process_arg_t));
     Elf64_Ehdr ehdr;
@@ -216,7 +218,7 @@ void spawn_init_process() {
     arg->ip = (void *)ehdr.e_entry;
     arg->argc = 1;
     arg->argv = calloc(1, sizeof(char *));
-    arg->argv[0] = strdup("posix-init");
+    arg->argv[0] = strdup(INIT_PROCESS);
     process_t *process = process_new(arg);
     process_arg_free(arg);
 }

@@ -1,5 +1,6 @@
 #include <task/task.h>
 #include <task/sched.h>
+#include <uapi/kcall.h>
 
 task_t *idle_tasks[MAX_CPU_NUM];
 
@@ -131,6 +132,9 @@ task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
     mm->ref_count = 1;
     memset(&mm->task_vma_mgr, 0, sizeof(vma_manager_t));
     mm->task_vma_mgr.initialized = true;
+    if (current_task && !(flags & K_THREAD_FLAGS_NO_VMA_COPY)) {
+        vma_manager_copy(&mm->task_vma_mgr, &current_task->mm->task_vma_mgr);
+    }
     task->mm = mm;
     task_arch_init_user(task, task->kernel_stack, (uint64_t)ip, (uint64_t)sp,
                         arg);

@@ -121,6 +121,10 @@ static inline k_error_t kCreatePhysicalMemory(uintptr_t paddr, size_t size,
                               size, info, out);
 }
 
+static inline k_error_t kForkMemory(handle_id_t source, handle_id_t dest) {
+    return (k_error_t)syscall(kCallBase + kCallForkMemory, source, dest);
+}
+
 static inline k_error_t kCreateSpace(handle_id_t *out) {
     return (k_error_t)syscall(kCallBase + kCallCreateSpace, out);
 }

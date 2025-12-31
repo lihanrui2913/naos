@@ -6,6 +6,7 @@
 #include <mm/bitmap.h>
 #include <mm/mm.h>
 #include <task/universe.h>
+#include <uapi/aether/protocols.h>
 
 extern struct llist_header tasks_list;
 extern struct llist_header default_blocking_list;

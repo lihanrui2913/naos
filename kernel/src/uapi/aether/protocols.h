@@ -3,6 +3,8 @@
 #include <libs/klibc.h>
 #include <uapi/stub.h>
 
+extern void *calloc(size_t num, size_t size);
+
 #define REQUEST_TYPE_NONE 0
 
 #define REQUEST_TYPE_POSIX 1
@@ -412,9 +414,6 @@ typedef struct fchownat_response {
     int error;
 } fchownat_response_t;
 
-#define RESPONSE_CODE_OK 0
-#define RESPONSE_CODE_FAIL 1
-
 #define RESPONSE_MAGIC 0x13486578
 
 typedef struct response {
@@ -464,6 +463,7 @@ static inline void sender_send_response(sender_t *sender,
 static inline k_error_t sender_send(sender_t *sender) {
     k_error_t error = kSubmitDescriptor(sender->lane, sender->actions,
                                         sender->idx, KCALL_SUBMIT_NO_RECEIVING);
+    sender->idx = 0;
     return error;
 }
 
@@ -479,8 +479,9 @@ static inline receiver_t *create_receiver(handle_id_t lane) {
     r->actions = calloc(MAX_SEND_ONCE, sizeof(k_action_t));
     return r;
 }
+
 static inline void receiver_recv_request(receiver_t *receiver, request_t *buf) {
-    size_t total_len = offsetof(request_t, data) + buf->data_len;
+    size_t total_len = offsetof(request_t, data);
     receiver->actions[receiver->idx] = (k_action_t){
         .type = kActionRecvToBuffer,
         .buffer = buf,
@@ -500,8 +501,19 @@ static inline void receiver_recv_response(receiver_t *receiver,
     receiver->idx++;
 }
 
+static inline void receiver_recv_data(receiver_t *receiver, void *buf,
+                                      size_t len) {
+    receiver->actions[receiver->idx] = (k_action_t){
+        .type = kActionRecvToBuffer,
+        .buffer = buf,
+        .length = len,
+    };
+    receiver->idx++;
+}
+
 static inline k_error_t receiver_recv(receiver_t *receiver) {
     k_error_t error =
         kSubmitDescriptor(receiver->lane, receiver->actions, receiver->idx, 0);
+    receiver->idx = 0;
     return error;
 }

@@ -106,6 +106,7 @@ typedef struct k_allocate_restrictions {
 } k_allocate_restrictions_t;
 
 #define K_THREAD_FLAGS_POSIX ((size_t)1 << 0)
+#define K_THREAD_FLAGS_NO_VMA_COPY ((size_t)1 << 1)
 
 typedef struct k_create_thread_arg {
     void *ip;

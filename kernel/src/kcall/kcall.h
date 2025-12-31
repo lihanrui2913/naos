@@ -31,6 +31,7 @@ k_error_t kUnmapMemoryImpl(handle_id_t memory_handle, handle_id_t space_id,
                            void *pointer, size_t size);
 k_error_t kCreatePhysicalMemoryImpl(uintptr_t paddr, size_t size, size_t info,
                                     handle_id_t *out);
+k_error_t kForkMemoryImpl(handle_id_t source, handle_id_t dest);
 k_error_t kCreateStreamImpl(handle_id_t *handle_out1, handle_id_t *handle_out2);
 k_error_t kCreateSpaceImpl(handle_id_t *out);
 k_error_t kCreateThreadImpl(handle_id_t universe, handle_id_t space,
