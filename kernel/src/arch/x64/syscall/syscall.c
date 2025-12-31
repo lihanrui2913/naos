@@ -120,12 +120,14 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     if (idx > MAX_SYSCALL_NUM) {
         printk("Syscall %d not implemented\n", idx);
         regs->rax = (uint64_t)-ENOSYS;
+        goto done;
     }
 
     syscall_handle_t handler = syscall_handlers[idx];
     if (!handler) {
         printk("Syscall %d not implemented\n", idx);
         regs->rax = (uint64_t)-ENOSYS;
+        goto done;
     }
 
     regs->rax = handler(arg1, arg2, arg3, arg4, arg5, arg6);
@@ -139,6 +141,11 @@ maybe_kcall:
     }
 
     syscall_handle_t kcall = kcall_handlers[idx - kCallBase];
+    if (!kcall) {
+        printk("KCall %d not implemented\n", idx - kCallBase);
+        regs->rax = kErrIllegalSyscall;
+        goto done;
+    }
     regs->rax = kcall(arg1, arg2, arg3, arg4, arg5, arg6);
 done:
 }
