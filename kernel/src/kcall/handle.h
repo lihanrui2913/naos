@@ -2,6 +2,7 @@
 
 #include <libs/llist.h>
 #include <task/universe.h>
+#include <init/initramfs.h>
 
 typedef struct universe_handle {
     universe_t *universe;
@@ -27,6 +28,10 @@ typedef struct space {
 typedef struct space_handle {
     space_t *space;
 } space_handle_t;
+
+typedef struct initramfs_desc_handle {
+    initramfs_handle_t *handle;
+} initramfs_desc_handle_t;
 
 #define LANE_BUFFER_SIZE 65536
 #define LANE_PENDING_DESC_NUM 64
@@ -54,6 +59,7 @@ typedef struct handle {
         MEMORY,
         THREAD,
         SPACE,
+        INITRAMFS,
         LANE,
     } handle_type;
     int refcount;
@@ -62,6 +68,7 @@ typedef struct handle {
         memory_handle_t memory;
         thread_handle_t thread;
         space_handle_t space;
+        initramfs_desc_handle_t initramfs;
         lane_handle_t lane;
     };
 } handle_t;

@@ -108,10 +108,11 @@ static inline k_error_t kMapMemory(handle_id_t memory_handle,
                               space_id, pointer, size, flags, actual_pointer);
 }
 
-static inline k_error_t kUnmapMemory(handle_id_t memory_handle, void *pointer,
+static inline k_error_t kUnmapMemory(handle_id_t memory_handle,
+                                     handle_id_t space_handle, void *pointer,
                                      size_t size) {
     return (k_error_t)syscall(kCallBase + kCallUnMapMemory, memory_handle,
-                              pointer, size);
+                              space_handle, pointer, size);
 }
 
 static inline k_error_t kCreatePhysicalMemory(uintptr_t paddr, size_t size,
@@ -125,10 +126,11 @@ static inline k_error_t kCreateSpace(handle_id_t *out) {
 }
 
 static inline k_error_t kCreateThread(handle_id_t universe, handle_id_t space,
-                                      void *ip, void *sp, uint64_t arg,
+                                      const k_create_thread_arg_t *arg,
+                                      uint64_t flags,
                                       handle_id_t *thread_handle_out) {
     return (k_error_t)syscall(kCallBase + kCallCreateThread, universe, space,
-                              ip, sp, arg, thread_handle_out);
+                              arg, flags, thread_handle_out);
 }
 
 static inline k_error_t kQueryThreadStats(handle_id_t thread_handle,
@@ -202,4 +204,16 @@ static inline k_error_t kSubmitDescriptor(handle_id_t lane_handle_id,
                                           uint32_t flags) {
     return (k_error_t)syscall(kCallBase + kCallSubmitDescriptor, lane_handle_id,
                               action, count, flags);
+}
+
+static inline k_error_t kLookupInitramfs(const char *path,
+                                         handle_id_t *ret_handle) {
+    return (k_error_t)syscall(kCallBase + kCallLookupInitramfs, path,
+                              ret_handle);
+}
+
+static inline k_error_t kReadInitramfs(handle_id_t handle, size_t offset,
+                                       void *buf, size_t limit) {
+    return (k_error_t)syscall(kCallBase + kCallReadInitramfs, handle, offset,
+                              buf, limit);
 }

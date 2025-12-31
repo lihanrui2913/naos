@@ -1,5 +1,5 @@
+#include "vfs.h"
 #include "process.h"
-#include <mm/page_table_flags.h>
 #include <uapi/aether/protocols.h>
 
 void posix_main(int lane) {
@@ -29,6 +29,10 @@ void posix_main(int lane) {
 void main(int lane) {
     kLog(kLogSeverityInfo, "posix-subsystem is starting...\n", 33);
 
+    vfs_init();
+
+    spawn_init_process();
+
     while (1) {
         k_action_t accept_action = {
             .type = kActionAccept,
@@ -53,9 +57,15 @@ void main(int lane) {
                        0, &stack_start);
 
             handle_id_t service_handle;
-            kCreateThread(universe_handle, kThisSpace, posix_main,
-                          stack_start + USER_STACK_SIZE, remote_handle,
+            k_create_thread_arg_t arg;
+            arg.ip = posix_main;
+            arg.sp = stack_start + USER_STACK_SIZE;
+            arg.arg = remote_handle;
+            kCreateThread(universe_handle, kThisSpace, &arg, 0,
                           &service_handle);
+
+            kUnmapMemory(stack_memory_handle, kThisSpace, stack_start,
+                         USER_STACK_SIZE);
         }
     }
 }

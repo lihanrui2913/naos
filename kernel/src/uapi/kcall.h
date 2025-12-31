@@ -45,6 +45,9 @@ enum {
 
     kCallSubmitDescriptor = 70,
 
+    kCallLookupInitramfs = 80,
+    kCallReadInitramfs = 81,
+
 #if defined(__x86_64__)
     kCallReadFsBase = 100,
     kCallWriteFsBase,
@@ -102,11 +105,13 @@ typedef struct k_allocate_restrictions {
     int address_bits;
 } k_allocate_restrictions_t;
 
-#define K_MEMORY_FLAGS_R ((size_t)1 << 0)
-#define K_MEMORY_FLAGS_W ((size_t)1 << 1)
-#define K_MEMORY_FLAGS_RW (K_MEMORY_FLAGS_R | K_MEMORY_FLAGS_W)
-#define K_MEMORY_FLAGS_CACHE_WT ((size_t)1 << 2)
-#define K_MEMORY_FLAGS_CACHE_WB ((size_t)1 << 3)
+#define K_THREAD_FLAGS_POSIX ((size_t)1 << 0)
+
+typedef struct k_create_thread_arg {
+    void *ip;
+    void *sp;
+    uint64_t arg;
+} k_create_thread_arg_t;
 
 typedef struct k_thread_stats {
     uint64_t user_time;

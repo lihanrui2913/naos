@@ -42,7 +42,7 @@ void syscall_init() {
 }
 
 syscall_handle_t syscall_handlers[MAX_SYSCALL_NUM];
-syscall_handle_t kcall_handlers[100];
+syscall_handle_t kcall_handlers[110];
 
 void syscall_handler_init() {
     memset(syscall_handlers, 0, sizeof(syscall_handlers));
@@ -68,12 +68,17 @@ void syscall_handler_init() {
     kcall_handlers[kCallGetMemoryInfo] = (syscall_handle_t)kGetMemoryInfoImpl;
     kcall_handlers[kCallSetMemoryInfo] = (syscall_handle_t)kSetMemoryInfoImpl;
     kcall_handlers[kCallMapMemory] = (syscall_handle_t)kMapMemoryImpl;
+    kcall_handlers[kCallUnMapMemory] = (syscall_handle_t)kUnmapMemoryImpl;
     kcall_handlers[kCallCreatePhysicalMemory] =
         (syscall_handle_t)kCreatePhysicalMemoryImpl;
     kcall_handlers[kCallCreateStream] = (syscall_handle_t)kCreateStreamImpl;
+    kcall_handlers[kCallCreateSpace] = (syscall_handle_t)kCreateSpaceImpl;
     kcall_handlers[kCallCreateThread] = (syscall_handle_t)kCreateThreadImpl;
     kcall_handlers[kCallSubmitDescriptor] =
         (syscall_handle_t)kSubmitDescriptorImpl;
+    kcall_handlers[kCallLookupInitramfs] =
+        (syscall_handle_t)kLookupInitramfsImpl;
+    kcall_handlers[kCallReadInitramfs] = (syscall_handle_t)kReadInitramfsImpl;
 }
 
 spinlock_t syscall_debug_lock = SPIN_INIT;
@@ -102,11 +107,14 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
 
     if (!current_task->posix_lane) {
         handle_id_t handle1, handle2;
-        kCreateStreamImpl(&handle1, handle2);
-        current_task->posix_lane =
-            current_task->universe->handles[handle1]->lane.lane;
+        kCreateStreamImpl(&handle1, &handle2);
+        current_task->posix_lane = current_task->universe->handles[handle1];
+        spin_lock(&posix_lane->lane.lane->peer->lock);
+        while (!posix_lane || !posix_lane->lane.lane->peer)
+            schedule(SCHED_YIELD);
         posix_lane->lane.lane->peer->connections[0] =
             current_task->universe->handles[handle2]->lane.lane;
+        spin_unlock(&posix_lane->lane.lane->peer->lock);
     }
 
     if (idx > MAX_SYSCALL_NUM) {
@@ -125,6 +133,11 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     goto done;
 
 maybe_kcall:
+    if (current_task->flags & K_THREAD_FLAGS_POSIX) {
+        regs->rax = (uint64_t)-1;
+        goto done;
+    }
+
     syscall_handle_t kcall = kcall_handlers[idx - kCallBase];
     regs->rax = kcall(arg1, arg2, arg3, arg4, arg5, arg6);
 done:

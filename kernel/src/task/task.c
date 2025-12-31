@@ -117,6 +117,7 @@ task_t *task_create_user(universe_t *universe, uint64_t *space, void *ip,
     llist_init_head(&task->node);
     task->cpu_id = allocate_cpu_id();
     task->user = false;
+    task->flags = flags;
     spin_lock(&pid_alloc_lock);
     task->pid = next_pid++;
     spin_unlock(&pid_alloc_lock);

@@ -399,13 +399,17 @@ k_error_t kMapMemoryImpl(handle_id_t memory_handle, handle_id_t space_id,
     if (!write_user_memory(actual_pointer, &pointer, sizeof(void *))) {
         return kErrFault;
     }
+    vma_t *vma = vma_alloc();
+    vma->vm_start = (uint64_t)pointer;
+    vma->vm_end = (uint64_t)pointer + size;
+    vma_insert(&current_task->mm->task_vma_mgr, vma);
     map_page_range(space, (uint64_t)pointer, handle->memory.address, size,
                    handle->memory.info);
     return kErrNone;
 }
 
-k_error_t kUnmapMemoryImpl(handle_id_t memory_handle, void *pointer,
-                           size_t size) {
+k_error_t kUnmapMemoryImpl(handle_id_t memory_handle, handle_id_t space_id,
+                           void *pointer, size_t size) {
     if (memory_handle < 0 ||
         memory_handle > current_task->universe->max_handle_count)
         return kErrBadDescriptor;
@@ -416,7 +420,19 @@ k_error_t kUnmapMemoryImpl(handle_id_t memory_handle, void *pointer,
     if (handle->handle_type != MEMORY) {
         return kErrBadDescriptor;
     }
-    unmap_page_range(get_current_page_dir(false), (uint64_t)pointer, size);
+    uint64_t *space = get_space(space_id);
+    if (!space) {
+        return kErrBadDescriptor;
+    }
+    vma_t *vma;
+    while (vma = vma_find_intersection(&current_task->mm->task_vma_mgr,
+                                       (uint64_t)pointer,
+                                       (uint64_t)pointer + size),
+           vma) {
+        vma_remove(&current_task->mm->task_vma_mgr, vma);
+        vma_free(vma);
+    }
+    unmap_page_range(space, (uint64_t)pointer, size);
     return kErrNone;
 }
 
@@ -483,7 +499,16 @@ k_error_t kCreateSpaceImpl(handle_id_t *out) {
     handle_t *handle = malloc(sizeof(handle_t));
     handle->refcount = 1;
     handle->handle_type = SPACE;
-    handle->space.space = clone_page_table(get_current_page_dir(false), 0);
+    handle->space.space = malloc(sizeof(space_t));
+    handle->space.space->page_table_addr =
+        alloc_frames_bytes(DEFAULT_PAGE_SIZE);
+
+    memset(handle->space.space->page_table_addr, 0, DEFAULT_PAGE_SIZE);
+#if defined(__x86_64__) || defined(__riscv__)
+    memcpy((uint64_t *)handle->space.space->page_table_addr + 256,
+           (uint64_t *)get_current_page_dir(false) + 256,
+           DEFAULT_PAGE_SIZE / 2);
+#endif
 
     handle_id_t id = attach_handle(current_task->universe, handle);
 
@@ -493,7 +518,7 @@ k_error_t kCreateSpaceImpl(handle_id_t *out) {
 }
 
 k_error_t kCreateThreadImpl(handle_id_t universe_id, handle_id_t space_id,
-                            void *ip, void *sp, uint64_t arg,
+                            const k_create_thread_arg_t *arg, uint64_t flags,
                             handle_id_t *thread_handle_out) {
     universe_t *universe = get_universe(universe_id);
     if (!universe) {
@@ -516,7 +541,8 @@ k_error_t kCreateThreadImpl(handle_id_t universe_id, handle_id_t space_id,
         free(handle);
         return kErrFault;
     }
-    task_t *task = task_create_user(universe, page_table_addr, ip, sp, arg, 0);
+    task_t *task = task_create_user(universe, page_table_addr, arg->ip, arg->sp,
+                                    arg->arg, flags);
     handle->thread.task = task;
 
     return kErrNone;
@@ -680,5 +706,33 @@ k_error_t kSubmitDescriptorImpl(handle_id_t handle_id, k_action_t *action,
     }
     self->recv_pos = recv_pos;
 
+    return kErrNone;
+}
+
+k_error_t kLookupInitramfsImpl(const char *path, handle_id_t *ret_handle) {
+    initramfs_handle_t *h = initramfs_lookup(path);
+    if (!h)
+        return kErrCancelled;
+    handle_t *handle = malloc(sizeof(handle_t));
+    handle->refcount = 1;
+    handle->handle_type = INITRAMFS;
+    handle->initramfs.handle = h;
+    handle_id_t id = attach_handle(current_task->universe, handle);
+    *ret_handle = id;
+    return kErrNone;
+}
+
+k_error_t kReadInitramfsImpl(handle_id_t handle_id, size_t offset, void *buf,
+                             size_t limit) {
+    if (handle_id < 0 || handle_id > current_task->universe->max_handle_count)
+        return kErrBadDescriptor;
+    handle_t *handle = current_task->universe->handles[handle_id];
+    if (!handle) {
+        return kErrBadDescriptor;
+    }
+    if (handle->handle_type != INITRAMFS) {
+        return kErrBadDescriptor;
+    }
+    initramfs_read(handle->initramfs.handle, buf, offset, limit);
     return kErrNone;
 }

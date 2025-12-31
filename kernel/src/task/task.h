@@ -29,6 +29,7 @@ typedef struct task {
     struct llist_header node;
     uint64_t cpu_id;
     bool user;
+    uint64_t flags;
     uint64_t pid;
     struct task *parent;
     int *futex_pointer;

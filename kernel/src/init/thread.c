@@ -13,7 +13,7 @@
 #define USER_STACK_END 0x00007ffffffff000
 #define USER_STACK_START 0x00007fffff000000
 
-void load_service(const char *path, uint64_t handle_id) {
+void load_service(const char *path, handle_id_t handle_id) {
     _cleanup_free_ initramfs_handle_t *handle = initramfs_lookup(path);
     if (!handle)
         return;
@@ -43,7 +43,7 @@ void load_service(const char *path, uint64_t handle_id) {
         size_t size =
             PADDING_UP(phdr->p_vaddr + phdr->p_memsz, DEFAULT_PAGE_SIZE) -
             start;
-        map_page_range(get_current_page_dir(false), start, 0, size,
+        map_page_range(get_current_page_dir(true), start, 0, size,
                        PT_FLAG_R | PT_FLAG_W | PT_FLAG_U | PT_FLAG_X);
         initramfs_read(handle, (void *)phdr->p_vaddr, phdr->p_offset,
                        phdr->p_filesz);
@@ -54,7 +54,7 @@ void load_service(const char *path, uint64_t handle_id) {
     }
     load_low = PADDING_DOWN(load_low, DEFAULT_PAGE_SIZE);
     load_high = PADDING_UP(load_high, DEFAULT_PAGE_SIZE);
-    map_page_range(get_current_page_dir(false), USER_STACK_START, 0,
+    map_page_range(get_current_page_dir(true), USER_STACK_START, 0,
                    USER_STACK_END - USER_STACK_START,
                    PT_FLAG_R | PT_FLAG_W | PT_FLAG_U);
 
@@ -69,7 +69,7 @@ void load_service(const char *path, uint64_t handle_id) {
     }
     can_schedule = false;
     task_t *task =
-        task_create_user(u, clone_page_table(get_current_page_dir(false), 0),
+        task_create_user(u, clone_page_table(get_current_page_dir(true), 0),
                          (void *)e_entry, (void *)USER_STACK_END, handle_id, 0);
     drop_universe(u);
     vma_t *vma = vma_alloc();
@@ -88,10 +88,13 @@ void load_service(const char *path, uint64_t handle_id) {
         Elf64_Phdr *phdr = &phdrs[i];
         if (phdr->p_type != PT_LOAD)
             continue;
-        unmap_page_range(get_current_page_dir(false), phdr->p_vaddr,
-                         PADDING_UP(phdr->p_memsz, DEFAULT_PAGE_SIZE));
+        size_t start = PADDING_DOWN(phdr->p_vaddr, DEFAULT_PAGE_SIZE);
+        size_t size =
+            PADDING_UP(phdr->p_vaddr + phdr->p_memsz, DEFAULT_PAGE_SIZE) -
+            start;
+        unmap_page_range(get_current_page_dir(true), start, size);
     }
-    unmap_page_range(get_current_page_dir(false), USER_STACK_START,
+    unmap_page_range(get_current_page_dir(true), USER_STACK_START,
                      USER_STACK_END - USER_STACK_START);
 }
 

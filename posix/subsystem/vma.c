@@ -10,7 +10,6 @@ vma_t *vma_alloc(void) {
         return NULL;
 
     memset(vma, 0, sizeof(vma_t));
-    vma->node = NULL;
     vma->shm_id = -1;
     vma->vm_rb.rb_parent_color = 0;
     vma->vm_rb.rb_left = NULL;
@@ -181,7 +180,6 @@ int vma_split(vma_manager_t *mgr, vma_t *vma, uint64_t addr) {
     new_vma->vm_end = vma->vm_end;
     new_vma->vm_flags = vma->vm_flags;
     new_vma->vm_type = vma->vm_type;
-    new_vma->node = vma->node;
     new_vma->vm_offset = vma->vm_offset;
     new_vma->shm_id = vma->shm_id;
 
@@ -237,8 +235,7 @@ int vma_merge(vma_t *vma1, vma_t *vma2) {
         return -1;
     }
 
-    if (vma1->vm_flags != vma2->vm_flags || vma1->vm_type != vma2->vm_type ||
-        vma1->node != vma2->node) {
+    if (vma1->vm_flags != vma2->vm_flags || vma1->vm_type != vma2->vm_type) {
         return -1;
     }
 
@@ -268,8 +265,7 @@ int vma_merge_ex(vma_manager_t *mgr, vma_t *vma1, vma_t *vma2) {
         return -1;
     }
 
-    if (vma1->vm_flags != vma2->vm_flags || vma1->vm_type != vma2->vm_type ||
-        vma1->node != vma2->node) {
+    if (vma1->vm_flags != vma2->vm_flags || vma1->vm_type != vma2->vm_type) {
         return -1;
     }
 
@@ -372,7 +368,6 @@ vma_t *vma_copy(vma_t *src) {
     dst->vm_end = src->vm_end;
     dst->vm_flags = src->vm_flags;
     dst->vm_type = src->vm_type;
-    dst->node = src->node;
     dst->vm_offset = src->vm_offset;
     dst->shm_id = src->shm_id;
 
