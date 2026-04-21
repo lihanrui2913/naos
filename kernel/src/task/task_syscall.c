@@ -2814,6 +2814,10 @@ uint64_t sys_setns(int fd, uint64_t nstype) {
 }
 
 uint64_t sys_nanosleep(struct timespec *req, struct timespec *rem) {
+    if (check_user_overflow((uint64_t)req, sizeof(struct timespec)) ||
+        check_unmapped((uint64_t)req, sizeof(struct timespec))) {
+        return -EFAULT;
+    }
     if (req->tv_sec < 0)
         return (uint64_t)-EINVAL;
 
@@ -2851,6 +2855,10 @@ uint64_t sys_clock_nanosleep(int clock_id, int flags,
                              struct timespec *remain) {
     if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) {
         return (uint64_t)-EINVAL;
+    }
+    if (check_user_overflow((uint64_t)request, sizeof(struct timespec)) ||
+        check_unmapped((uint64_t)request, sizeof(struct timespec))) {
+        return -EFAULT;
     }
 
     if (request->tv_sec < 0 || request->tv_nsec >= 1000000000L) {
@@ -3598,4 +3606,13 @@ uint64_t sys_kcmp(uint64_t pid1, uint64_t pid2, int type, uint64_t idx1,
             type, pid1, pid2, idx1, idx2);
         return (uint64_t)-EINVAL;
     }
+}
+
+uint32_t sys_personality(uint32_t personality) {
+    uint32_t old = current_task->personality;
+
+    if (personality != UINT32_MAX)
+        current_task->personality = personality;
+
+    return old;
 }

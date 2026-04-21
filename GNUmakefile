@@ -110,11 +110,12 @@ clippy:
 
 ROOTFS_IMG_SIZE ?= 4096
 ROOTFS_EXT_BLOCK_SIZE ?= 1024
-ROOTFS_EXT_DISABLE_FEATURES := ^has_journal,^extent,^64bit,^metadata_csum,^dir_index,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^quota,^metadata_csum_seed,^orphan_file,^project,^encrypt,^verity,^casefold,^inline_data,^ea_inode,^bigalloc,^mmp,^fast_commit,^sparse_super2
+ROOTFS_EXT_INODE_SIZE ?= 256
+ROOTFS_EXT_FEATURES := extent,64bit,flex_bg,huge_file,dir_nlink,extra_isize,^has_journal,^dir_index,^metadata_csum,^quota,^metadata_csum_seed,^orphan_file,^project,^encrypt,^verity,^casefold,^inline_data,^ea_inode,^bigalloc,^mmp,^fast_commit,^sparse_super2
 
 rootfs-$(ARCH).img: user/.build-stamp-$(ARCH)
 	dd if=/dev/zero bs=1M count=0 seek=$(ROOTFS_IMG_SIZE) of=rootfs-$(ARCH).img
-	sudo mkfs.ext4 -b $(ROOTFS_EXT_BLOCK_SIZE) -I 128 -O $(ROOTFS_EXT_DISABLE_FEATURES) -E lazy_itable_init=0,lazy_journal_init=0 -F -q -d user/rootfs-$(ARCH) rootfs-$(ARCH).img
+	sudo mkfs.ext4 -b $(ROOTFS_EXT_BLOCK_SIZE) -I $(ROOTFS_EXT_INODE_SIZE) -O $(ROOTFS_EXT_FEATURES) -E lazy_itable_init=0,lazy_journal_init=0 -F -q -d user/rootfs-$(ARCH) rootfs-$(ARCH).img
 
 ifeq ($(ARCH),x86_64)
 EFI_FILE_SINGLE = assets/limine/BOOTX64.EFI

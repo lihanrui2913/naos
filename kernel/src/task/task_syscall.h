@@ -223,9 +223,6 @@ uint64_t sys_execveat(uint64_t dirfd, const char *path, const char **argv,
 uint64_t sys_getsid(uint64_t pid);
 uint64_t sys_setsid(void);
 
-uint64_t sys_kcmp(uint64_t pid1, uint64_t pid2, int type, uint64_t idx1,
-                  uint64_t idx2);
-
 static inline uint64_t sys_getuid() { return current_task->uid; }
 
 static inline int64_t cred_keep_or_set(int value, int64_t current) {
@@ -400,3 +397,8 @@ static inline uint64_t sys_set_tid_address(int *ptr) {
 #define PRIO_USER 2
 
 uint64_t sys_setpriority(int which, int who, int niceval);
+
+uint64_t sys_kcmp(uint64_t pid1, uint64_t pid2, int type, uint64_t idx1,
+                  uint64_t idx2);
+
+uint32_t sys_personality(uint32_t personality);

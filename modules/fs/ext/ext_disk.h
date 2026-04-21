@@ -55,6 +55,13 @@
 #define EXT4_FEATURE_INCOMPAT_ENCRYPT 0x10000
 #define EXT4_FEATURE_INCOMPAT_CASEFOLD 0x20000
 
+#define EXT4_HUGE_FILE_FL 0x00040000
+#define EXT4_EXTENTS_FL 0x00080000
+
+#define EXT4_EXT_MAGIC 0xF30A
+#define EXT4_EXT_INIT_MAX_LEN (1u << 15)
+#define EXT4_EXT_UNWRITTEN_MASK 0x8000
+
 #define EXT2_S_IFSOCK 0xC000
 #define EXT2_S_IFLNK 0xA000
 #define EXT2_S_IFREG 0x8000
@@ -245,3 +252,25 @@ typedef struct ext_dir_entry {
     uint8_t file_type;
     char name[];
 } __attribute__((packed)) ext_dir_entry_t;
+
+typedef struct ext_extent {
+    uint32_t ee_block;
+    uint16_t ee_len;
+    uint16_t ee_start_hi;
+    uint32_t ee_start_lo;
+} __attribute__((packed)) ext_extent_t;
+
+typedef struct ext_extent_idx {
+    uint32_t ei_block;
+    uint32_t ei_leaf_lo;
+    uint16_t ei_leaf_hi;
+    uint16_t ei_unused;
+} __attribute__((packed)) ext_extent_idx_t;
+
+typedef struct ext_extent_header {
+    uint16_t eh_magic;
+    uint16_t eh_entries;
+    uint16_t eh_max;
+    uint16_t eh_depth;
+    uint32_t eh_generation;
+} __attribute__((packed)) ext_extent_header_t;

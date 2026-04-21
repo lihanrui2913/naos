@@ -29,7 +29,7 @@ static spinlock_t rwlock = SPIN_INIT;
      EXT_QUOTA_ENTRY_SIZE)
 
 typedef struct ext_map_cache_entry {
-    uint32_t block;
+    uint64_t block;
     uint8_t *data;
     bool valid;
 } ext_map_cache_entry_t;
@@ -45,6 +45,8 @@ typedef struct ext_mount_ctx {
     uint32_t ptrs_per_block;
     uint64_t blocks_count;
     uint64_t inodes_count;
+    bool has_extents;
+    bool has_64bit;
     ext_map_cache_entry_t *map_cache_entries;
     uint32_t map_cache_entry_count;
 } ext_mount_ctx_t;
@@ -94,10 +96,23 @@ typedef struct ext_dir_lookup {
     uint16_t prev_rec_len;
 } ext_dir_lookup_t;
 
+#define EXT_EXTENT_MAX_DEPTH 5u
+
+typedef struct ext_extent_path {
+    ext_extent_header_t *hdr;
+    uint8_t *buf;
+    uint64_t block;
+    uint16_t slot;
+} ext_extent_path_t;
+
 static int ext_dev_read(ext_mount_ctx_t *fs, uint64_t offset, void *buf,
                         size_t size);
 static int ext_dev_write(ext_mount_ctx_t *fs, uint64_t offset, const void *buf,
                          size_t size);
+static int ext_inode_get_block_locked(ext_mount_ctx_t *fs, uint32_t ino,
+                                      ext_inode_disk_t *inode,
+                                      uint32_t logical_block, bool create,
+                                      uint64_t *out_block);
 static void ext_sync_vfs_inode(struct vfs_inode *inode, ext_mount_ctx_t *fs,
                                const ext_inode_disk_t *disk_inode);
 static struct vfs_inode *ext_iget_locked(struct vfs_super_block *sb,
@@ -178,6 +193,30 @@ static uint32_t ext_inode_rdev_get(const ext_inode_disk_t *inode) {
 static void ext_inode_rdev_set(ext_inode_disk_t *inode, uint32_t dev) {
     memset(inode->i_block, 0, sizeof(inode->i_block));
     inode->i_block[0] = dev;
+}
+
+static bool ext_inode_uses_extents(const ext_inode_disk_t *inode) {
+    return inode && (inode->i_flags & EXT4_EXTENTS_FL);
+}
+
+static size_t ext_inode_extra_capacity(ext_mount_ctx_t *fs) {
+    if (!fs || fs->inode_size <= EXT2_GOOD_OLD_INODE_SIZE)
+        return 0;
+
+    return MIN((size_t)fs->inode_size - EXT2_GOOD_OLD_INODE_SIZE,
+               sizeof(ext_inode_disk_t) - EXT2_GOOD_OLD_INODE_SIZE);
+}
+
+static void ext_inode_init_large_fields(ext_mount_ctx_t *fs,
+                                        ext_inode_disk_t *inode) {
+    size_t extra;
+
+    if (!fs || !inode)
+        return;
+
+    extra = ext_inode_extra_capacity(fs);
+    if (extra >= sizeof(inode->i_extra_isize))
+        inode->i_extra_isize = (uint16_t)extra;
 }
 
 static void ext_inode_touch(ext_inode_disk_t *inode, bool atime, bool mtime,
@@ -301,6 +340,47 @@ static uint64_t ext_sb_reserved_blocks_count(const ext_super_block_t *sb) {
            ((uint64_t)sb->s_r_blocks_count_hi << 32);
 }
 
+static uint64_t ext_sb_free_blocks_count(const ext_super_block_t *sb) {
+    if (!sb)
+        return 0;
+
+    return (uint64_t)sb->s_free_blocks_count_lo |
+           ((uint64_t)sb->s_free_blocks_count_hi << 32);
+}
+
+static void ext_sb_free_blocks_count_set(ext_super_block_t *sb,
+                                         uint64_t count) {
+    if (!sb)
+        return;
+
+    sb->s_free_blocks_count_lo = (uint32_t)count;
+    sb->s_free_blocks_count_hi = (uint32_t)(count >> 32);
+}
+
+static uint64_t ext_group_block_bitmap(const ext_group_desc_t *gd) {
+    if (!gd)
+        return 0;
+
+    return (uint64_t)gd->bg_block_bitmap_lo |
+           ((uint64_t)gd->bg_block_bitmap_hi << 32);
+}
+
+static uint64_t ext_group_inode_bitmap(const ext_group_desc_t *gd) {
+    if (!gd)
+        return 0;
+
+    return (uint64_t)gd->bg_inode_bitmap_lo |
+           ((uint64_t)gd->bg_inode_bitmap_hi << 32);
+}
+
+static uint64_t ext_group_inode_table(const ext_group_desc_t *gd) {
+    if (!gd)
+        return 0;
+
+    return (uint64_t)gd->bg_inode_table_lo |
+           ((uint64_t)gd->bg_inode_table_hi << 32);
+}
+
 static uint64_t ext_group_free_blocks_count(const ext_group_desc_t *gd) {
     if (!gd)
         return 0;
@@ -309,12 +389,47 @@ static uint64_t ext_group_free_blocks_count(const ext_group_desc_t *gd) {
            ((uint64_t)gd->bg_free_blocks_count_hi << 16);
 }
 
+static void ext_group_free_blocks_count_set(ext_group_desc_t *gd,
+                                            uint64_t count) {
+    if (!gd)
+        return;
+
+    gd->bg_free_blocks_count_lo = (uint16_t)count;
+    gd->bg_free_blocks_count_hi = (uint16_t)(count >> 16);
+}
+
 static uint64_t ext_group_free_inodes_count(const ext_group_desc_t *gd) {
     if (!gd)
         return 0;
 
     return (uint64_t)gd->bg_free_inodes_count_lo |
            ((uint64_t)gd->bg_free_inodes_count_hi << 16);
+}
+
+static void ext_group_free_inodes_count_set(ext_group_desc_t *gd,
+                                            uint64_t count) {
+    if (!gd)
+        return;
+
+    gd->bg_free_inodes_count_lo = (uint16_t)count;
+    gd->bg_free_inodes_count_hi = (uint16_t)(count >> 16);
+}
+
+static uint64_t ext_group_used_dirs_count(const ext_group_desc_t *gd) {
+    if (!gd)
+        return 0;
+
+    return (uint64_t)gd->bg_used_dirs_count_lo |
+           ((uint64_t)gd->bg_used_dirs_count_hi << 16);
+}
+
+static void ext_group_used_dirs_count_set(ext_group_desc_t *gd,
+                                          uint64_t count) {
+    if (!gd)
+        return;
+
+    gd->bg_used_dirs_count_lo = (uint16_t)count;
+    gd->bg_used_dirs_count_hi = (uint16_t)(count >> 16);
 }
 
 static bool ext_reserved_blocks_available_to_caller(const ext_mount_ctx_t *fs) {
@@ -400,14 +515,14 @@ static void ext_map_cache_destroy(ext_mount_ctx_t *fs) {
 }
 
 static inline ext_map_cache_entry_t *ext_map_cache_slot(ext_mount_ctx_t *fs,
-                                                        uint32_t block) {
+                                                        uint64_t block) {
     if (!fs || !fs->map_cache_entries || !fs->map_cache_entry_count)
         return NULL;
     return &fs->map_cache_entries[block % fs->map_cache_entry_count];
 }
 
 static void ext_map_cache_invalidate_locked(ext_mount_ctx_t *fs,
-                                            uint32_t block) {
+                                            uint64_t block) {
     ext_map_cache_entry_t *entry = ext_map_cache_slot(fs, block);
     if (!entry)
         return;
@@ -415,7 +530,7 @@ static void ext_map_cache_invalidate_locked(ext_mount_ctx_t *fs,
         entry->valid = false;
 }
 
-static int ext_map_cache_read_locked(ext_mount_ctx_t *fs, uint32_t block,
+static int ext_map_cache_read_locked(ext_mount_ctx_t *fs, uint64_t block,
                                      void *buf) {
     ext_map_cache_entry_t *entry = ext_map_cache_slot(fs, block);
     if (entry && entry->valid && entry->block == block) {
@@ -423,8 +538,8 @@ static int ext_map_cache_read_locked(ext_mount_ctx_t *fs, uint32_t block,
         return 0;
     }
 
-    int ret = ext_dev_read_direct(fs, (uint64_t)block * fs->block_size, buf,
-                                  fs->block_size);
+    int ret =
+        ext_dev_read_direct(fs, block * fs->block_size, buf, fs->block_size);
     if (ret)
         return ret;
 
@@ -436,7 +551,7 @@ static int ext_map_cache_read_locked(ext_mount_ctx_t *fs, uint32_t block,
     return 0;
 }
 
-static int ext_map_cache_ref_locked(ext_mount_ctx_t *fs, uint32_t block,
+static int ext_map_cache_ref_locked(ext_mount_ctx_t *fs, uint64_t block,
                                     uint8_t **buf_out) {
     if (!buf_out)
         return -EINVAL;
@@ -446,8 +561,8 @@ static int ext_map_cache_ref_locked(ext_mount_ctx_t *fs, uint32_t block,
         return -EINVAL;
 
     if (!entry->valid || entry->block != block) {
-        int ret = ext_dev_read_direct(fs, (uint64_t)block * fs->block_size,
-                                      entry->data, fs->block_size);
+        int ret = ext_dev_read_direct(fs, block * fs->block_size, entry->data,
+                                      fs->block_size);
         if (ret)
             return ret;
         entry->block = block;
@@ -458,7 +573,7 @@ static int ext_map_cache_ref_locked(ext_mount_ctx_t *fs, uint32_t block,
     return 0;
 }
 
-static void ext_map_cache_store_locked(ext_mount_ctx_t *fs, uint32_t block,
+static void ext_map_cache_store_locked(ext_mount_ctx_t *fs, uint64_t block,
                                        const void *buf) {
     ext_map_cache_entry_t *entry = ext_map_cache_slot(fs, block);
     if (!entry)
@@ -484,7 +599,7 @@ static int ext_inode_offset(ext_mount_ctx_t *fs, uint32_t ino,
 
     uint32_t group = (ino - 1) / fs->sb.s_inodes_per_group;
     uint32_t index = (ino - 1) % fs->sb.s_inodes_per_group;
-    uint64_t table_block = fs->groups[group].bg_inode_table_lo;
+    uint64_t table_block = ext_group_inode_table(&fs->groups[group]);
     *offset_out =
         table_block * fs->block_size + (uint64_t)index * fs->inode_size;
     return 0;
@@ -508,23 +623,29 @@ static int ext_dev_write(ext_mount_ctx_t *fs, uint64_t offset, const void *buf,
     return ext_dev_write_direct(fs, offset, buf, size);
 }
 
-static int ext_read_block(ext_mount_ctx_t *fs, uint32_t block, void *buf) {
-    return ext_dev_read(fs, (uint64_t)block * fs->block_size, buf,
-                        fs->block_size);
+static int ext_read_block(ext_mount_ctx_t *fs, uint64_t block, void *buf) {
+    return ext_dev_read(fs, block * fs->block_size, buf, fs->block_size);
 }
 
-static int ext_write_block(ext_mount_ctx_t *fs, uint32_t block,
+static int ext_write_block(ext_mount_ctx_t *fs, uint64_t block,
                            const void *buf) {
-    return ext_dev_write(fs, (uint64_t)block * fs->block_size, buf,
-                         fs->block_size);
+    return ext_dev_write(fs, block * fs->block_size, buf, fs->block_size);
 }
 
-static int ext_zero_block(ext_mount_ctx_t *fs, uint32_t block) {
+static int ext_zero_block(ext_mount_ctx_t *fs, uint64_t block) {
     void *zero = calloc(1, fs->block_size);
     if (!zero)
         return -ENOMEM;
     int ret = ext_write_block(fs, block, zero);
     free(zero);
+    return ret;
+}
+
+static int ext_write_block_cached_locked(ext_mount_ctx_t *fs, uint64_t block,
+                                         const void *buf) {
+    int ret = ext_write_block(fs, block, buf);
+    if (!ret)
+        ext_map_cache_store_locked(fs, block, buf);
     return ret;
 }
 
@@ -660,45 +781,12 @@ static int ext_lookup_name_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
-        uint32_t offsets[4] = {0};
-        uint32_t depth = 0;
-        uint32_t ptrs = fs->ptrs_per_block;
-        uint32_t logical = lblock;
-        if (logical < EXT2_NDIR_BLOCKS) {
-            depth = 1;
-            offsets[0] = logical;
-        } else if ((logical -= EXT2_NDIR_BLOCKS) < ptrs) {
-            depth = 2;
-            offsets[0] = EXT2_IND_BLOCK;
-            offsets[1] = logical;
-        } else if ((logical -= ptrs) < ptrs * ptrs) {
-            depth = 3;
-            offsets[0] = EXT2_DIND_BLOCK;
-            offsets[1] = logical / ptrs;
-            offsets[2] = logical % ptrs;
-        } else {
-            logical -= ptrs * ptrs;
-            depth = 4;
-            offsets[0] = EXT2_TIND_BLOCK;
-            offsets[1] = logical / (ptrs * ptrs);
-            offsets[2] = (logical / ptrs) % ptrs;
-            offsets[3] = logical % ptrs;
-        }
-
-        pblock = dir_inode.i_block[offsets[0]];
-        if (!pblock)
-            continue;
-        for (uint32_t level = 1; level < depth; level++) {
-            ret = ext_read_block(fs, pblock, buf);
-            if (ret) {
-                free(buf);
-                return ret;
-            }
-            uint32_t *entries = (uint32_t *)buf;
-            pblock = entries[offsets[level]];
-            if (!pblock)
-                break;
+        uint64_t pblock = 0;
+        ret = ext_inode_get_block_locked(fs, dir_ino, &dir_inode, lblock, false,
+                                         &pblock);
+        if (ret) {
+            free(buf);
+            return ret;
         }
         if (!pblock)
             continue;
@@ -747,7 +835,7 @@ static int ext_lookup_name_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     return 0;
 }
 
-static int ext_bitmap_update(ext_mount_ctx_t *fs, uint32_t block, uint32_t bit,
+static int ext_bitmap_update(ext_mount_ctx_t *fs, uint64_t block, uint32_t bit,
                              bool set) {
     uint8_t *bitmap = calloc(1, fs->block_size);
     if (!bitmap)
@@ -774,14 +862,15 @@ static int ext_alloc_inode_locked(ext_mount_ctx_t *fs, uint16_t mode,
 
     for (uint32_t group = 0; group < fs->group_count; group++) {
         ext_group_desc_t *gd = &fs->groups[group];
-        if (!gd->bg_free_inodes_count_lo)
+        uint64_t free_inodes = ext_group_free_inodes_count(gd);
+        if (!free_inodes)
             continue;
 
         uint64_t inode_count = ext_group_inodes_count(fs, group);
         uint8_t *bitmap = calloc(1, fs->block_size);
         if (!bitmap)
             return -ENOMEM;
-        int ret = ext_read_block(fs, gd->bg_inode_bitmap_lo, bitmap);
+        int ret = ext_read_block(fs, ext_group_inode_bitmap(gd), bitmap);
         if (ret) {
             free(bitmap);
             return ret;
@@ -791,14 +880,15 @@ static int ext_alloc_inode_locked(ext_mount_ctx_t *fs, uint16_t mode,
             if (bitmap[bit >> 3] & (1u << (bit & 7)))
                 continue;
             bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7));
-            ret = ext_write_block(fs, gd->bg_inode_bitmap_lo, bitmap);
+            ret = ext_write_block(fs, ext_group_inode_bitmap(gd), bitmap);
             free(bitmap);
             if (ret)
                 return ret;
 
-            gd->bg_free_inodes_count_lo--;
+            ext_group_free_inodes_count_set(gd, free_inodes - 1);
             if ((mode & S_IFMT) == EXT2_S_IFDIR)
-                gd->bg_used_dirs_count_lo++;
+                ext_group_used_dirs_count_set(
+                    gd, ext_group_used_dirs_count(gd) + 1);
             fs->sb.s_free_inodes_count--;
             ret = ext_write_group_desc(fs, group);
             if (ret)
@@ -812,7 +902,7 @@ static int ext_alloc_inode_locked(ext_mount_ctx_t *fs, uint16_t mode,
             uint8_t *empty = calloc(1, fs->inode_size);
             if (!empty)
                 return -ENOMEM;
-            uint64_t table_block = gd->bg_inode_table_lo;
+            uint64_t table_block = ext_group_inode_table(gd);
             uint64_t offset =
                 table_block * fs->block_size + (uint64_t)bit * fs->inode_size;
             ret = ext_dev_write(fs, offset, empty, fs->inode_size);
@@ -834,13 +924,15 @@ static int ext_free_inode_locked(ext_mount_ctx_t *fs, uint32_t ino,
     uint32_t group = (ino - 1) / fs->sb.s_inodes_per_group;
     uint32_t bit = (ino - 1) % fs->sb.s_inodes_per_group;
     ext_group_desc_t *gd = &fs->groups[group];
-    int ret = ext_bitmap_update(fs, gd->bg_inode_bitmap_lo, bit, false);
+    uint64_t free_inodes = ext_group_free_inodes_count(gd);
+    uint64_t used_dirs = ext_group_used_dirs_count(gd);
+    int ret = ext_bitmap_update(fs, ext_group_inode_bitmap(gd), bit, false);
     if (ret)
         return ret;
 
-    gd->bg_free_inodes_count_lo++;
-    if (is_dir && gd->bg_used_dirs_count_lo)
-        gd->bg_used_dirs_count_lo--;
+    ext_group_free_inodes_count_set(gd, free_inodes + 1);
+    if (is_dir && used_dirs)
+        ext_group_used_dirs_count_set(gd, used_dirs - 1);
     fs->sb.s_free_inodes_count++;
     ret = ext_write_group_desc(fs, group);
     if (ret)
@@ -848,38 +940,58 @@ static int ext_free_inode_locked(ext_mount_ctx_t *fs, uint32_t ino,
     return ext_write_super(fs);
 }
 
-static int ext_alloc_block_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
-                                  uint32_t *out_block) {
-    if (!fs || !out_block)
+static int ext_alloc_blocks_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
+                                   uint32_t want_blocks, uint64_t goal_block,
+                                   uint64_t *out_block,
+                                   uint32_t *out_allocated) {
+    if (!fs || !out_block || !out_allocated || !want_blocks)
         return -EINVAL;
 
     for (uint32_t pass = 0; pass < fs->group_count; pass++) {
         uint32_t group = (prefer_group + pass) % fs->group_count;
         ext_group_desc_t *gd = &fs->groups[group];
-        if (!gd->bg_free_blocks_count_lo)
+        uint64_t free_blocks = ext_group_free_blocks_count(gd);
+        if (!free_blocks)
             continue;
 
         uint64_t block_count = ext_group_blocks_count(fs, group);
         uint8_t *bitmap = calloc(1, fs->block_size);
         if (!bitmap)
             return -ENOMEM;
-        int ret = ext_read_block(fs, gd->bg_block_bitmap_lo, bitmap);
+        int ret = ext_read_block(fs, ext_group_block_bitmap(gd), bitmap);
         if (ret) {
             free(bitmap);
             return ret;
         }
 
-        for (uint32_t bit = 0; bit < block_count; bit++) {
+        uint32_t start_bit = 0;
+        uint64_t group_first = ext_group_first_block(fs, group);
+        if (goal_block >= group_first && goal_block < group_first + block_count)
+            start_bit = (uint32_t)(goal_block - group_first);
+
+        for (uint32_t scan = 0; scan < block_count; scan++) {
+            uint32_t bit = (start_bit + scan) % block_count;
             if (bitmap[bit >> 3] & (1u << (bit & 7)))
                 continue;
-            bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7));
-            ret = ext_write_block(fs, gd->bg_block_bitmap_lo, bitmap);
+
+            uint32_t run = 1;
+            uint32_t max_run = MIN((uint32_t)(block_count - bit), want_blocks);
+            while (run < max_run &&
+                   !(bitmap[(bit + run) >> 3] & (1u << ((bit + run) & 7)))) {
+                run++;
+            }
+
+            for (uint32_t i = 0; i < run; i++)
+                bitmap[(bit + i) >> 3] |= (uint8_t)(1u << ((bit + i) & 7));
+
+            ret = ext_write_block(fs, ext_group_block_bitmap(gd), bitmap);
             free(bitmap);
             if (ret)
                 return ret;
 
-            gd->bg_free_blocks_count_lo--;
-            fs->sb.s_free_blocks_count_lo--;
+            ext_group_free_blocks_count_set(gd, free_blocks - run);
+            ext_sb_free_blocks_count_set(
+                &fs->sb, ext_sb_free_blocks_count(&fs->sb) - run);
             ret = ext_write_group_desc(fs, group);
             if (ret)
                 return ret;
@@ -887,8 +999,14 @@ static int ext_alloc_block_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
             if (ret)
                 return ret;
 
-            *out_block = (uint32_t)(ext_group_first_block(fs, group) + bit);
-            return ext_zero_block(fs, *out_block);
+            *out_block = ext_group_first_block(fs, group) + bit;
+            *out_allocated = run;
+            for (uint32_t i = 0; i < run; i++) {
+                ret = ext_zero_block(fs, *out_block + i);
+                if (ret)
+                    return ret;
+            }
+            return 0;
         }
 
         free(bitmap);
@@ -897,7 +1015,14 @@ static int ext_alloc_block_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
     return -ENOSPC;
 }
 
-static int ext_free_block_locked(ext_mount_ctx_t *fs, uint32_t block) {
+static int ext_alloc_block_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
+                                  uint64_t *out_block) {
+    uint32_t allocated = 0;
+    return ext_alloc_blocks_locked(fs, prefer_group, 1, 0, out_block,
+                                   &allocated);
+}
+
+static int ext_free_block_locked(ext_mount_ctx_t *fs, uint64_t block) {
     if (!fs || block < fs->sb.s_first_data_block || block >= fs->blocks_count)
         return -EINVAL;
 
@@ -908,13 +1033,15 @@ static int ext_free_block_locked(ext_mount_ctx_t *fs, uint32_t block) {
     uint32_t bit =
         (block - fs->sb.s_first_data_block) % fs->sb.s_blocks_per_group;
     ext_group_desc_t *gd = &fs->groups[group];
+    uint64_t free_blocks = ext_group_free_blocks_count(gd);
 
-    int ret = ext_bitmap_update(fs, gd->bg_block_bitmap_lo, bit, false);
+    int ret = ext_bitmap_update(fs, ext_group_block_bitmap(gd), bit, false);
     if (ret)
         return ret;
 
-    gd->bg_free_blocks_count_lo++;
-    fs->sb.s_free_blocks_count_lo++;
+    ext_group_free_blocks_count_set(gd, free_blocks + 1);
+    ext_sb_free_blocks_count_set(&fs->sb,
+                                 ext_sb_free_blocks_count(&fs->sb) + 1);
     ret = ext_write_group_desc(fs, group);
     if (ret)
         return ret;
@@ -970,12 +1097,463 @@ static int ext_block_all_zero(void *buf, uint32_t count) {
     return 1;
 }
 
-static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
-                                          ext_inode_disk_t *inode,
-                                          uint32_t logical_block, bool create,
-                                          uint32_t *out_block,
-                                          uint32_t *out_run_blocks,
-                                          uint32_t max_run_blocks) {
+static uint16_t ext_extent_inode_max_entries(void) {
+    return (uint16_t)((sizeof(((ext_inode_disk_t *)0)->i_block) -
+                       sizeof(ext_extent_header_t)) /
+                      sizeof(ext_extent_t));
+}
+
+static uint16_t ext_extent_block_max_entries(ext_mount_ctx_t *fs) {
+    return (uint16_t)((fs->block_size - sizeof(ext_extent_header_t)) /
+                      sizeof(ext_extent_t));
+}
+
+static ext_extent_header_t *ext_inode_extent_header(ext_inode_disk_t *inode) {
+    return (ext_extent_header_t *)inode->i_block;
+}
+
+static const ext_extent_header_t *
+ext_inode_extent_header_const(const ext_inode_disk_t *inode) {
+    return (const ext_extent_header_t *)inode->i_block;
+}
+
+static ext_extent_t *ext_extent_first(ext_extent_header_t *hdr) {
+    return (ext_extent_t *)((uint8_t *)hdr + sizeof(*hdr));
+}
+
+static const ext_extent_t *
+ext_extent_first_const(const ext_extent_header_t *hdr) {
+    return (const ext_extent_t *)((const uint8_t *)hdr + sizeof(*hdr));
+}
+
+static ext_extent_idx_t *ext_extent_first_idx(ext_extent_header_t *hdr) {
+    return (ext_extent_idx_t *)((uint8_t *)hdr + sizeof(*hdr));
+}
+
+static const ext_extent_idx_t *
+ext_extent_first_idx_const(const ext_extent_header_t *hdr) {
+    return (const ext_extent_idx_t *)((const uint8_t *)hdr + sizeof(*hdr));
+}
+
+static uint16_t ext_extent_len_get(const ext_extent_t *ext) {
+    uint16_t raw = ext->ee_len;
+    return raw > EXT4_EXT_INIT_MAX_LEN ? raw - EXT4_EXT_INIT_MAX_LEN : raw;
+}
+
+static bool ext_extent_is_unwritten(const ext_extent_t *ext) {
+    return ext->ee_len > EXT4_EXT_INIT_MAX_LEN;
+}
+
+static uint64_t ext_extent_start_get(const ext_extent_t *ext) {
+    return (uint64_t)ext->ee_start_lo | ((uint64_t)ext->ee_start_hi << 32);
+}
+
+static void ext_extent_start_set(ext_extent_t *ext, uint64_t block) {
+    ext->ee_start_lo = (uint32_t)block;
+    ext->ee_start_hi = (uint16_t)(block >> 32);
+}
+
+static uint64_t ext_extent_idx_leaf_get(const ext_extent_idx_t *idx) {
+    return (uint64_t)idx->ei_leaf_lo | ((uint64_t)idx->ei_leaf_hi << 32);
+}
+
+static void ext_extent_idx_leaf_set(ext_extent_idx_t *idx, uint64_t block) {
+    idx->ei_leaf_lo = (uint32_t)block;
+    idx->ei_leaf_hi = (uint16_t)(block >> 32);
+}
+
+static void ext_extent_len_set(ext_extent_t *ext, uint16_t len) {
+    ext->ee_len = len;
+}
+
+static bool ext_extent_header_valid(const ext_extent_header_t *hdr,
+                                    uint16_t max_entries) {
+    if (!hdr || hdr->eh_magic != EXT4_EXT_MAGIC)
+        return false;
+    if (hdr->eh_max > max_entries || hdr->eh_entries > hdr->eh_max)
+        return false;
+    if (hdr->eh_depth > EXT_EXTENT_MAX_DEPTH)
+        return false;
+    return true;
+}
+
+static uint32_t ext_extent_node_first_lblock(const ext_extent_header_t *hdr) {
+    if (!hdr || !hdr->eh_entries)
+        return 0;
+    if (hdr->eh_depth)
+        return ext_extent_first_idx_const(hdr)[0].ei_block;
+    return ext_extent_first_const(hdr)[0].ee_block;
+}
+
+static void ext_extent_path_release(ext_extent_path_t *path, uint16_t depth) {
+    if (!path)
+        return;
+
+    for (uint16_t i = 1; i <= depth; i++) {
+        free(path[i].buf);
+        path[i].buf = NULL;
+        path[i].hdr = NULL;
+    }
+}
+
+static uint32_t ext_extent_next_lblock_from_path(ext_extent_path_t path[],
+                                                 uint16_t depth) {
+    if (!path)
+        return UINT32_MAX;
+
+    for (int level = depth; level > 0; level--) {
+        ext_extent_header_t *parent = path[level - 1].hdr;
+        uint16_t next_slot = path[level - 1].slot + 1;
+
+        if (!parent || next_slot >= parent->eh_entries)
+            continue;
+
+        return ext_extent_first_idx(parent)[next_slot].ei_block;
+    }
+
+    return UINT32_MAX;
+}
+
+static void ext_inode_init_extent_root(ext_inode_disk_t *inode) {
+    ext_extent_header_t *hdr;
+
+    if (!inode)
+        return;
+
+    memset(inode->i_block, 0, sizeof(inode->i_block));
+    inode->i_flags |= EXT4_EXTENTS_FL;
+    hdr = ext_inode_extent_header(inode);
+    hdr->eh_magic = EXT4_EXT_MAGIC;
+    hdr->eh_entries = 0;
+    hdr->eh_max = ext_extent_inode_max_entries();
+    hdr->eh_depth = 0;
+    hdr->eh_generation = 0;
+}
+
+static bool ext_inode_should_use_extents(ext_mount_ctx_t *fs, uint16_t mode,
+                                         size_t payload_size) {
+    if (!fs || !fs->has_extents)
+        return false;
+
+    switch (mode & S_IFMT) {
+    case EXT2_S_IFREG:
+    case EXT2_S_IFDIR:
+        return true;
+    case EXT2_S_IFLNK:
+        return payload_size > sizeof(((ext_inode_disk_t *)0)->i_block);
+    default:
+        return false;
+    }
+}
+
+static int ext_extent_load_path_locked(ext_mount_ctx_t *fs,
+                                       ext_inode_disk_t *inode,
+                                       uint32_t logical_block,
+                                       ext_extent_path_t path[],
+                                       uint16_t *depth_out) {
+    ext_extent_header_t *hdr;
+    uint16_t depth;
+    int ret = 0;
+
+    if (!fs || !inode || !path || !depth_out)
+        return -EINVAL;
+
+    memset(path, 0, sizeof(ext_extent_path_t) * (EXT_EXTENT_MAX_DEPTH + 1));
+    hdr = ext_inode_extent_header(inode);
+    if (!ext_extent_header_valid(hdr, ext_extent_inode_max_entries()))
+        return -EIO;
+
+    depth = hdr->eh_depth;
+    path[0].hdr = hdr;
+
+    for (uint16_t level = 0; level < depth; level++) {
+        ext_extent_idx_t *idx;
+        uint16_t entries = path[level].hdr->eh_entries;
+        uint16_t slot = 0;
+        uint64_t child;
+
+        if (!entries)
+            break;
+
+        idx = ext_extent_first_idx(path[level].hdr);
+        while (slot + 1 < entries && idx[slot + 1].ei_block <= logical_block)
+            slot++;
+
+        child = ext_extent_idx_leaf_get(&idx[slot]);
+        path[level].slot = slot;
+        path[level + 1].buf = calloc(1, fs->block_size);
+        if (!path[level + 1].buf) {
+            ret = -ENOMEM;
+            goto fail;
+        }
+
+        ret = ext_read_block(fs, child, path[level + 1].buf);
+        if (ret)
+            goto fail;
+
+        path[level + 1].block = child;
+        path[level + 1].hdr = (ext_extent_header_t *)path[level + 1].buf;
+        if (!ext_extent_header_valid(path[level + 1].hdr,
+                                     ext_extent_block_max_entries(fs))) {
+            ret = -EIO;
+            goto fail;
+        }
+    }
+
+    path[depth].slot = 0;
+    if (path[depth].hdr->eh_entries) {
+        ext_extent_t *ext = ext_extent_first(path[depth].hdr);
+        while (path[depth].slot < path[depth].hdr->eh_entries &&
+               ext[path[depth].slot].ee_block <= logical_block) {
+            path[depth].slot++;
+        }
+    }
+
+    *depth_out = depth;
+    return 0;
+
+fail:
+    ext_extent_path_release(path, depth);
+    return ret;
+}
+
+static int ext_extent_flush_path_locked(ext_mount_ctx_t *fs,
+                                        ext_extent_path_t path[],
+                                        uint16_t depth) {
+    for (int level = depth; level > 0; level--) {
+        int ret = ext_write_block_cached_locked(fs, path[level].block,
+                                                path[level].buf);
+        if (ret)
+            return ret;
+    }
+    return 0;
+}
+
+static int ext_extent_refresh_parents_locked(ext_mount_ctx_t *fs,
+                                             ext_extent_path_t path[],
+                                             uint16_t depth) {
+    for (int level = depth; level > 0; level--) {
+        ext_extent_header_t *child = path[level].hdr;
+        ext_extent_idx_t *parent_entries;
+        uint16_t slot;
+
+        if (!child->eh_entries)
+            break;
+
+        parent_entries = ext_extent_first_idx(path[level - 1].hdr);
+        slot = path[level - 1].slot;
+        if (slot >= path[level - 1].hdr->eh_entries)
+            return -EIO;
+        parent_entries[slot].ei_block = ext_extent_node_first_lblock(child);
+    }
+
+    return ext_extent_flush_path_locked(fs, path, depth);
+}
+
+static int ext_extent_grow_tree_locked(ext_mount_ctx_t *fs,
+                                       ext_inode_disk_t *inode) {
+    ext_extent_header_t *root;
+    uint8_t *leaf_buf = NULL;
+    ext_extent_header_t *leaf_hdr;
+    uint64_t leaf_block = 0;
+    int ret;
+
+    if (!fs || !inode)
+        return -EINVAL;
+
+    root = ext_inode_extent_header(inode);
+    if (!ext_extent_header_valid(root, ext_extent_inode_max_entries()))
+        return -EIO;
+    if (root->eh_depth != 0 || !root->eh_entries)
+        return -EINVAL;
+
+    ret = ext_alloc_block_locked(fs, 0, &leaf_block);
+    if (ret)
+        return ret;
+
+    leaf_buf = calloc(1, fs->block_size);
+    if (!leaf_buf) {
+        ext_free_block_locked(fs, leaf_block);
+        return -ENOMEM;
+    }
+
+    leaf_hdr = (ext_extent_header_t *)leaf_buf;
+    leaf_hdr->eh_magic = EXT4_EXT_MAGIC;
+    leaf_hdr->eh_entries = root->eh_entries;
+    leaf_hdr->eh_max = ext_extent_block_max_entries(fs);
+    leaf_hdr->eh_depth = 0;
+    leaf_hdr->eh_generation = root->eh_generation;
+    memcpy(ext_extent_first(leaf_hdr), ext_extent_first(root),
+           root->eh_entries * sizeof(ext_extent_t));
+
+    ret = ext_write_block_cached_locked(fs, leaf_block, leaf_buf);
+    if (ret) {
+        free(leaf_buf);
+        ext_free_block_locked(fs, leaf_block);
+        return ret;
+    }
+
+    memset(inode->i_block, 0, sizeof(inode->i_block));
+    root = ext_inode_extent_header(inode);
+    root->eh_magic = EXT4_EXT_MAGIC;
+    root->eh_entries = 1;
+    root->eh_max = ext_extent_inode_max_entries();
+    root->eh_depth = 1;
+    root->eh_generation = 0;
+    ext_extent_first_idx(root)[0].ei_block =
+        leaf_hdr->eh_entries ? ext_extent_first(leaf_hdr)[0].ee_block : 0;
+    ext_extent_idx_leaf_set(&ext_extent_first_idx(root)[0], leaf_block);
+    ext_inode_add_fs_blocks(fs, inode, 1);
+
+    free(leaf_buf);
+    return 0;
+}
+
+static int ext_extent_map_blocks_locked(ext_mount_ctx_t *fs, uint32_t ino,
+                                        ext_inode_disk_t *inode,
+                                        uint32_t logical_block, bool create,
+                                        uint64_t *out_block,
+                                        uint32_t *out_run_blocks,
+                                        uint32_t max_run_blocks) {
+    ext_extent_path_t path[EXT_EXTENT_MAX_DEPTH + 1];
+    ext_extent_header_t *leaf_hdr;
+    ext_extent_t *ext;
+    uint16_t depth = 0;
+    uint16_t entries;
+    uint16_t pos;
+    int ret;
+
+retry:
+    ret = ext_extent_load_path_locked(fs, inode, logical_block, path, &depth);
+    if (ret)
+        return ret;
+
+    if (!out_block || !out_run_blocks) {
+        ext_extent_path_release(path, depth);
+        return -EINVAL;
+    }
+    if (!max_run_blocks)
+        max_run_blocks = 1;
+
+    leaf_hdr = path[depth].hdr;
+    entries = leaf_hdr->eh_entries;
+    pos = path[depth].slot;
+    ext = ext_extent_first(leaf_hdr);
+
+    if (pos > 0) {
+        ext_extent_t *prev = &ext[pos - 1];
+        uint32_t prev_len = ext_extent_len_get(prev);
+        uint32_t prev_start = prev->ee_block;
+        if (logical_block >= prev_start &&
+            logical_block < prev_start + prev_len) {
+            uint32_t delta = logical_block - prev_start;
+            *out_run_blocks = MIN(prev_len - delta, max_run_blocks);
+            *out_block = ext_extent_is_unwritten(prev)
+                             ? 0
+                             : ext_extent_start_get(prev) + delta;
+            ext_extent_path_release(path, depth);
+            return 0;
+        }
+    }
+
+    if (!create) {
+        uint32_t hole = max_run_blocks;
+        if (pos < entries) {
+            hole = MIN(hole, ext[pos].ee_block - logical_block);
+        } else if (depth > 0) {
+            uint32_t next_lblock =
+                ext_extent_next_lblock_from_path(path, depth);
+            if (next_lblock != UINT32_MAX) {
+                if (next_lblock <= logical_block) {
+                    ext_extent_path_release(path, depth);
+                    return -EIO;
+                }
+                hole = MIN(hole, next_lblock - logical_block);
+            }
+        }
+        *out_block = 0;
+        *out_run_blocks = hole ? hole : 1;
+        ext_extent_path_release(path, depth);
+        return 0;
+    }
+
+    if (entries >= leaf_hdr->eh_max) {
+        ext_extent_path_release(path, depth);
+        if (depth == 0) {
+            ret = ext_extent_grow_tree_locked(fs, inode);
+            if (!ret)
+                goto retry;
+        }
+        return -ENOTSUP;
+    }
+
+    uint32_t prefer_group = (ino - 1) / fs->sb.s_inodes_per_group;
+    uint32_t hole_limit = max_run_blocks;
+    uint64_t goal_block = 0;
+    uint64_t first_block = 0;
+    uint32_t alloc_blocks = 0;
+
+    if (pos > 0) {
+        ext_extent_t *prev = &ext[pos - 1];
+        uint32_t prev_len = ext_extent_len_get(prev);
+        if (logical_block == prev->ee_block + prev_len)
+            goal_block = ext_extent_start_get(prev) + prev_len;
+    }
+    if (pos < entries) {
+        hole_limit = MIN(hole_limit, ext[pos].ee_block - logical_block);
+    } else if (depth > 0) {
+        uint32_t next_lblock = ext_extent_next_lblock_from_path(path, depth);
+        if (next_lblock != UINT32_MAX) {
+            if (next_lblock <= logical_block) {
+                ext_extent_path_release(path, depth);
+                return -EIO;
+            }
+            hole_limit = MIN(hole_limit, next_lblock - logical_block);
+        }
+    }
+    hole_limit = MIN(hole_limit, (uint32_t)EXT4_EXT_INIT_MAX_LEN);
+    if (!hole_limit)
+        hole_limit = 1;
+
+    ret = ext_alloc_blocks_locked(fs, prefer_group, hole_limit, goal_block,
+                                  &first_block, &alloc_blocks);
+    if (ret) {
+        ext_extent_path_release(path, depth);
+        return ret;
+    }
+
+    if (pos > 0) {
+        ext_extent_t *prev = &ext[pos - 1];
+        uint32_t prev_len = ext_extent_len_get(prev);
+        uint64_t prev_phys = ext_extent_start_get(prev);
+        if (logical_block == prev->ee_block + prev_len &&
+            prev_phys + prev_len == first_block &&
+            prev_len + alloc_blocks <= EXT4_EXT_INIT_MAX_LEN) {
+            ext_extent_len_set(prev, (uint16_t)(prev_len + alloc_blocks));
+            *out_block = first_block;
+            *out_run_blocks = alloc_blocks;
+            ret = ext_extent_refresh_parents_locked(fs, path, depth);
+            ext_extent_path_release(path, depth);
+            return ret;
+        }
+    }
+
+    memmove(&ext[pos + 1], &ext[pos], (entries - pos) * sizeof(ext_extent_t));
+    ext[pos].ee_block = logical_block;
+    ext_extent_len_set(&ext[pos], (uint16_t)alloc_blocks);
+    ext_extent_start_set(&ext[pos], first_block);
+    leaf_hdr->eh_entries++;
+    *out_block = first_block;
+    *out_run_blocks = alloc_blocks;
+    ret = ext_extent_refresh_parents_locked(fs, path, depth);
+    ext_extent_path_release(path, depth);
+    return ret;
+}
+
+static int ext_inode_get_block_run_legacy_locked(
+    ext_mount_ctx_t *fs, uint32_t ino, ext_inode_disk_t *inode,
+    uint32_t logical_block, bool create, uint64_t *out_block,
+    uint32_t *out_run_blocks, uint32_t max_run_blocks) {
     uint32_t offsets[4] = {0};
     uint32_t depth = 0;
     int ret = ext_lblock_path(fs, logical_block, offsets, &depth);
@@ -984,18 +1562,18 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
 
     if (!out_block || !out_run_blocks)
         return -EINVAL;
-    if (max_run_blocks == 0)
+    if (!max_run_blocks)
         max_run_blocks = 1;
 
     uint32_t prefer_group = (ino - 1) / fs->sb.s_inodes_per_group;
 
     if (depth == 1) {
         if (!inode->i_block[offsets[0]] && create) {
-            uint32_t first = 0;
+            uint64_t first = 0;
             ret = ext_alloc_block_locked(fs, prefer_group, &first);
             if (ret)
                 return ret;
-            inode->i_block[offsets[0]] = first;
+            inode->i_block[offsets[0]] = (uint32_t)first;
             ext_inode_add_fs_blocks(fs, inode, 1);
         }
         *out_block = inode->i_block[offsets[0]];
@@ -1006,9 +1584,11 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
         for (uint32_t run = 1; run < limit; run++) {
             uint32_t slot = inode->i_block[offsets[0] + run];
             if (!slot && create) {
-                ret = ext_alloc_block_locked(fs, prefer_group, &slot);
+                uint64_t new_block = 0;
+                ret = ext_alloc_block_locked(fs, prefer_group, &new_block);
                 if (ret)
                     return ret;
+                slot = (uint32_t)new_block;
                 inode->i_block[offsets[0] + run] = slot;
                 ext_inode_add_fs_blocks(fs, inode, 1);
             }
@@ -1016,7 +1596,7 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
             if (*out_block == 0) {
                 if (slot != 0)
                     break;
-            } else if (slot != *out_block + run) {
+            } else if ((uint64_t)slot != *out_block + run) {
                 break;
             }
             *out_run_blocks = run + 1;
@@ -1026,9 +1606,11 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
 
     uint32_t cur = inode->i_block[offsets[0]];
     if (!cur && create) {
-        ret = ext_alloc_block_locked(fs, prefer_group, &cur);
+        uint64_t new_block = 0;
+        ret = ext_alloc_block_locked(fs, prefer_group, &new_block);
         if (ret)
             return ret;
+        cur = (uint32_t)new_block;
         inode->i_block[offsets[0]] = cur;
         ext_inode_add_fs_blocks(fs, inode, 1);
     }
@@ -1048,11 +1630,13 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
         uint32_t *entries = (uint32_t *)buf;
         uint32_t next = entries[offsets[level]];
         if (!next && create) {
-            ret = ext_alloc_block_locked(fs, prefer_group, &next);
+            uint64_t new_block = 0;
+            ret = ext_alloc_block_locked(fs, prefer_group, &new_block);
             if (ret)
                 return ret;
+            next = (uint32_t)new_block;
             entries[offsets[level]] = next;
-            ret = ext_write_block(fs, cur, buf);
+            ret = ext_write_block_cached_locked(fs, cur, buf);
             if (ret)
                 return ret;
             ext_inode_add_fs_blocks(fs, inode, 1);
@@ -1073,9 +1657,11 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
     uint32_t first = entries[offsets[depth - 1]];
     bool dirty = false;
     if (!first && create) {
-        ret = ext_alloc_block_locked(fs, prefer_group, &first);
+        uint64_t new_block = 0;
+        ret = ext_alloc_block_locked(fs, prefer_group, &new_block);
         if (ret)
             return ret;
+        first = (uint32_t)new_block;
         entries[offsets[depth - 1]] = first;
         ext_inode_add_fs_blocks(fs, inode, 1);
         dirty = true;
@@ -1089,9 +1675,11 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
     for (uint32_t run = 1; run < limit; run++) {
         uint32_t *slot = &entries[offsets[depth - 1] + run];
         if (!*slot && create) {
-            ret = ext_alloc_block_locked(fs, prefer_group, slot);
+            uint64_t new_block = 0;
+            ret = ext_alloc_block_locked(fs, prefer_group, &new_block);
             if (ret)
                 return ret;
+            *slot = (uint32_t)new_block;
             ext_inode_add_fs_blocks(fs, inode, 1);
             dirty = true;
         }
@@ -1099,14 +1687,14 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
         if (first == 0) {
             if (*slot != 0)
                 break;
-        } else if (*slot != first + run) {
+        } else if ((uint64_t)*slot != *out_block + run) {
             break;
         }
         *out_run_blocks = run + 1;
     }
 
     if (dirty) {
-        ret = ext_write_block(fs, cur, buf);
+        ret = ext_write_block_cached_locked(fs, cur, buf);
         if (ret)
             return ret;
     }
@@ -1114,18 +1702,34 @@ static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
     return 0;
 }
 
+static int ext_inode_get_block_run_locked(ext_mount_ctx_t *fs, uint32_t ino,
+                                          ext_inode_disk_t *inode,
+                                          uint32_t logical_block, bool create,
+                                          uint64_t *out_block,
+                                          uint32_t *out_run_blocks,
+                                          uint32_t max_run_blocks) {
+    if (ext_inode_uses_extents(inode))
+        return ext_extent_map_blocks_locked(fs, ino, inode, logical_block,
+                                            create, out_block, out_run_blocks,
+                                            max_run_blocks);
+
+    return ext_inode_get_block_run_legacy_locked(
+        fs, ino, inode, logical_block, create, out_block, out_run_blocks,
+        max_run_blocks);
+}
+
 static int ext_inode_get_block_locked(ext_mount_ctx_t *fs, uint32_t ino,
                                       ext_inode_disk_t *inode,
                                       uint32_t logical_block, bool create,
-                                      uint32_t *out_block) {
+                                      uint64_t *out_block) {
     uint32_t run_blocks = 0;
     return ext_inode_get_block_run_locked(fs, ino, inode, logical_block, create,
                                           out_block, &run_blocks, 1);
 }
 
-static int ext_inode_clear_block_locked(ext_mount_ctx_t *fs,
-                                        ext_inode_disk_t *inode,
-                                        uint32_t logical_block) {
+static int ext_inode_clear_block_legacy_locked(ext_mount_ctx_t *fs,
+                                               ext_inode_disk_t *inode,
+                                               uint32_t logical_block) {
     uint32_t offsets[4] = {0};
     uint32_t depth = 0;
     int ret = ext_lblock_path(fs, logical_block, offsets, &depth);
@@ -1133,7 +1737,7 @@ static int ext_inode_clear_block_locked(ext_mount_ctx_t *fs,
         return ret;
 
     if (depth == 1) {
-        uint32_t block = inode->i_block[offsets[0]];
+        uint64_t block = inode->i_block[offsets[0]];
         if (!block)
             return 0;
         ret = ext_free_block_locked(fs, block);
@@ -1178,10 +1782,9 @@ static int ext_inode_clear_block_locked(ext_mount_ctx_t *fs,
 
     for (int level = (int)depth - 2; level >= 0; level--) {
         if (!ext_block_all_zero(bufs[level], fs->ptrs_per_block)) {
-            ret = ext_write_block(fs, blocks[level], bufs[level]);
+            ret = ext_write_block_cached_locked(fs, blocks[level], bufs[level]);
             if (ret)
                 goto cleanup;
-            ext_map_cache_store_locked(fs, blocks[level], bufs[level]);
             break;
         }
 
@@ -1201,6 +1804,108 @@ cleanup:
     for (size_t i = 0; i < 3; i++)
         free(bufs[i]);
     return ret;
+}
+
+static int ext_inode_clear_block_extent_locked(ext_mount_ctx_t *fs,
+                                               ext_inode_disk_t *inode,
+                                               uint32_t logical_block) {
+    ext_extent_path_t path[EXT_EXTENT_MAX_DEPTH + 1];
+    ext_extent_header_t *leaf_hdr;
+    ext_extent_t *ext;
+    uint16_t depth = 0;
+    uint16_t pos;
+    int ret;
+
+    ret = ext_extent_load_path_locked(fs, inode, logical_block, path, &depth);
+    if (ret)
+        return ret;
+
+    leaf_hdr = path[depth].hdr;
+    pos = path[depth].slot;
+    if (!pos) {
+        ext_extent_path_release(path, depth);
+        return 0;
+    }
+
+    ext = ext_extent_first(leaf_hdr);
+    ext_extent_t *target = &ext[pos - 1];
+    uint32_t len = ext_extent_len_get(target);
+    uint32_t start = target->ee_block;
+    uint64_t phys = ext_extent_start_get(target);
+    uint32_t delta;
+
+    if (logical_block < start || logical_block >= start + len) {
+        ext_extent_path_release(path, depth);
+        return 0;
+    }
+
+    delta = logical_block - start;
+    ret = ext_free_block_locked(fs, phys + delta);
+    if (ret) {
+        ext_extent_path_release(path, depth);
+        return ret;
+    }
+    ext_inode_sub_fs_blocks(fs, inode, 1);
+
+    if (len == 1) {
+        memmove(&ext[pos - 1], &ext[pos],
+                (leaf_hdr->eh_entries - pos) * sizeof(ext_extent_t));
+        leaf_hdr->eh_entries--;
+    } else if (delta == 0) {
+        target->ee_block++;
+        ext_extent_start_set(target, phys + 1);
+        ext_extent_len_set(target, (uint16_t)(len - 1));
+    } else if (delta == len - 1) {
+        ext_extent_len_set(target, (uint16_t)(len - 1));
+    } else {
+        if (leaf_hdr->eh_entries >= leaf_hdr->eh_max) {
+            ext_extent_path_release(path, depth);
+            return -ENOTSUP;
+        }
+
+        memmove(&ext[pos + 1], &ext[pos],
+                (leaf_hdr->eh_entries - pos) * sizeof(ext_extent_t));
+        ext[pos].ee_block = logical_block + 1;
+        ext_extent_len_set(&ext[pos], (uint16_t)(len - delta - 1));
+        ext_extent_start_set(&ext[pos], phys + delta + 1);
+        ext_extent_len_set(target, (uint16_t)delta);
+        leaf_hdr->eh_entries++;
+    }
+
+    if (!leaf_hdr->eh_entries && depth == 1) {
+        ext_extent_idx_t *root_idx = ext_extent_first_idx(path[0].hdr);
+
+        ret = ext_free_block_locked(fs, path[1].block);
+        if (ret) {
+            ext_extent_path_release(path, depth);
+            return ret;
+        }
+        ext_inode_sub_fs_blocks(fs, inode, 1);
+
+        if (path[0].hdr->eh_entries > 1) {
+            memmove(&root_idx[path[0].slot], &root_idx[path[0].slot + 1],
+                    (path[0].hdr->eh_entries - path[0].slot - 1) *
+                        sizeof(ext_extent_idx_t));
+            path[0].hdr->eh_entries--;
+        } else {
+            ext_inode_init_extent_root(inode);
+        }
+        ext_extent_path_release(path, depth);
+        return 0;
+    }
+
+    ret = ext_extent_refresh_parents_locked(fs, path, depth);
+    ext_extent_path_release(path, depth);
+    return ret;
+}
+
+static int ext_inode_clear_block_locked(ext_mount_ctx_t *fs,
+                                        ext_inode_disk_t *inode,
+                                        uint32_t logical_block) {
+    if (ext_inode_uses_extents(inode))
+        return ext_inode_clear_block_extent_locked(fs, inode, logical_block);
+
+    return ext_inode_clear_block_legacy_locked(fs, inode, logical_block);
 }
 
 static int ext_inode_truncate_locked(ext_mount_ctx_t *fs, uint32_t ino,
@@ -1243,7 +1948,7 @@ static int ext_read_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
         size_t chunk = MIN((size_t)fs->block_size - boff, total - done);
 
         if (boff == 0 && chunk == fs->block_size) {
-            uint32_t pblock = 0;
+            uint64_t pblock = 0;
             uint32_t run_blocks = 0;
             uint32_t max_blocks = (uint32_t)((total - done) / fs->block_size);
             int ret = ext_inode_get_block_run_locked(fs, ino, inode, lblock,
@@ -1258,7 +1963,7 @@ static int ext_read_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
             if (!pblock) {
                 memset((uint8_t *)buf + done, 0, run_size);
             } else {
-                ret = ext_dev_read_direct(fs, (uint64_t)pblock * fs->block_size,
+                ret = ext_dev_read_direct(fs, pblock * fs->block_size,
                                           (uint8_t *)buf + done, run_size);
                 if (ret) {
                     free(block);
@@ -1270,7 +1975,7 @@ static int ext_read_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
             continue;
         }
 
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret =
             ext_inode_get_block_locked(fs, ino, inode, lblock, false, &pblock);
         if (ret) {
@@ -1280,8 +1985,8 @@ static int ext_read_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
         if (!pblock) {
             memset((uint8_t *)buf + done, 0, chunk);
         } else {
-            ret = ext_dev_read_direct(fs, (uint64_t)pblock * fs->block_size,
-                                      block, fs->block_size);
+            ret = ext_dev_read_direct(fs, pblock * fs->block_size, block,
+                                      fs->block_size);
             if (ret) {
                 free(block);
                 return ret;
@@ -1518,7 +2223,7 @@ static int ext_write_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
         size_t chunk = MIN((size_t)fs->block_size - boff, size - done);
 
         if (boff == 0 && chunk == fs->block_size) {
-            uint32_t pblock = 0;
+            uint64_t pblock = 0;
             uint32_t run_blocks = 0;
             uint32_t max_blocks = (uint32_t)((size - done) / fs->block_size);
             int ret = ext_inode_get_block_run_locked(
@@ -1533,7 +2238,7 @@ static int ext_write_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
             }
             size_t run_size = (size_t)run_blocks * fs->block_size;
 
-            ret = ext_dev_write_direct(fs, (uint64_t)pblock * fs->block_size,
+            ret = ext_dev_write_direct(fs, pblock * fs->block_size,
                                        (const uint8_t *)buf + done, run_size);
             if (ret) {
                 free(block);
@@ -1544,7 +2249,7 @@ static int ext_write_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
             continue;
         }
 
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret =
             ext_inode_get_block_locked(fs, ino, inode, lblock, true, &pblock);
         if (ret) {
@@ -1557,8 +2262,8 @@ static int ext_write_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
         }
 
         if (chunk != fs->block_size || boff != 0) {
-            ret = ext_dev_read_direct(fs, (uint64_t)pblock * fs->block_size,
-                                      block, fs->block_size);
+            ret = ext_dev_read_direct(fs, pblock * fs->block_size, block,
+                                      fs->block_size);
             if (ret) {
                 free(block);
                 return ret;
@@ -1568,7 +2273,7 @@ static int ext_write_inode_data_locked(ext_mount_ctx_t *fs, uint32_t ino,
         }
 
         memcpy(block + boff, (const uint8_t *)buf + done, chunk);
-        ret = ext_dev_write_direct(fs, (uint64_t)pblock * fs->block_size, block,
+        ret = ext_dev_write_direct(fs, pblock * fs->block_size, block,
                                    fs->block_size);
         if (ret) {
             free(block);
@@ -1601,7 +2306,7 @@ static int ext_dir_find_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     memset(result, 0, sizeof(*result));
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock,
                                              false, &pblock);
         if (ret) {
@@ -1679,7 +2384,7 @@ static int ext_dir_add_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock, false,
                                          &pblock);
         if (ret) {
@@ -1750,7 +2455,7 @@ static int ext_dir_add_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     }
 
     uint32_t new_lblock = blocks;
-    uint32_t pblock = 0;
+    uint64_t pblock = 0;
     ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, new_lblock, true,
                                      &pblock);
     if (ret) {
@@ -1793,7 +2498,7 @@ static int ext_dir_remove_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     if (!buf)
         return -ENOMEM;
 
-    uint32_t pblock = 0;
+    uint64_t pblock = 0;
     ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lookup.lblock,
                                      false, &pblock);
     if (ret) {
@@ -1842,7 +2547,7 @@ static int ext_dir_replace_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     if (!buf)
         return -ENOMEM;
 
-    uint32_t pblock = 0;
+    uint64_t pblock = 0;
     ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lookup.lblock,
                                      false, &pblock);
     if (ret) {
@@ -1879,7 +2584,7 @@ static int ext_dir_is_empty_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock,
                                              false, &pblock);
         if (ret) {
@@ -1933,7 +2638,7 @@ static int ext_delete_directory_contents_locked(ext_mount_ctx_t *fs,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock,
                                              false, &pblock);
         if (ret) {
@@ -2017,7 +2722,7 @@ static int ext_dir_set_dotdot_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         int ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock,
                                              false, &pblock);
         if (ret) {
@@ -2219,18 +2924,18 @@ static int ext_create_inode_common_locked(
     disk_inode.i_links_count = (mode & S_IFMT) == EXT2_S_IFDIR ? 2 : 1;
     ext_inode_uid_set(&disk_inode, parent ? parent->i_uid : 0);
     ext_inode_gid_set(&disk_inode, parent ? parent->i_gid : 0);
+    ext_inode_init_large_fields(fs, &disk_inode);
     ext_inode_touch(&disk_inode, true, true, true);
+    if (ext_inode_should_use_extents(fs, mode, payload_size))
+        ext_inode_init_extent_root(&disk_inode);
     if ((mode & S_IFMT) == EXT2_S_IFCHR || (mode & S_IFMT) == EXT2_S_IFBLK)
         ext_inode_rdev_set(&disk_inode, rdev);
 
     if ((mode & S_IFMT) == EXT2_S_IFDIR) {
-        uint32_t block = 0;
-        uint32_t prefer_group = (ino - 1) / fs->sb.s_inodes_per_group;
-        ret = ext_alloc_block_locked(fs, prefer_group, &block);
+        uint64_t block = 0;
+        ret = ext_inode_get_block_locked(fs, ino, &disk_inode, 0, true, &block);
         if (ret)
             goto rollback_inode;
-        disk_inode.i_block[0] = block;
-        ext_inode_add_fs_blocks(fs, &disk_inode, 1);
         ext_inode_size_set(&disk_inode, fs->block_size);
 
         uint8_t *buf = calloc(1, fs->block_size);
@@ -2258,7 +2963,8 @@ static int ext_create_inode_common_locked(
         if (ret)
             goto rollback_inode_release;
     } else if ((mode & S_IFMT) == EXT2_S_IFLNK) {
-        if (payload_size <= sizeof(disk_inode.i_block)) {
+        if (payload_size <= sizeof(disk_inode.i_block) &&
+            !ext_inode_uses_extents(&disk_inode)) {
             memcpy(disk_inode.i_block, payload, payload_size);
             ext_inode_size_set(&disk_inode, payload_size);
         } else {
@@ -2385,19 +3091,37 @@ static int ext_mount_prepare_locked(ext_mount_ctx_t *fs, uint64_t dev) {
     fs->inode_size =
         fs->sb.s_inode_size ? fs->sb.s_inode_size : EXT2_GOOD_OLD_INODE_SIZE;
     fs->desc_size = fs->sb.s_desc_size ? fs->sb.s_desc_size : 32;
+    fs->has_extents =
+        (fs->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0;
+    fs->has_64bit =
+        (fs->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
     fs->ptrs_per_block = fs->block_size / sizeof(uint32_t);
     fs->blocks_count = (uint64_t)fs->sb.s_blocks_count_lo |
                        ((uint64_t)fs->sb.s_blocks_count_hi << 32);
     fs->inodes_count = fs->sb.s_inodes_count;
+
+    if (fs->inode_size < EXT2_GOOD_OLD_INODE_SIZE ||
+        fs->inode_size > fs->block_size || (fs->inode_size & 3))
+        return -EINVAL;
+    if (fs->desc_size < 32 || fs->desc_size > fs->block_size ||
+        (fs->desc_size & 3))
+        return -EINVAL;
+    if (!fs->sb.s_blocks_per_group || !fs->sb.s_inodes_per_group)
+        return -EINVAL;
+
     fs->group_count = (uint32_t)((fs->blocks_count - fs->sb.s_first_data_block +
                                   fs->sb.s_blocks_per_group - 1) /
                                  fs->sb.s_blocks_per_group);
 
-    compat_ok = EXT2_FEATURE_COMPAT_EXT_ATTR | EXT2_FEATURE_COMPAT_RESIZE_INODE;
-    ro_ok = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER |
-            EXT2_FEATURE_RO_COMPAT_LARGE_FILE |
-            EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE;
-    incompat_ok = EXT2_FEATURE_INCOMPAT_FILETYPE;
+    compat_ok = EXT3_FEATURE_COMPAT_HAS_JOURNAL | EXT2_FEATURE_COMPAT_EXT_ATTR |
+                EXT2_FEATURE_COMPAT_RESIZE_INODE;
+    ro_ok =
+        EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER |
+        EXT2_FEATURE_RO_COMPAT_LARGE_FILE | EXT4_FEATURE_RO_COMPAT_HUGE_FILE |
+        EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE;
+    incompat_ok = EXT2_FEATURE_INCOMPAT_FILETYPE |
+                  EXT4_FEATURE_INCOMPAT_EXTENTS | EXT4_FEATURE_INCOMPAT_64BIT |
+                  EXT4_FEATURE_INCOMPAT_FLEX_BG;
     if ((fs->sb.s_feature_compat & ~compat_ok) ||
         (fs->sb.s_feature_ro_compat & ~ro_ok) ||
         (fs->sb.s_feature_incompat & ~incompat_ok))
@@ -2448,7 +3172,7 @@ static int ext_iterate_dir_locked(struct vfs_inode *dir,
         return -ENOMEM;
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
-        uint32_t pblock = 0;
+        uint64_t pblock = 0;
         ret = ext_inode_get_block_locked(fs, (uint32_t)dir->i_ino, &dir_inode,
                                          lblock, false, &pblock);
         if (ret) {

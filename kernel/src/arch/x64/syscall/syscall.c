@@ -543,9 +543,8 @@ void syscall_handler_init() {
     // regist_syscall_handler(SYS_UTIME, (syscall_handle_t)sys_utime);
     regist_syscall_handler(SYS_MKNOD, (syscall_handle_t)sys_mknod);
     // regist_syscall_handler(SYS_USELIB, (syscall_handle_t)sys_uselib);
-    // regist_syscall_handler(SYS_PERSONALITY,
-    // (syscall_handle_t)sys_personality); regist_syscall_handler(SYS_USTAT,
-    // (syscall_handle_t)sys_ustat);
+    regist_syscall_handler(SYS_PERSONALITY, (syscall_handle_t)sys_personality);
+    // regist_syscall_handler(SYS_USTAT, (syscall_handle_t)sys_ustat);
     regist_syscall_handler(SYS_STATFS, (syscall_handle_t)sys_statfs);
     regist_syscall_handler(SYS_FSTATFS, (syscall_handle_t)sys_fstatfs);
     // regist_syscall_handler(SYS_SYSFS, (syscall_handle_t)sys_sysfs);

@@ -502,6 +502,10 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
             ret = pty_tcxonc_locked(pair, false, arg, &notify_master,
                                     &notify_slave);
             break;
+        case TCSBRK:
+        case TCSBRKP:
+            ret = 0;
+            break;
         case TIOCGPGRP:
             ret =
                 copy_to_user((void *)arg, &pair->frontProcessGroup, sizeof(int))
@@ -760,6 +764,10 @@ int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
     case TCXONC:
         ret = pty_tcxonc_locked(pair, false, (uintptr_t)arg, &notify_master,
                                 &notify_slave);
+        break;
+    case TCSBRK:
+    case TCSBRKP:
+        ret = 0;
         break;
     case TIOCGPGRP:
         ret = copy_to_user(arg, &pair->frontProcessGroup, sizeof(int)) ? -EFAULT
