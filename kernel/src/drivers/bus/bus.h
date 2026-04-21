@@ -124,6 +124,9 @@ typedef struct attribute {
     char *value;
 } attribute_t;
 
+/**
+ * Allocate a text sysfs-style attribute for a bus or bus device.
+ */
 attribute_t *attribute_new(const char *name, const char *value);
 void attribute_free(attribute_t *attr);
 
@@ -139,6 +142,10 @@ typedef struct bin_attribute {
 
 struct bus_device;
 
+/**
+ * Logical bus descriptor that supplies default sysfs-visible metadata for all
+ * devices attached to that bus.
+ */
 typedef struct bus {
     const char *name;
     const char *devices_path;
@@ -149,6 +156,9 @@ typedef struct bus {
     int bus_default_bin_attrs_count;
 } bus_t;
 
+/**
+ * Generic sysfs-visible device instance attached to a logical bus.
+ */
 typedef struct bus_device {
     struct llist_header node;
 
@@ -172,6 +182,9 @@ typedef struct attributes_builder {
     int capability;
 } attributes_builder_t;
 
+/**
+ * Allocate a dynamic attribute-array builder.
+ */
 attributes_builder_t *attributes_builder_new();
 int attributes_builder_append(attributes_builder_t *builder, attribute_t *attr);
 
@@ -181,10 +194,17 @@ typedef struct bin_attributes_builder {
     int capability;
 } bin_attributes_builder_t;
 
+/**
+ * Allocate a dynamic binary-attribute-array builder.
+ */
 bin_attributes_builder_t *bin_attributes_builder_new();
 int bin_attributes_builder_append(bin_attributes_builder_t *builder,
                                   bin_attribute_t *attr);
 
+/**
+ * Install a generic bus device and merge the caller-provided attributes with
+ * the bus defaults.
+ */
 bus_device_t *bus_device_install_internal(
     bus_t *bus, void *dev_data, attribute_t **extra_attrs,
     int extra_attrs_count, bin_attribute_t **extra_bin_attrs,
@@ -192,10 +212,16 @@ bus_device_t *bus_device_install_internal(
     int (*get_device_path)(struct bus_device *device, char *buf,
                            size_t max_count));
 
+/**
+ * Convenience wrapper for installing a PCI-backed bus device.
+ */
 bus_device_t *bus_device_install_pci(void *dev_data, attribute_t **extra_attrs,
                                      int extra_attrs_count,
                                      bin_attribute_t **extra_bin_attrs,
                                      int extra_bin_attrs_count);
+/**
+ * Convenience wrapper for installing a USB-backed bus device.
+ */
 bus_device_t *bus_device_install_usb(void *dev_data, attribute_t **extra_attrs,
                                      int extra_attrs_count,
                                      bin_attribute_t **extra_bin_attrs,

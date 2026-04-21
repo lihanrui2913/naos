@@ -60,7 +60,20 @@ struct futex_wait {
     (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
 #define FUTEX_CMP_REQUEUE_PI_PRIVATE (FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
 
+/**
+ * Linux contract: provide futex wait/wake/requeue/PI operations with Linux
+ * userspace ABI semantics.
+ * Current kernel: supports WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, WAKE_OP,
+ * REQUEUE, CMP_REQUEUE, LOCK_PI, and UNLOCK_PI.
+ * Gaps: FUTEX_FD, TRYLOCK_PI, WAIT_REQUEUE_PI, CMP_REQUEUE_PI, LOCK_PI2, and
+ * full PI owner-state semantics are not implemented yet; the current PI path is
+ * a simplified owner wait/wake protocol rather than a Linux-complete rt-mutex
+ * implementation.
+ */
 uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
                    int *uaddr2, int val3);
 
+/**
+ * Release futex wait state that is still attached to a dying task.
+ */
 int futex_on_exit_task(task_t *task);

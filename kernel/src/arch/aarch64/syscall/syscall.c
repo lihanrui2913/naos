@@ -367,6 +367,15 @@ void regist_syscall_handler(int nr, syscall_handle_t handler) {
     syscall_handlers[nr] = handler;
 }
 
+/*
+ * Syscall table maintenance notes:
+ * - Every registered entry should target Linux userspace-visible semantics,
+ *   even when the in-kernel implementation is still incomplete.
+ * - Entries routed to dummy_syscall_handler intentionally surface -ENOSYS and
+ *   should be treated as ABI placeholders.
+ * - Commented-out registrations document syscall numbers that are still
+ *   entirely unimplemented on this architecture.
+ */
 void syscall_handler_init() {
     regist_syscall_handler(SYS_READ, (syscall_handle_t)sys_read);
     regist_syscall_handler(SYS_WRITE, (syscall_handle_t)sys_write);

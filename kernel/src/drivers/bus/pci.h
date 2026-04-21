@@ -16,13 +16,13 @@
 #define EXPORT_BYTE(target, first)                                             \
     ((first) ? ((target) & ~0xFF00) : (((target) & ~0x00FF) >> 8))
 
+/**
+ * Encode segment/bus/device/function into the implementation-defined address
+ * form used by the current PCI host-controller backend.
+ */
 uint32_t segment_bus_device_functon_to_pci_address(uint16_t segment,
                                                    uint8_t bus, uint8_t device,
                                                    uint8_t function);
-uint32_t pci_read(uint32_t b, uint32_t d, uint32_t f, uint32_t s,
-                  uint32_t offset);
-void pci_write(uint32_t b, uint32_t d, uint32_t f, uint32_t s, uint32_t offset,
-               uint32_t value);
 
 #define PCI_BAR_GET_SIZE 1
 #define PCI_BAR_GET_IS_MMIO 2
@@ -33,6 +33,10 @@ typedef struct {
     bool mmio;
 } pci_bar_t;
 
+/**
+ * Low-level PCI configuration-space accessors supplied by a host-controller
+ * implementation such as ECAM or architecture-specific glue.
+ */
 typedef struct {
     uint64_t (*convert_bar_address)(uint64_t bar_address);
     uint8_t (*read8)(uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4,
@@ -51,6 +55,9 @@ typedef struct {
 
 struct pcie_info;
 
+/**
+ * Enumerated PCI function plus driver/runtime state discovered during probing.
+ */
 typedef struct pci_device {
     const char *name;
     bus_device_t *device;
@@ -87,6 +94,9 @@ typedef struct pci_device {
 extern pci_device_t *pci_devices[PCI_DEVICE_MAX];
 extern uint32_t pci_device_number;
 
+/**
+ * Search a device's PCI capability list for a capability ID.
+ */
 uint32_t pci_enumerate_capability_list(pci_device_t *pci_dev,
                                        uint32_t cap_type);
 
@@ -94,16 +104,43 @@ uint32_t pci_enumerate_capability_list(pci_device_t *pci_dev,
 
 uint64_t get_mmio_address(uint32_t pci_address, uint16_t offset);
 
+/**
+ * Return a human-readable class string for a PCI class code.
+ */
 const char *pci_classname(uint32_t classcode);
+/**
+ * Collect all enumerated devices with the requested vendor ID.
+ */
 void pci_find_vid(pci_device_t **result, uint32_t *n, uint32_t vid);
+/**
+ * Collect all enumerated devices with the requested class code.
+ */
 void pci_find_class(pci_device_t **result, uint32_t *n, uint32_t class_code);
+/**
+ * Look up a previously enumerated device by bus/device/function/segment.
+ */
 pci_device_t *pci_find_bdfs(uint8_t bus, uint8_t slot, uint8_t func,
                             uint16_t segment);
+/**
+ * Enumerate all buses reachable from one PCI segment group.
+ */
 void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group);
+/**
+ * Enumerate one PCI bus and the functions reachable beneath it.
+ */
 void pci_scan_bus(pci_device_op_t *op, uint16_t segment_group, uint8_t bus);
+/**
+ * Enumerate one concrete PCI function and populate pci_device_t state.
+ */
 void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                        uint8_t device, uint8_t function);
+/**
+ * Initialize host-controller access before bus enumeration starts.
+ */
 void pci_controller_init();
+/**
+ * Enumerate PCI devices and probe registered PCI drivers.
+ */
 void pci_init();
 
 #define PCI_DRIVER_FLAGS_NEED_SYSFS (1 << 0)
@@ -112,6 +149,10 @@ struct pci_driver;
 typedef bool (*pci_driver_match_t)(pci_device_t *dev,
                                    const struct pci_driver *driver);
 
+/**
+ * High-level PCI driver descriptor. The core matches enumerated pci_device_t
+ * objects against this table and then calls probe/remove/shutdown.
+ */
 typedef struct pci_driver {
     const char *name;
     uint32_t class_id;
@@ -125,5 +166,8 @@ typedef struct pci_driver {
 
 #define MAX_PCI_DRIVERS 256
 
+/**
+ * Register a PCI driver with the PCI core.
+ */
 int regist_pci_driver(pci_driver_t *driver);
 pci_driver_t *pci_get_current_probe_driver(void);

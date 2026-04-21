@@ -33,6 +33,9 @@ typedef struct bus_device bus_device_t;
 typedef void (*usb_xfer_cb)(int status, int actual_length, void *user_data);
 typedef usb_xfer_cb intr_xfer_cb;
 
+/**
+ * Host-controller-owned endpoint pipe descriptor.
+ */
 struct usb_pipe {
     union {
         usb_controller_t *cntl;
@@ -47,6 +50,9 @@ struct usb_pipe {
     uint8_t eptype;
 };
 
+/**
+ * Parsed interface view exposed to USB function drivers.
+ */
 struct usb_device_interface {
     usb_interface_descriptor_t *iface;
     void *end;
@@ -58,6 +64,9 @@ struct usb_device_interface {
 #define USB_MAX_TOPOLOGY_LEN 32
 #define USB_MAX_STRING_LEN 64
 
+/**
+ * Root USB controller state registered with the USB core.
+ */
 struct usb_controller {
     pci_device_t *pci;
     uint8_t type;
@@ -69,6 +78,9 @@ struct usb_controller {
     usb_device_t *rootdev;
 };
 
+/**
+ * Hub state tracked by the USB core, including root hubs and external hubs.
+ */
 struct usb_hub {
     usb_hub_ops_t *op;
     usb_device_t *usbdev;
@@ -87,6 +99,9 @@ struct usb_hub {
     struct llist_header node;
 };
 
+/**
+ * Hub/controller callbacks required by the generic USB enumeration logic.
+ */
 struct usb_hub_ops {
     usb_pipe_t *(*realloc_pipe)(
         usb_device_t *usbdev, usb_pipe_t *upipe,
@@ -100,6 +115,10 @@ struct usb_hub_ops {
     void (*disconnect)(usb_hub_t *hub, uint32_t port);
 };
 
+/**
+ * Optional bus-level notifications for subsystems interested in controller or
+ * device add/remove events.
+ */
 struct usb_bus_notifier_ops {
     void (*controller_add)(usb_controller_t *cntl);
     void (*controller_remove)(usb_controller_t *cntl);
@@ -274,6 +293,10 @@ struct usb_super_speed_endpoint_descriptor {
     uint16_t wBytesPerInterval;
 } __attribute__((packed));
 
+/**
+ * Enumerated USB device plus the interfaces and strings discovered during the
+ * standard USB enumeration flow.
+ */
 struct usb_device {
     usb_hub_t *hub;
     usb_pipe_t *defpipe;
@@ -401,37 +424,106 @@ struct usb_device_id {
 #define HID_REQ_SET_IDLE 0x0A
 #define HID_REQ_SET_PROTOCOL 0x0B
 
+/**
+ * Submit a prepared transfer to the controller that owns xfer->pipe.
+ */
 int usb_submit_xfer(usb_xfer_t *xfer);
+/**
+ * Send one generic transfer through a prepared pipe.
+ */
 int usb_send_pipe(usb_pipe_t *pipe, int dir, const void *cmd, void *data,
                   int datasize, uint64_t timeout_ns);
+/**
+ * Send a synchronous bulk transfer.
+ */
 int usb_send_bulk(usb_pipe_t *pipe, int dir, void *data, int datasize);
+/**
+ * Queue a non-blocking bulk transfer.
+ */
 int usb_send_bulk_nonblock(usb_pipe_t *pipe, int dir, void *data, int datasize);
+/**
+ * Queue an interrupt transfer with a completion callback.
+ */
 int usb_send_intr_pipe(usb_pipe_t *pipe, void *data_ptr, int len,
                        intr_xfer_cb cb, void *user_data);
+/**
+ * Return non-zero when the pipe address space must be treated as 32-bit.
+ */
 int usb_32bit_pipe(usb_pipe_t *pipe);
+/**
+ * Allocate or reconfigure a pipe for one endpoint descriptor.
+ */
 usb_pipe_t *usb_alloc_pipe(usb_device_t *usbdev,
                            usb_endpoint_descriptor_t *epdesc,
                            usb_super_speed_endpoint_descriptor_t *ss_epdesc);
+/**
+ * Release a previously allocated pipe.
+ */
 void usb_free_pipe(usb_device_t *usbdev, usb_pipe_t *pipe);
+/**
+ * Send a control request over endpoint zero.
+ */
 int usb_send_default_control(usb_pipe_t *pipe, const usb_ctrl_request_t *req,
                              void *data);
+/**
+ * Check whether a pipe currently resides on the controller freelist.
+ */
 int usb_is_freelist(usb_controller_t *cntl, usb_pipe_t *pipe);
+/**
+ * Populate pipe metadata directly from an endpoint descriptor.
+ */
 void usb_desc2pipe(usb_pipe_t *pipe, usb_device_t *usbdev,
                    usb_endpoint_descriptor_t *epdesc);
+/**
+ * Derive the polling period for an endpoint.
+ */
 int usb_get_period(usb_device_t *usbdev, usb_endpoint_descriptor_t *epdesc);
+/**
+ * Estimate transfer time for a payload sent through the given pipe.
+ */
 int usb_xfer_time(usb_pipe_t *pipe, int datalen);
+/**
+ * Find an endpoint descriptor inside one parsed interface block.
+ */
 usb_endpoint_descriptor_t *usb_find_desc(usb_device_interface_t *iface,
                                          int type, int dir);
+/**
+ * Find the SuperSpeed companion descriptor associated with an interface.
+ */
 usb_super_speed_endpoint_descriptor_t *
 usb_find_ss_desc(usb_device_interface_t *iface);
+/**
+ * Select an alternate setting for one interface number.
+ */
 int usb_set_interface(usb_device_t *usbdev, uint8_t iface_num,
                       uint8_t alt_setting);
+/**
+ * Enumerate devices hanging off one hub.
+ */
 void usb_enumerate(usb_hub_t *hub);
+/**
+ * Register a controller and its root hub with the USB core.
+ */
 void usb_register_controller(usb_controller_t *cntl, usb_hub_t *hub);
+/**
+ * Remove a controller from the USB core and tear down attached state.
+ */
 void usb_unregister_controller(usb_controller_t *cntl);
+/**
+ * Mark one hub port dirty so the enumeration worker rescans it.
+ */
 void usb_hub_mark_port_changed(usb_hub_t *hub, uint32_t port);
+/**
+ * Register callbacks for USB bus add/remove notifications.
+ */
 void usb_register_bus_notifier(usb_bus_notifier_ops_t *ops);
+/**
+ * Remove previously registered USB bus notification callbacks.
+ */
 void usb_unregister_bus_notifier(usb_bus_notifier_ops_t *ops);
+/**
+ * Return a human-readable string for one USB speed enum value.
+ */
 const char *usb_speed_name(uint8_t speed);
 
 #define MAX_USBDEV_NUM 256
@@ -444,6 +536,9 @@ struct usb_driver {
     int (*remove)(usb_device_t *usbdev);
 };
 
+/**
+ * Register a USB function driver with the USB core.
+ */
 void regist_usb_driver(usb_driver_t *driver);
 usb_driver_t *usb_get_current_probe_driver(void);
 usb_driver_t *usb_get_current_remove_driver(void);

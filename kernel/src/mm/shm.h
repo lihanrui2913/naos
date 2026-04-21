@@ -75,9 +75,37 @@ struct shmid_ds {
 #define IPC_STAT 2 /* get ipc_perm options */
 #define IPC_INFO 3 /* see ipcs */
 
+/**
+ * Linux contract: create or look up a System V shared memory segment.
+ * Current kernel: supports IPC_PRIVATE creation, IPC_CREAT, IPC_EXCL, and
+ * segment lookup by key.
+ * Gaps: Linux permission checks, sequence-number reuse rules, and global SHM
+ * tuning limits are not yet enforced.
+ */
 uint64_t sys_shmget(int key, int size, int shmflg);
+/**
+ * Linux contract: attach a System V shared memory segment into the caller's
+ * address space.
+ * Current kernel: maps the segment into a new shared VMA and honors SHM_RND,
+ * SHM_RDONLY, and SHM_EXEC.
+ * Gaps: SHM_REMAP replacement semantics and Linux permission enforcement are
+ * not implemented, and address selection is driven by the local free-region
+ * allocator rather than Linux's full attach heuristics.
+ */
 void *sys_shmat(int shmid, void *shmaddr, int shmflg);
+/**
+ * Linux contract: detach a System V shared memory segment from the caller.
+ * Current kernel: removes the matching shared-memory VMA and updates nattch.
+ * Gaps: detach is keyed by the exact tracked attach address and does not
+ * implement Linux's broader attach bookkeeping semantics.
+ */
 uint64_t sys_shmdt(void *shmaddr);
+/**
+ * Linux contract: control or query a System V shared memory segment.
+ * Current kernel: supports IPC_RMID and IPC_STAT.
+ * Gaps: IPC_SET, IPC_INFO, SHM_INFO, and Linux permission/capability rules are
+ * still unimplemented and currently fail with -ENOSYS.
+ */
 uint64_t sys_shmctl(int shmid, int cmd, struct shmid_ds *buf);
 
 struct task;

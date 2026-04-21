@@ -25,15 +25,61 @@ uint64_t task_fork(struct pt_regs *regs, bool vfork);
 #define RUSAGE_CHILDREN (-1)
 #define RUSAGE_THREAD 1
 
+/**
+ * Linux contract: wait for child exit/stop/continue events selected by pid and
+ * options.
+ * Current kernel: supports normal child reaping and ptrace stop notifications.
+ * Gaps: the implementation is not yet a complete reproduction of every Linux
+ * wait status corner case.
+ */
 uint64_t sys_waitpid(uint64_t pid, int *status, uint64_t options,
                      struct rusage *rusage);
+/**
+ * Linux contract: waitid(2) with siginfo reporting and optional WNOWAIT.
+ * Current kernel: supports P_ALL, P_PID, P_PGID, and P_PIDFD selection plus
+ * ptrace wait events.
+ * Gaps: Linux-accurate WCONTINUED and some less common waitid state transitions
+ * are not fully modeled yet, and the implementation is still centered on exit
+ * and ptrace-stop reporting.
+ */
 uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
                     struct rusage *rusage);
+/**
+ * Linux contract: implement ptrace request dispatch for traced tasks.
+ * Current kernel: supports the subset wired by task/ptrace.c.
+ */
 uint64_t sys_ptrace(uint64_t request, uint64_t pid, void *addr, void *data);
+/**
+ * Linux contract: report resource usage for the selected task set.
+ * Current kernel: supports SELF, THREAD, and CHILDREN accounting.
+ * Gaps: only the counters currently maintained by the scheduler/task runtime
+ * code are reported.
+ */
 uint64_t sys_getrusage(int who, struct rusage *ru);
+/**
+ * Linux contract: create a task or thread according to clone(2) flags.
+ * Current kernel: supports the common CLONE_VM/FILES/FS/SIGHAND/THREAD/VFORK
+ * family plus namespace and pidfd integration used elsewhere in the kernel.
+ * Gaps: only the flag combinations explicitly validated in sys_clone_internal()
+ * are supported; unsupported Linux clone features are rejected or ignored if no
+ * kernel support exists behind them.
+ */
 uint64_t sys_clone(struct pt_regs *regs, uint64_t flags, uint64_t newsp,
                    int *parent_tid, int *child_tid, uint64_t tls);
+/**
+ * Linux contract: unshare task state such as file tables and namespaces.
+ * Current kernel: supports CLONE_FS, CLONE_FILES, CLONE_SYSVSEM, and the
+ * namespace flags listed in task_syscall.c.
+ * Gaps: only state with an implemented clone/put path can actually be detached,
+ * and unsupported Linux unshare bits are rejected up front.
+ */
 uint64_t sys_unshare(uint64_t unshare_flags);
+/**
+ * Linux contract: join an existing namespace referenced by a namespace fd.
+ * Current kernel: supports mount and user namespaces only.
+ * Gaps: other Linux namespace types still fail even if the fd is valid, and
+ * setns support is limited to the namespace fd formats recognized by procfs.
+ */
 uint64_t sys_setns(int fd, uint64_t nstype);
 
 typedef struct clone_args {
@@ -50,20 +96,52 @@ typedef struct clone_args {
     uint64_t cgroup;
 } clone_args_t;
 
+/**
+ * Linux contract: clone3(2) with a structured argument block.
+ * Current kernel: supports the fields consumed by sys_clone_internal(),
+ * including pidfd creation and cgroupfd-based placement.
+ * Gaps: fields such as set_tid/set_tid_size are not acted on, and support is
+ * limited to the clone flags implemented by sys_clone_internal().
+ */
 uint64_t sys_clone3(struct pt_regs *regs, clone_args_t *args,
                     uint64_t args_size);
 int read_task_user_memory(task_t *task, uint64_t uaddr, void *dst, size_t size);
 int write_task_user_memory(task_t *task, uint64_t uaddr, const void *src,
                            size_t size);
+/**
+ * Linux contract: copy memory from another task with process_vm_readv(2).
+ * Current kernel: supports vector copies through the target task's page tables.
+ * Gaps: there are no ptrace-like permission checks yet; only basic pid lookup,
+ * userspace pointer validation, and mapped-page access are enforced.
+ */
 uint64_t sys_process_vm_readv(uint64_t pid, const struct iovec *lvec,
                               uint64_t liovcnt, const struct iovec *rvec,
                               uint64_t riovcnt, uint64_t flags);
+/**
+ * Linux contract: copy memory into another task with process_vm_writev(2).
+ * Current kernel: supports vector copies through the target task's page tables.
+ * Gaps: there are no ptrace-like permission checks yet; only basic pid lookup,
+ * userspace pointer validation, and mapped-page access are enforced.
+ */
 uint64_t sys_process_vm_writev(uint64_t pid, const struct iovec *lvec,
                                uint64_t liovcnt, const struct iovec *rvec,
                                uint64_t riovcnt, uint64_t flags);
 
 struct timespec;
+/**
+ * Linux contract: sleep until the requested relative interval expires or a
+ * signal interrupts the sleep.
+ * Current kernel: performs a relative sleep using force_wakeup_ns scheduling.
+ * Gaps: interruption handling and rem reporting are not Linux-complete yet, so
+ * the call currently behaves more like an uninterruptible relative delay.
+ */
 uint64_t sys_nanosleep(struct timespec *req, struct timespec *rem);
+/**
+ * Linux contract: clock_nanosleep(2) with selectable clocks and TIMER_ABSTIME.
+ * Current kernel: supports CLOCK_REALTIME and CLOCK_MONOTONIC validation.
+ * Gaps: the current implementation sleeps relative to "now" even when
+ * TIMER_ABSTIME is supplied, so absolute-sleep semantics are incomplete.
+ */
 uint64_t sys_clock_nanosleep(int clock_id, int flags,
                              const struct timespec *request,
                              struct timespec *remain);
@@ -80,19 +158,67 @@ struct sched_param {
     int sched_priority;
 };
 
+/**
+ * Linux contract: set the scheduling parameters for a target task.
+ * Current kernel: validates the target and priority range.
+ * Gaps: it does not yet reconfigure the scheduler's runtime state.
+ */
 uint64_t sys_sched_setparam(int pid, const struct sched_param *param);
+/**
+ * Linux contract: return the active scheduling parameters for a target task.
+ * Current kernel: always reports priority 0 after validating the target.
+ */
 uint64_t sys_sched_getparam(int pid, struct sched_param *param);
+/**
+ * Linux contract: change the scheduling policy and parameters of a target task.
+ * Current kernel: validates policy/priority combinations and returns success.
+ * Gaps: runtime policy changes are not applied to the scheduler yet.
+ */
 uint64_t sys_sched_setscheduler(int pid, int policy,
                                 const struct sched_param *param);
+/**
+ * Linux contract: report the active scheduling policy of a target task.
+ * Current kernel: always reports SCHED_OTHER for existing tasks.
+ */
 uint64_t sys_sched_getscheduler(int pid);
+/**
+ * Linux contract: report the highest priority allowed for a policy.
+ * Current kernel: returns bounds from the local scheduler policy table.
+ */
 uint64_t sys_sched_get_priority_max(int policy);
+/**
+ * Linux contract: report the lowest priority allowed for a policy.
+ * Current kernel: returns bounds from the local scheduler policy table.
+ */
 uint64_t sys_sched_get_priority_min(int policy);
+/**
+ * Linux contract: report the round-robin quantum for a target task.
+ * Current kernel: returns a fixed 100 ms interval after validating the target.
+ * Gaps: the value is synthetic and not derived from a real per-policy runtime
+ * scheduler configuration.
+ */
 uint64_t sys_sched_rr_get_interval(int pid, struct timespec *interval);
+/**
+ * Linux contract: restrict a task to the CPUs in the supplied affinity mask.
+ * Current kernel: validates the mask and target existence.
+ * Gaps: the mask is not yet enforced by the scheduler, so this is currently a
+ * validation-only compatibility interface.
+ */
 uint64_t sys_sched_setaffinity(int pid, size_t len,
                                const unsigned long *user_mask_ptr);
+/**
+ * Linux contract: return the current CPU affinity mask for a target task.
+ * Current kernel: reports a synthetic mask that only exposes CPU 0.
+ * Gaps: the returned mask does not reflect a real per-task affinity state.
+ */
 uint64_t sys_sched_getaffinity(int pid, size_t len,
                                unsigned long *user_mask_ptr);
 
+/**
+ * Linux contract: configure ITIMER_REAL/VTALRM/PROF timers.
+ * Current kernel: implements ITIMER_REAL only.
+ * Gaps: other timer classes return -ENOSYS.
+ */
 size_t sys_setitimer(int which, struct itimerval *value, struct itimerval *old);
 
 #define PR_SET_PDEATHSIG 1
@@ -201,34 +327,120 @@ size_t sys_setitimer(int which, struct itimerval *value, struct itimerval *old);
 #define PR_CAP_AMBIENT_LOWER 3
 #define PR_CAP_AMBIENT_CLEAR_ALL 4
 
+/**
+ * Linux contract: multiplex process control features such as PR_SET_NAME,
+ * PR_SET_NO_NEW_PRIVS, seccomp state, and parent-death signals.
+ * Current kernel: implements only a small subset of prctl options.
+ * Gaps: unsupported options often return -EINVAL, and features such as real
+ * seccomp state, dumpability, or ambient capabilities are not implemented;
+ * several accepted options currently just return success without changing any
+ * deeper kernel policy.
+ */
 uint64_t sys_prctl(uint64_t options, uint64_t arg2, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5);
+/**
+ * Linux contract: install or query seccomp filters.
+ * Current kernel: declared for ABI completeness only.
+ * Gaps: there is no implementation and the syscall number is not wired into the
+ * architecture syscall tables yet.
+ */
 uint64_t sys_seccomp(uint64_t operation, uint64_t flags, void *uargs);
+/**
+ * Linux contract: register the robust futex list for the current thread.
+ * Current kernel: validates the ABI size and stores the user pointer verbatim.
+ * Gaps: only one Linux ABI layout size is accepted.
+ */
 uint64_t sys_set_robust_list(void *head, size_t len);
+/**
+ * Linux contract: query the robust futex list of a thread.
+ * Current kernel: returns the stored list pointer and length.
+ * Gaps: there are no ptrace-like permission checks beyond pid lookup.
+ */
 uint64_t sys_get_robust_list(int pid, void **head_ptr, size_t *len_ptr);
+/**
+ * Linux contract: register restartable sequences for per-CPU critical sections.
+ * Current kernel: not implemented and always returns -ENOSYS.
+ */
 uint64_t sys_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t sig);
+/**
+ * Linux contract: configure the task's SIGALRM delivery via alarm(2).
+ * Current kernel: wraps sys_setitimer(ITIMER_REAL).
+ * Gaps: inherits the ITIMER_REAL-only limitation of sys_setitimer().
+ */
 uint64_t sys_alarm(uint64_t seconds);
+/**
+ * Linux contract: create a POSIX timer.
+ * Current kernel: supports CLOCK_REALTIME and CLOCK_MONOTONIC with SIGEV_NONE
+ * or SIGEV_SIGNAL delivery.
+ * Gaps: Linux timer notification modes beyond those two are rejected.
+ */
 uint64_t sys_timer_create(clockid_t clockid, struct sigevent *sevp,
                           timer_t *timerid);
+/**
+ * Linux contract: arm or disarm a POSIX timer.
+ * Current kernel: supports relative and absolute expiry for the timer objects
+ * created by sys_timer_create().
+ * Gaps: only the create/settime subset is present; matching gettime/delete
+ * syscalls are not wired in the syscall tables yet.
+ */
 uint64_t sys_timer_settime(timer_t timerid, int flags,
                            const struct itimerspec *new_value,
                            struct itimerspec *old_value);
 
+/**
+ * Linux contract: reboot, halt, or power off the machine after validating the
+ * Linux magic values and caller permissions.
+ * Current kernel: toggles CAD state and accepts restart/poweroff commands.
+ * Gaps: restart and poweroff currently return success without actually driving
+ * hardware reset or shutdown, and Linux privilege checks are not enforced here.
+ */
 uint64_t sys_reboot(int magic1, int magic2, uint32_t cmd, void *arg);
 
+/**
+ * Linux contract: return the process group ID of the target process.
+ * Current kernel: looks up the task by pid and returns its cached pgid.
+ */
 uint64_t sys_getpgid(uint64_t pid);
+/**
+ * Linux contract: move a process into a process group subject to session rules.
+ * Current kernel: directly rewrites the target thread group's pgid.
+ * Gaps: Linux session/exec/leadership permission checks are not fully enforced.
+ */
 uint64_t sys_setpgid(uint64_t pid, uint64_t pgid);
+/**
+ * Linux contract: execveat(2) with dirfd-relative path resolution and flags.
+ * Current kernel: routes through the local exec loader and VFS path lookup.
+ * Gaps: support is limited to the flags and interpreter/ELF handling
+ * implemented by task_do_execve().
+ */
 uint64_t sys_execveat(uint64_t dirfd, const char *path, const char **argv,
                       const char **envp, uint64_t flags);
+/**
+ * Linux contract: return the session ID of the selected process.
+ * Current kernel: returns the cached sid from the target task struct.
+ */
 uint64_t sys_getsid(uint64_t pid);
+/**
+ * Linux contract: create a new session and detach from the controlling group.
+ * Current kernel: only permits thread-group leaders and rewrites sid/pgid for
+ * the whole thread group.
+ */
 uint64_t sys_setsid(void);
 
+/**
+ * Linux contract: return the real user ID of the calling task.
+ */
 static inline uint64_t sys_getuid() { return current_task->uid; }
 
 static inline int64_t cred_keep_or_set(int value, int64_t current) {
     return value == -1 ? current : value;
 }
 
+/**
+ * Linux contract: set real/effective/saved user IDs according to setuid(2).
+ * Current kernel: updates all three IDs unconditionally for the caller.
+ * Gaps: Linux capability and permission checks are not implemented.
+ */
 static inline uint64_t sys_setuid(uint64_t uid) {
     if (uid == (uint64_t)-1)
         return (uint64_t)-EINVAL;
@@ -239,12 +451,24 @@ static inline uint64_t sys_setuid(uint64_t uid) {
     return 0;
 }
 
+/**
+ * Linux contract: return the real group ID of the calling task.
+ */
 static inline uint64_t sys_getgid() { return current_task->gid; }
 
+/**
+ * Linux contract: return the effective user ID of the calling task.
+ */
 static inline uint64_t sys_geteuid() { return current_task->euid; }
 
+/**
+ * Linux contract: return the effective group ID of the calling task.
+ */
 static inline uint64_t sys_getegid() { return current_task->egid; }
 
+/**
+ * Linux contract: return real/effective/saved user IDs.
+ */
 static inline uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
     int value;
 
@@ -267,6 +491,11 @@ static inline uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
     return 0;
 }
 
+/**
+ * Linux contract: set any subset of real/effective/saved user IDs.
+ * Current kernel: directly updates the stored IDs.
+ * Gaps: Linux privilege checks are not enforced.
+ */
 static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
@@ -275,6 +504,11 @@ static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
     return 0;
 }
 
+/**
+ * Linux contract: change real/effective user IDs with Linux saved-ID rules.
+ * Current kernel: applies the requested values and updates suid using a reduced
+ * version of the Linux rules.
+ */
 static inline uint64_t sys_setreuid(int ruid, int euid) {
     int64_t old_ruid = current_task->uid;
 
@@ -286,6 +520,9 @@ static inline uint64_t sys_setreuid(int ruid, int euid) {
     return 0;
 }
 
+/**
+ * Linux contract: return real/effective/saved group IDs.
+ */
 static inline uint64_t sys_getresgid(int *rgid, int *egid, int *sgid) {
     int value;
 
@@ -308,6 +545,11 @@ static inline uint64_t sys_getresgid(int *rgid, int *egid, int *sgid) {
     return 0;
 }
 
+/**
+ * Linux contract: set any subset of real/effective/saved group IDs.
+ * Current kernel: directly updates the stored IDs.
+ * Gaps: Linux privilege checks are not enforced.
+ */
 static inline uint64_t sys_setresgid(int rgid, int egid, int sgid) {
     current_task->gid = cred_keep_or_set(rgid, current_task->gid);
     current_task->egid = cred_keep_or_set(egid, current_task->egid);
@@ -316,6 +558,9 @@ static inline uint64_t sys_setresgid(int rgid, int egid, int sgid) {
     return 0;
 }
 
+/**
+ * Linux contract: change real/effective group IDs with Linux saved-ID rules.
+ */
 static inline uint64_t sys_setregid(int rgid, int egid) {
     int64_t old_rgid = current_task->gid;
 
@@ -327,6 +572,11 @@ static inline uint64_t sys_setregid(int rgid, int egid) {
     return 0;
 }
 
+/**
+ * Linux contract: set real/effective/saved group IDs according to setgid(2).
+ * Current kernel: updates all three IDs unconditionally for the caller.
+ * Gaps: Linux capability and permission checks are not implemented.
+ */
 static inline uint64_t sys_setgid(uint64_t gid) {
     if (gid == (uint64_t)-1)
         return (uint64_t)-EINVAL;
@@ -337,24 +587,47 @@ static inline uint64_t sys_setgid(uint64_t gid) {
     return 0;
 }
 
+/**
+ * Linux contract: fork the current task with a private address space.
+ */
 static inline uint64_t sys_fork(struct pt_regs *regs) {
     return task_fork(regs, false);
 }
 
+/**
+ * Linux contract: vfork the current task and block the parent until exec/exit.
+ */
 static inline uint64_t sys_vfork(struct pt_regs *regs) {
     return task_fork(regs, true);
 }
 
+/**
+ * Linux contract: return the caller's thread-group ID.
+ */
 static inline uint64_t sys_getpid() {
     return task_effective_tgid(current_task);
 }
 
+/**
+ * Linux contract: return the caller's thread ID.
+ */
 static inline uint64_t sys_gettid() { return current_task->pid; }
 
+/**
+ * Linux contract: return the parent process ID visible to the caller.
+ */
 static inline uint64_t sys_getppid() { return task_parent_pid(current_task); }
 
+/**
+ * Linux contract: return the caller's process group ID.
+ */
 static inline uint64_t sys_getpgrp() { return current_task->pgid; }
 
+/**
+ * Linux contract: report the supplementary group list.
+ * Current kernel: exposes exactly one synthetic group entry.
+ * Gaps: real supplementary group tracking is not implemented.
+ */
 static inline uint64_t sys_getgroups(int gidsetsize, int *gids) {
     if (!gidsetsize)
         return 1;
@@ -369,6 +642,10 @@ static inline uint64_t sys_getgroups(int gidsetsize, int *gids) {
     return 1;
 }
 
+/**
+ * Linux contract: report the current CPU and NUMA node.
+ * Current kernel: returns the scheduler CPU ID and always reports NUMA node 0.
+ */
 static inline uint64_t sys_getcpu(unsigned *cpup, unsigned *nodep,
                                   void *unused) {
     (void)unused;
@@ -387,6 +664,10 @@ static inline uint64_t sys_getcpu(unsigned *cpup, unsigned *nodep,
     return 0;
 }
 
+/**
+ * Linux contract: register the clear_child_tid pointer and return the caller's
+ * thread ID.
+ */
 static inline uint64_t sys_set_tid_address(int *ptr) {
     current_task->tidptr = ptr;
     return current_task->pid;
@@ -396,9 +677,23 @@ static inline uint64_t sys_set_tid_address(int *ptr) {
 #define PRIO_PGRP 1
 #define PRIO_USER 2
 
+/**
+ * Linux contract: adjust a task's nice value.
+ * Current kernel: only validates PRIO_PROCESS lookups and does not yet change
+ * scheduler behavior.
+ * Gaps: PRIO_PGRP and PRIO_USER are not implemented.
+ */
 uint64_t sys_setpriority(int which, int who, int niceval);
 
+/**
+ * Linux contract: compare shared kernel objects between two tasks via kcmp(2).
+ * Current kernel: supports the subset implemented in task_syscall.c.
+ */
 uint64_t sys_kcmp(uint64_t pid1, uint64_t pid2, int type, uint64_t idx1,
                   uint64_t idx2);
 
+/**
+ * Linux contract: get or set the execution-domain personality flags.
+ * Current kernel: exposes the local compatibility personality state.
+ */
 uint32_t sys_personality(uint32_t personality);

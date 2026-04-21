@@ -280,6 +280,10 @@ struct vfs_poll_table {
     void *private_data;
 };
 
+/**
+ * Page-cache style operations for filesystems that back inodes with pageable
+ * storage.
+ */
 struct vfs_address_space_operations {
     int (*readpage)(struct vfs_file *file, struct vfs_address_space *mapping,
                     uint64_t index, void *page);
@@ -288,6 +292,9 @@ struct vfs_address_space_operations {
     void (*invalidatepage)(struct vfs_address_space *mapping, uint64_t index);
 };
 
+/**
+ * Per-inode address-space state used by the VFS cache and mmap paths.
+ */
 struct vfs_address_space {
     struct vfs_inode *host;
     const struct vfs_address_space_operations *a_ops;
@@ -295,6 +302,9 @@ struct vfs_address_space {
     spinlock_t lock;
 };
 
+/**
+ * Superblock callbacks supplied by a filesystem implementation.
+ */
 struct vfs_super_operations {
     struct vfs_inode *(*alloc_inode)(struct vfs_super_block *sb);
     void (*destroy_inode)(struct vfs_inode *inode);
@@ -310,6 +320,9 @@ struct vfs_super_operations {
                      uint32_t *valid);
 };
 
+/**
+ * Dentry-level callbacks used during lookup, hashing, and teardown.
+ */
 struct vfs_dentry_operations {
     int (*d_revalidate)(struct vfs_dentry *dentry, unsigned int flags);
     int (*d_hash)(const struct vfs_qstr *name, struct vfs_qstr *out);
@@ -326,6 +339,9 @@ struct vfs_rename_ctx {
     unsigned int flags;
 };
 
+/**
+ * Inode callbacks that implement filesystem namespace and metadata behavior.
+ */
 struct vfs_inode_operations {
     struct vfs_dentry *(*lookup)(struct vfs_inode *dir,
                                  struct vfs_dentry *dentry, unsigned int flags);
@@ -354,6 +370,9 @@ struct vfs_inode_operations {
     int (*tmpfile)(struct vfs_inode *dir, struct vfs_file *file, umode_t mode);
 };
 
+/**
+ * File callbacks that implement opened-file operations after lookup/open.
+ */
 struct vfs_file_operations {
     loff_t (*llseek)(struct vfs_file *file, loff_t offset, int whence);
     ssize_t (*read)(struct vfs_file *file, void *buf, size_t count,
@@ -373,6 +392,10 @@ struct vfs_file_operations {
     size_t (*show_fdinfo)(struct vfs_file *file, char *buf, size_t size);
 };
 
+/**
+ * Mounted superblock state shared by all dentries/inodes on one filesystem
+ * instance.
+ */
 struct vfs_super_block {
     const struct vfs_super_operations *s_op;
     const struct vfs_dentry_operations *s_d_op;
@@ -391,6 +414,10 @@ struct vfs_super_block {
     volatile uint64_t s_seq;
 };
 
+/**
+ * VFS inode object. Filesystems embed this in their private inode type and fill
+ * i_op/i_fop plus inode metadata before the inode becomes visible.
+ */
 struct vfs_inode {
     struct vfs_super_block *i_sb;
     const struct vfs_inode_operations *i_op;
@@ -430,6 +457,10 @@ struct vfs_inode {
     uint64_t poll_seq_pri;
 };
 
+/**
+ * Directory cache entry. Dentries name filesystem objects and may exist without
+ * an attached inode for negative cache entries.
+ */
 struct vfs_dentry {
     struct vfs_qstr d_name;
     struct vfs_dentry *d_parent;
@@ -449,6 +480,9 @@ struct vfs_dentry {
     struct llist_header d_alias;
 };
 
+/**
+ * Mounted view of a superblock, including namespace propagation metadata.
+ */
 struct vfs_mount {
     struct vfs_mount *mnt_parent;
     struct vfs_mount *mnt_master;
@@ -469,6 +503,10 @@ struct vfs_mount {
     struct llist_header mnt_mounts;
 };
 
+/**
+ * Open file description tracked by the kernel and referenced by one or more fd
+ * table entries.
+ */
 struct vfs_file {
     const struct vfs_file_operations *f_op;
     struct vfs_path f_path;
@@ -506,6 +544,9 @@ struct vfs_fs_context {
     struct vfs_super_block *sb;
 };
 
+/**
+ * Filesystem type descriptor registered with the VFS.
+ */
 struct vfs_file_system_type {
     const char *name;
     unsigned long fs_flags;
@@ -610,21 +651,40 @@ void vfs_qstr_destroy(struct vfs_qstr *qstr);
 
 int vfs_init(void);
 
+/**
+ * Register a filesystem type so it can be mounted by name.
+ */
 int vfs_register_filesystem(struct vfs_file_system_type *fs);
+/**
+ * Remove a filesystem type from the global registry.
+ */
 void vfs_unregister_filesystem(struct vfs_file_system_type *fs);
+/**
+ * Look up a registered filesystem type by name.
+ */
 struct vfs_file_system_type *vfs_get_fs_type(const char *name);
 
+/**
+ * Allocate and initialize a new superblock instance for a filesystem type.
+ */
 struct vfs_super_block *vfs_alloc_super(struct vfs_file_system_type *type,
                                         unsigned long sb_flags);
 void vfs_get_super(struct vfs_super_block *sb);
 void vfs_put_super(struct vfs_super_block *sb);
 
+/**
+ * Allocate a filesystem-specific inode through sb->s_op->alloc_inode when
+ * available, otherwise allocate a plain VFS inode.
+ */
 struct vfs_inode *vfs_alloc_inode(struct vfs_super_block *sb);
 struct vfs_inode *vfs_igrab(struct vfs_inode *inode);
 void vfs_iput(struct vfs_inode *inode);
 void vfs_inode_init_owner(struct vfs_inode *inode, struct vfs_inode *dir,
                           umode_t mode);
 
+/**
+ * Allocate a dentry under the given parent and copy the supplied name into it.
+ */
 struct vfs_dentry *vfs_d_alloc(struct vfs_super_block *sb,
                                struct vfs_dentry *parent,
                                const struct vfs_qstr *name);
@@ -635,6 +695,9 @@ void vfs_d_instantiate(struct vfs_dentry *dentry, struct vfs_inode *inode);
 struct vfs_dentry *vfs_d_lookup(struct vfs_dentry *parent,
                                 const struct vfs_qstr *name);
 
+/**
+ * Allocate a mount object for an already-created superblock.
+ */
 struct vfs_mount *vfs_mount_alloc(struct vfs_super_block *sb,
                                   unsigned long mnt_flags);
 struct vfs_mount *vfs_mntget(struct vfs_mount *mnt);
@@ -674,6 +737,9 @@ void vfs_path_get(struct vfs_path *path);
 void vfs_path_put(struct vfs_path *path);
 bool vfs_path_equal(const struct vfs_path *a, const struct vfs_path *b);
 
+/**
+ * Allocate an open file description for the resolved path.
+ */
 struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
                                 unsigned int open_flags);
 struct vfs_file *vfs_file_get(struct vfs_file *file);
@@ -686,12 +752,19 @@ char *vfs_path_to_string(const struct vfs_path *path,
 bool vfs_path_is_ancestor(const struct vfs_path *ancestor,
                           const struct vfs_path *path);
 
+/**
+ * Resolve a pathname into a referenced VFS path using Linux-style lookup
+ * flags.
+ */
 int vfs_filename_lookup(int dfd, const char *name, unsigned int lookup_flags,
                         struct vfs_path *path);
 int vfs_path_parent_lookup(int dfd, const char *name, unsigned int lookup_flags,
                            struct vfs_path *parent, struct vfs_qstr *last,
                            unsigned int *type);
 
+/**
+ * Open a path relative to dfd and return a referenced open file description.
+ */
 int vfs_openat(int dfd, const char *name, const struct vfs_open_how *how,
                struct vfs_file **out);
 int vfs_close_file(struct vfs_file *file);
@@ -718,6 +791,10 @@ int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
 int vfs_statx(int dfd, const char *pathname, int flags, uint32_t mask,
               struct vfs_kstat *stat);
 
+/**
+ * Internal mount helper used by kernel subsystems to mount a filesystem by
+ * name.
+ */
 int vfs_kern_mount(const char *fs_name, unsigned long mnt_flags,
                    const char *source, void *data, struct vfs_mount **out);
 int vfs_do_mount(int dfd, const char *pathname, const char *fs_name,
@@ -729,6 +806,9 @@ int vfs_do_move_mount(int from_dfd, const char *from_pathname, int to_dfd,
                       const char *to_pathname);
 int vfs_do_umount(int dfd, const char *pathname, int flags);
 
+/**
+ * Initialize a poll-wait entry before arming it against a node.
+ */
 void vfs_poll_wait_init(vfs_poll_wait_t *wait, struct task *task,
                         uint32_t events);
 int vfs_poll_wait_arm(vfs_node_t *node, vfs_poll_wait_t *wait);
@@ -737,6 +817,9 @@ int vfs_poll_wait_sleep(vfs_node_t *node, vfs_poll_wait_t *wait,
                         int64_t timeout_ns, const char *reason);
 void vfs_poll_notify(vfs_node_t *node, uint32_t events);
 
+/**
+ * Syscall-facing helpers that translate fd numbers into VFS file operations.
+ */
 int vfs_sys_openat(int dfd, const char *pathname,
                    const struct vfs_open_how *how);
 int vfs_sys_close(int fd);
