@@ -766,6 +766,11 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
             spin_unlock(&nl_sk->lock);
             return 0;
         }
+        case 3:
+        case 11:
+        case 12:
+            // TODO
+            return -ENOPROTOOPT;
         default:
             printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                    __LINE__, level, optname);

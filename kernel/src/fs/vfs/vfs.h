@@ -744,6 +744,7 @@ struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
                                 unsigned int open_flags);
 struct vfs_file *vfs_file_get(struct vfs_file *file);
 void vfs_file_put(struct vfs_file *file);
+int mountfd_get_path(struct vfs_file *file, struct vfs_path *path);
 
 void vfs_fill_generic_kstat(const struct vfs_path *path,
                             struct vfs_kstat *stat);

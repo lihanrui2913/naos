@@ -408,6 +408,7 @@ static int file_lock_setlk(fd_t *fd, const flock_t *req, bool wait, bool ofd) {
 
 static int generic_get_fd_path(int fd, struct vfs_path *path) {
     struct vfs_file *file;
+    int ret;
 
     if (!path)
         return -EINVAL;
@@ -417,11 +418,15 @@ static int generic_get_fd_path(int fd, struct vfs_path *path) {
     if (!file)
         return -EBADF;
 
-    path->mnt = file->f_path.mnt;
-    path->dentry = file->f_path.dentry;
-    vfs_path_get(path);
+    ret = mountfd_get_path(file, path);
+    if (ret == -EINVAL) {
+        path->mnt = file->f_path.mnt;
+        path->dentry = file->f_path.dentry;
+        vfs_path_get(path);
+        ret = 0;
+    }
     vfs_file_put(file);
-    return 0;
+    return ret;
 }
 
 static inline int rw_validate_user_buffer(const void *buf, uint64_t len) {
@@ -671,21 +676,8 @@ uint64_t sys_umount2(const char *target, uint64_t flags) {
     return (uint64_t)vfs_do_umount(AT_FDCWD, target_k, (int)flags);
 }
 
-static struct vfs_mount *
-generic_open_tree_resolve_mount(const struct vfs_path *path) {
-    struct vfs_mount *mnt;
-
-    if (!path || !path->mnt)
-        return NULL;
-
-    mnt = vfs_path_mount(path);
-    if (mnt)
-        return mnt;
-    return vfs_mntget(path->mnt);
-}
-
-extern int mountfd_create_file(struct vfs_mount *mnt, bool detached,
-                               unsigned int open_flags,
+extern int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
+                               bool detached, unsigned int open_flags,
                                struct vfs_file **out_file);
 
 uint64_t sys_open_tree(int dfd, const char *pathname, unsigned int flags) {
@@ -728,14 +720,14 @@ uint64_t sys_open_tree(int dfd, const char *pathname, unsigned int flags) {
             vfs_path_put(&path);
             return (uint64_t)-ENOMEM;
         }
-        ret = mountfd_create_file(mnt, true, flags, &file);
+        ret = mountfd_create_file(mnt, mnt->mnt_root, true, flags, &file);
     } else {
-        mnt = generic_open_tree_resolve_mount(&path);
+        mnt = vfs_mntget(path.mnt);
         if (!mnt) {
             vfs_path_put(&path);
             return (uint64_t)-EINVAL;
         }
-        ret = mountfd_create_file(mnt, false, flags, &file);
+        ret = mountfd_create_file(mnt, path.dentry, false, flags, &file);
     }
 
     vfs_path_put(&path);
@@ -1686,12 +1678,6 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             ret = -ENOTTY;
         }
         break;
-    }
-    if (ret == -ENOTTY) {
-        printk("sys_ioctl: cmd %#010x not implemented, fs = %s\n", cmd,
-               (f->f_inode && f->f_inode->i_sb && f->f_inode->i_sb->s_type)
-                   ? f->f_inode->i_sb->s_type->name
-                   : NULL);
     }
 
     return ret;

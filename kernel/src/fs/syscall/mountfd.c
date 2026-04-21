@@ -5,6 +5,7 @@
 
 typedef struct mountfd_ctx {
     struct vfs_mount *mnt;
+    struct vfs_dentry *root;
     bool detached;
 } mountfd_ctx_t;
 
@@ -34,6 +35,22 @@ static mountfd_ctx_t *mountfd_file_ctx(struct vfs_file *file) {
     if (file->private_data)
         return (mountfd_ctx_t *)file->private_data;
     return (mountfd_ctx_t *)file->f_inode->i_private;
+}
+
+int mountfd_get_path(struct vfs_file *file, struct vfs_path *path) {
+    mountfd_ctx_t *ctx;
+
+    if (!path)
+        return -EINVAL;
+
+    ctx = mountfd_file_ctx(file);
+    if (!ctx || !ctx->mnt || !ctx->root)
+        return -EINVAL;
+
+    memset(path, 0, sizeof(*path));
+    path->mnt = vfs_mntget(ctx->mnt);
+    path->dentry = vfs_dget(ctx->root);
+    return 0;
 }
 
 static loff_t mountfd_llseek(struct vfs_file *file, loff_t offset, int whence) {
@@ -81,6 +98,8 @@ static int mountfd_release(struct vfs_inode *inode, struct vfs_file *file) {
         else
             vfs_mntput(ctx->mnt);
     }
+    if (ctx->root)
+        vfs_dput(ctx->root);
 
     free(ctx);
     file->private_data = NULL;
@@ -215,8 +234,9 @@ static struct vfs_file_system_type mountfdfs_fs_type = {
     .get_tree = mountfdfs_get_tree,
 };
 
-int mountfd_create_file(struct vfs_mount *mnt, bool detached,
-                        unsigned int open_flags, struct vfs_file **out_file) {
+int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
+                        bool detached, unsigned int open_flags,
+                        struct vfs_file **out_file) {
     struct vfs_mount *internal_mnt;
     struct vfs_super_block *sb;
     mountfdfs_info_t *fsi;
@@ -228,6 +248,10 @@ int mountfd_create_file(struct vfs_mount *mnt, bool detached,
     char namebuf[32];
 
     if (!mnt || !out_file)
+        return -EINVAL;
+    if (!root)
+        root = mnt->mnt_root;
+    if (!root)
         return -EINVAL;
 
     internal_mnt = mountfdfs_get_internal_mount();
@@ -241,6 +265,7 @@ int mountfd_create_file(struct vfs_mount *mnt, bool detached,
     }
 
     ctx->mnt = mnt;
+    ctx->root = vfs_dget(root);
     ctx->detached = detached;
 
     sb = internal_mnt->mnt_sb;
@@ -284,6 +309,10 @@ int mountfd_create_file(struct vfs_mount *mnt, bool detached,
         vfs_mntput(internal_mnt);
         return -ENOMEM;
     }
+
+    vfs_path_put(&file->f_path);
+    file->f_path.mnt = vfs_mntget(mnt);
+    file->f_path.dentry = vfs_dget(root);
 
     file->private_data = ctx;
     *out_file = file;

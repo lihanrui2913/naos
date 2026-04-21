@@ -70,6 +70,7 @@ static int vfs_get_scoped_start(struct vfs_process_fs *fs,
                                 struct vfs_mount *ns_root_mnt, int dfd,
                                 struct vfs_path *scoped) {
     struct vfs_file *file;
+    int ret;
     bool pwd_valid;
 
     if (!scoped)
@@ -97,10 +98,14 @@ static int vfs_get_scoped_start(struct vfs_process_fs *fs,
     if (!file)
         return -EBADF;
 
-    vfs_path_get(&file->f_path);
-    *scoped = file->f_path;
+    ret = mountfd_get_path(file, scoped);
+    if (ret == -EINVAL) {
+        vfs_path_get(&file->f_path);
+        *scoped = file->f_path;
+        ret = 0;
+    }
     vfs_file_put(file);
-    return 0;
+    return ret;
 }
 
 static int vfs_get_fs_start(int dfd, const char *name,
@@ -109,6 +114,7 @@ static int vfs_get_fs_start(int dfd, const char *name,
     struct vfs_process_fs *fs;
     struct vfs_file *file;
     struct vfs_mount *ns_root_mnt;
+    int fd_path_ret;
     bool root_valid;
     bool pwd_valid;
 
@@ -218,9 +224,15 @@ static int vfs_get_fs_start(int dfd, const char *name,
     if (!file)
         goto err;
 
-    vfs_path_get(&file->f_path);
-    *start = file->f_path;
+    fd_path_ret = mountfd_get_path(file, start);
+    if (fd_path_ret == -EINVAL) {
+        vfs_path_get(&file->f_path);
+        *start = file->f_path;
+        fd_path_ret = 0;
+    }
     vfs_file_put(file);
+    if (fd_path_ret < 0)
+        goto err;
     return 0;
 
 err:
