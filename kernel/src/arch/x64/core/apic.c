@@ -448,18 +448,7 @@ uint64_t general_ap_entry() {
     }
 }
 
-#if defined(MULTIBOOT2)
-void multiboot2_ap_entry() {
-    asm volatile("movq %0, %%cr3" ::"r"(virt_to_phys(get_kernel_page_dir())));
-    uint8_t *new_stack_base = alloc_frames_bytes(STACK_SIZE);
-    uint8_t *new_stack_top = new_stack_base + STACK_SIZE;
-    asm volatile("movq %0, %%rsp" ::"r"(new_stack_top));
-    asm volatile("movq %0, %%rbp" ::"r"(new_stack_top));
-    general_ap_entry();
-}
-#else
 void limine_ap_entry() { general_ap_entry(); }
-#endif
 
 uint64_t cpu_count;
 
@@ -475,13 +464,7 @@ uint32_t get_cpuid_by_lapic_id(uint32_t lapic_id) {
     return 0;
 }
 
-void smp_init() {
-#if defined(MULTIBOOT2)
-    boot_smp_init((uintptr_t)multiboot2_ap_entry);
-#else
-    boot_smp_init((uintptr_t)limine_ap_entry);
-#endif
-}
+void smp_init() { boot_smp_init((uintptr_t)limine_ap_entry); }
 
 int64_t apic_mask(uint64_t irq, uint64_t flags) {
     if (flags & IRQ_FLAGS_MSIX)

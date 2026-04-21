@@ -155,7 +155,7 @@ override LDFLAGS += \
     -nostdlib \
     -static \
     -z max-page-size=0x1000 \
-    -T linker-$(ARCH)-$(BOOT_PROTOCOL).ld
+    -T linker-$(ARCH).ld
 
 ifneq ($(CC_IS_CLANG),1)
 override LDFLAGS += -Wl,--build-id=none
@@ -177,27 +177,11 @@ override SRCFILES += $(shell find src/init -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/task -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/block -name "*.[Sc]" | LC_ALL=C sort)
 override SRCFILES += $(shell find src/net -name "*.[Sc]" | LC_ALL=C sort)
-ifeq ($(BOOT_PROTOCOL), limine)
 override SRCFILES += src/boot/limine_boot.c
-endif
-ifeq ($(BOOT_PROTOCOL), multiboot2)
-override SRCFILES += src/boot/multiboot2_boot.c
-override SRCFILES += $(shell find src/boot/multiboot2/x64 -name "*.[Sc]" | LC_ALL=C sort)
-override CFLAGS += -DMULTIBOOT2
-endif
-ifeq ($(BOOT_PROTOCOL), opensbi)
-override SRCFILES += src/boot/opensbi_boot.c
-override SRCFILES += $(shell find src/boot/opensbi -name "*.[Sc]" | LC_ALL=C sort)
-override CFLAGS += -DOPENSBI
-endif
 override CFILES := $(filter %.c,$(SRCFILES))
 override ASFILES := $(filter %.S,$(SRCFILES))
 override OBJ := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o))
 override HEADER_DEPS := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
-
-ifeq ($(KERNEL_MODEL), monolithic)
-override CFLAGS += -DMONOLITHIC
-endif
 
 # Default target. This must come first, before header dependencies.
 .PHONY: all
@@ -214,7 +198,7 @@ endif
 
 .PHONY: bin-$(ARCH)/$(OUTPUT)
 # Link rules for the final executable.
-bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-$(ARCH)-$(BOOT_PROTOCOL).ld $(OBJ)
+bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-$(ARCH).ld $(OBJ)
 	$(call PRINT_STEP,LD,$@)
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(LINKER) $(LDFLAGS) $(OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a $(PROJECT_ROOT)/liballoc_$(ARCH).a -o $@

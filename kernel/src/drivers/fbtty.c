@@ -158,7 +158,7 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
     case TIOCNXCL:
         return 0;
     default:
-        return -EINVAL;
+        return -ENOTTY;
     }
 }
 

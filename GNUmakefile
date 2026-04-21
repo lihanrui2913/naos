@@ -132,23 +132,10 @@ $(IMAGE_NAME).img: assets/limine modules kernel initramfs-$(ARCH).img rootfs-$(A
 	sgdisk --new=1:1M:255M $(IMAGE_NAME).img
 	mkfs.vfat -F 32 --offset 2048 -S 512 $(IMAGE_NAME).img
 	mcopy -i $(IMAGE_NAME).img@@1M kernel/bin-$(ARCH)/kernel ::/
-ifeq ($(KERNEL_MODEL), mixed)
 	mcopy -i $(IMAGE_NAME).img@@1M initramfs-$(ARCH).img ::/initramfs.img
-endif
-ifeq ($(BOOT_PROTOCOL), limine)
 	mmd -i $(IMAGE_NAME).img@@1M ::/EFI ::/EFI/BOOT ::/limine
 	mcopy -i $(IMAGE_NAME).img@@1M $(EFI_FILE_SINGLE) ::/EFI/BOOT
-ifeq ($(ARCH), x86_64)
-	mcopy -i $(IMAGE_NAME).img@@1M limine_x86_64_$(KERNEL_MODEL).conf ::/limine/limine.conf
-else
-	mcopy -i $(IMAGE_NAME).img@@1M limine_$(KERNEL_MODEL).conf ::/limine/limine.conf
-endif
-endif
-ifeq ($(BOOT_PROTOCOL), multiboot2)
-	mmd -i $(IMAGE_NAME).img@@1M ::/EFI ::/EFI/BOOT ::/limine
-	mcopy -i $(IMAGE_NAME).img@@1M $(EFI_FILE_SINGLE) ::/EFI/BOOT
-	mcopy -i $(IMAGE_NAME).img@@1M limine_multiboot2_$(KERNEL_MODEL).conf ::/limine/limine.conf
-endif
+	mcopy -i $(IMAGE_NAME).img@@1M limine.conf ::/limine/limine.conf
 
 TOTAL_IMG_SIZE=$$(( $(ROOTFS_IMG_SIZE) + 256 ))
 
@@ -157,18 +144,10 @@ single-$(IMAGE_NAME).img: assets/limine modules kernel initramfs-$(ARCH).img roo
 	sgdisk --new=1:1M:255M --new=2:256M:0 single-$(IMAGE_NAME).img
 	mkfs.vfat -F 32 --offset 2048 -S 512 single-$(IMAGE_NAME).img
 	mcopy -i single-$(IMAGE_NAME).img@@1M kernel/bin-$(ARCH)/kernel ::/
-ifeq ($(KERNEL_MODEL), mixed)
 	mcopy -i single-$(IMAGE_NAME).img@@1M initramfs-$(ARCH).img ::/initramfs.img
-endif
-ifeq ($(BOOT_PROTOCOL), limine)
 	mmd -i single-$(IMAGE_NAME).img@@1M ::/EFI ::/EFI/BOOT ::/limine
 	mcopy -i single-$(IMAGE_NAME).img@@1M $(EFI_FILE_SINGLE) ::/EFI/BOOT
-ifeq ($(ARCH), x86_64)
-	mcopy -i single-$(IMAGE_NAME).img@@1M limine_x86_64_$(KERNEL_MODEL).conf ::/limine/limine.conf
-else
-	mcopy -i single-$(IMAGE_NAME).img@@1M limine_$(KERNEL_MODEL).conf ::/limine/limine.conf
-endif
-endif
+	mcopy -i single-$(IMAGE_NAME).img@@1M limine.conf ::/limine/limine.conf
 
 	dd if=rootfs-$(ARCH).img of=single-$(IMAGE_NAME).img bs=1M count=$(ROOTFS_IMG_SIZE) seek=256
 
@@ -239,21 +218,6 @@ run-aarch64-single: assets/ovmf-code-$(ARCH).fd all-single
 
 .PHONY: run-riscv64
 run-riscv64: assets/ovmf-code-$(ARCH).fd all
-ifeq ($(BOOT_PROTOCOL), opensbi)
-	qemu-system-$(ARCH) \
-		-M virt \
-		-cpu rv64 \
-		-device ramfb \
-		-device qemu-xhci \
-		-device usb-kbd \
-		-device usb-mouse \
-		-kernel kernel/bin-$(ARCH)/kernel \
-		-drive if=none,file=rootfs-$(ARCH).img,format=raw,id=rootdisk \
-		-device virtio-blk-device,drive=rootdisk,bus=virtio-mmio-bus.0 \
-		-netdev user,id=net0 \
-		-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1 \
-		$(QEMUFLAGS)
-else
 	qemu-system-$(ARCH) \
 		-M virt \
 		-cpu rv64 \
@@ -269,7 +233,6 @@ else
 		-netdev user,id=net0 \
 		-device virtio-net-pci,netdev=net0 \
 		$(QEMUFLAGS)
-endif
 
 .PHONY: run-riscv64
 run-riscv64-single: assets/ovmf-code-$(ARCH).fd all-single

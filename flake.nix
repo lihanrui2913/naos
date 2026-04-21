@@ -117,8 +117,6 @@
             shellHook = ''
               export ARCH="''${ARCH:-x86_64}"
               export BUILD_MODE="''${BUILD_MODE:-debug}"
-              export BOOT_PROTOCOL="''${BOOT_PROTOCOL:-limine}"
-              export KERNEL_MODEL="''${KERNEL_MODEL:-mixed}"
 
               echo "naos dev shell"
               echo "default ARCH=$ARCH"

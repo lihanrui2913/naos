@@ -207,7 +207,7 @@ int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
     case TIOCNXCL:
         return 0;
     default:
-        return -EINVAL;
+        return -ENOTTY;
     }
 }
 

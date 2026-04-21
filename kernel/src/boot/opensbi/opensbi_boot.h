@@ -1,4 +1,0 @@
-#pragma once
-
-#define EARLY_MAP_BASE 0x80000000
-#define EARLY_MAP_END 0x88000000

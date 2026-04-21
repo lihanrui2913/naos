@@ -1681,14 +1681,13 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 
     default:
         ret = vfs_ioctl_file(f, cmd, arg);
-        if ((cmd == TCGETS || cmd == TCSETS || cmd == TCGETS2 ||
-             cmd == TIOCSCTTY || cmd == TIOCGWINSZ) &&
-            ret < 0) {
+        if (ret < 0 && (-ret != EBADF) && (-ret != EFAULT) &&
+            (-ret != EINVAL)) {
             ret = -ENOTTY;
         }
         break;
     }
-    if (ret == -ENOSYS) {
+    if (ret == -ENOTTY) {
         printk("sys_ioctl: cmd %#010x not implemented, fs = %s\n", cmd,
                (f->f_inode && f->f_inode->i_sb && f->f_inode->i_sb->s_type)
                    ? f->f_inode->i_sb->s_type->name
