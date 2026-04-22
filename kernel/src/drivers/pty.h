@@ -27,6 +27,9 @@ typedef struct pty_pair {
 
     bool stop_master_output;
     bool stop_slave_output;
+    bool packet_mode;
+    bool packet_data_pending;
+    uint8_t packet_status;
 
     int tty_kbmode;
     struct vt_mode vt_mode;

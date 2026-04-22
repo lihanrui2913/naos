@@ -74,8 +74,80 @@ static int pty_wait_node(vfs_node_t *node, uint32_t events,
     return ret;
 }
 
+static inline void pty_packet_queue_locked(pty_pair_t *pair, uint8_t status,
+                                           uint32_t *notify_master) {
+    if (!pair || !pair->packet_mode || !status)
+        return;
+    pair->packet_status |= status;
+    if (notify_master)
+        *notify_master |= EPOLLIN | EPOLLPRI;
+}
+
+static inline void pty_packet_mark_data_locked(pty_pair_t *pair,
+                                               size_t old_ptr_master) {
+    (void)old_ptr_master;
+    if (!pair || !pair->packet_mode)
+        return;
+    if (pair->ptrMaster > 0)
+        pair->packet_data_pending = true;
+}
+
+static inline void pty_packet_termios_changed_locked(
+    pty_pair_t *pair, const struct termios *old_term, uint32_t *notify_master) {
+    uint8_t status = 0;
+
+    if (!pair || !old_term)
+        return;
+    if (!memcmp(old_term, &pair->term, sizeof(*old_term)))
+        return;
+
+    if ((old_term->c_iflag ^ pair->term.c_iflag) & IXON) {
+        status |= (pair->term.c_iflag & IXON) ? TIOCPKT_DOSTOP : TIOCPKT_NOSTOP;
+    }
+    pty_packet_queue_locked(pair, status, notify_master);
+}
+
+static int pty_tcflush_locked(pty_pair_t *pair, int selector,
+                              uint32_t *notify_master, uint32_t *notify_slave,
+                              uint8_t *packet_status) {
+    if (!pair)
+        return -EINVAL;
+
+    switch (selector) {
+    case TCIFLUSH:
+        pair->ptrSlave = 0;
+        if (notify_master)
+            *notify_master |= EPOLLOUT;
+        if (packet_status)
+            *packet_status |= TIOCPKT_FLUSHREAD;
+        return 0;
+    case TCOFLUSH:
+        pair->ptrMaster = 0;
+        pair->packet_data_pending = false;
+        if (notify_slave)
+            *notify_slave |= EPOLLOUT;
+        if (packet_status)
+            *packet_status |= TIOCPKT_FLUSHWRITE;
+        return 0;
+    case TCIOFLUSH:
+        pair->ptrSlave = 0;
+        pair->ptrMaster = 0;
+        pair->packet_data_pending = false;
+        if (notify_master)
+            *notify_master |= EPOLLOUT;
+        if (notify_slave)
+            *notify_slave |= EPOLLOUT;
+        if (packet_status)
+            *packet_status |= TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
 static int pty_tcxonc_locked(pty_pair_t *pair, bool from_master, uintptr_t arg,
-                             uint32_t *notify_master, uint32_t *notify_slave) {
+                             uint32_t *notify_master, uint32_t *notify_slave,
+                             uint8_t *packet_status) {
     if (!pair)
         return -EINVAL;
 
@@ -84,8 +156,11 @@ static int pty_tcxonc_locked(pty_pair_t *pair, bool from_master, uintptr_t arg,
     case TCOOFF:
         if (from_master)
             pair->stop_master_output = true;
-        else
+        else {
             pair->stop_slave_output = true;
+            if (packet_status)
+                *packet_status |= TIOCPKT_STOP;
+        }
         return 0;
     case TCOON:
         if (from_master) {
@@ -94,6 +169,8 @@ static int pty_tcxonc_locked(pty_pair_t *pair, bool from_master, uintptr_t arg,
                 *notify_master |= EPOLLOUT;
         } else {
             pair->stop_slave_output = false;
+            if (packet_status)
+                *packet_status |= TIOCPKT_START;
             if (notify_slave)
                 *notify_slave |= EPOLLOUT;
         }
@@ -108,9 +185,11 @@ static int pty_tcxonc_locked(pty_pair_t *pair, bool from_master, uintptr_t arg,
             if (notify_slave)
                 *notify_slave |= EPOLLIN;
         } else {
+            size_t old_ptr_master = pair->ptrMaster;
             if (!pair->masterFds || pair->ptrMaster >= PTY_BUFF_SIZE)
                 return pair->masterFds ? -EAGAIN : 0;
             pair->bufferMaster[pair->ptrMaster++] = flow_char;
+            pty_packet_mark_data_locked(pair, old_ptr_master);
             if (notify_master)
                 *notify_master |= EPOLLIN;
         }
@@ -331,20 +410,35 @@ static ssize_t ptmx_read(fd_t *fd, void *addr, size_t offset, size_t size) {
     (void)offset;
     if (!pair)
         return -EINVAL;
+    if (!size)
+        return 0;
 
     while (true) {
         mutex_lock(&pair->lock);
+        if (pair->packet_mode && pair->packet_status) {
+            ((uint8_t *)addr)[0] = pair->packet_status;
+            pair->packet_status = 0;
+            mutex_unlock(&pair->lock);
+            return 1;
+        }
         if (ptmx_data_avail(pair) > 0) {
-            size_t to_copy = MIN(size, ptmx_data_avail(pair));
-            memcpy(addr, pair->bufferMaster, to_copy);
+            size_t header = pair->packet_mode ? 1 : 0;
+            size_t to_copy = MIN(size - header, ptmx_data_avail(pair));
+            if (header) {
+                ((uint8_t *)addr)[0] = TIOCPKT_DATA;
+            }
+            if (to_copy > 0)
+                memcpy((uint8_t *)addr + header, pair->bufferMaster, to_copy);
             size_t remaining = pair->ptrMaster - to_copy;
             if (remaining > 0)
                 memmove(pair->bufferMaster, &pair->bufferMaster[to_copy],
                         remaining);
             pair->ptrMaster -= to_copy;
+            pair->packet_data_pending =
+                pair->packet_mode && pair->ptrMaster > 0;
             mutex_unlock(&pair->lock);
             pty_notify_pair_slave(pair, EPOLLOUT);
-            return (ssize_t)to_copy;
+            return (ssize_t)(header + to_copy);
         }
         bool no_slave = (pair->slaveFds == 0);
         mutex_unlock(&pair->lock);
@@ -440,6 +534,7 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
     pty_pair_t *pair = pty_pair_from_file(fd);
     int ret = -ENOTTY;
     uint32_t notify_master = 0, notify_slave = 0;
+    uint8_t packet_status = 0;
     size_t number = _IOC_NR(request);
 
     if (!pair)
@@ -492,16 +587,69 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
             break;
         case TCSETS:
         case TCSETSW:
-        case TCSETSF:
+        case TCSETSF: {
+            struct termios old_term = pair->term;
             ret = (!arg || copy_from_user(&pair->term, (const void *)arg,
                                           sizeof(termios)))
                       ? -EFAULT
                       : 0;
+            if (!ret) {
+                pty_packet_termios_changed_locked(pair, &old_term,
+                                                  &notify_master);
+                if ((request & 0xffffffffU) == TCSETSF)
+                    ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
+                                             &notify_slave, &packet_status);
+            }
             break;
+        }
         case TCXONC:
             ret = pty_tcxonc_locked(pair, false, arg, &notify_master,
-                                    &notify_slave);
+                                    &notify_slave, &packet_status);
             break;
+        case TCFLSH:
+            ret = pty_tcflush_locked(pair, (int)arg, &notify_master,
+                                     &notify_slave, &packet_status);
+            break;
+        case TIOCPKT: {
+            int enabled = 0;
+            if (!arg ||
+                copy_from_user(&enabled, (const void *)arg, sizeof(enabled))) {
+                ret = -EFAULT;
+                break;
+            }
+            pair->packet_mode = enabled != 0;
+            pair->packet_status = 0;
+            pair->packet_data_pending =
+                pair->packet_mode && pair->ptrMaster > 0;
+            ret = 0;
+            break;
+        }
+        case TIOCGPKT: {
+            int enabled = pair->packet_mode ? 1 : 0;
+            ret = (!arg || copy_to_user((void *)arg, &enabled, sizeof(enabled)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
+        case FIONREAD: {
+            int available = 0;
+            if (!pair->packet_mode ||
+                (!pair->packet_status && !pair->packet_data_pending)) {
+                available = (int)ptmx_data_avail(pair);
+            }
+            ret = (!arg ||
+                   copy_to_user((void *)arg, &available, sizeof(available)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
+        case TIOCOUTQ: {
+            int queued = 0;
+            ret = (!arg || copy_to_user((void *)arg, &queued, sizeof(queued)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
         case TCSBRK:
         case TCSBRKP:
             ret = 0;
@@ -528,6 +676,8 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
             break;
         }
     }
+    if (!ret)
+        pty_packet_queue_locked(pair, packet_status, &notify_master);
     mutex_unlock(&pair->lock);
 
     if (ret >= 0) {
@@ -545,6 +695,8 @@ static __poll_t ptmx_poll(fd_t *file, struct vfs_poll_table *pt) {
         return EPOLLNVAL;
 
     mutex_lock(&pair->lock);
+    if (pair->packet_mode && pair->packet_status)
+        revents |= EPOLLIN | EPOLLPRI;
     if (ptmx_data_avail(pair) > 0)
         revents |= EPOLLIN;
     if (pair->ptrSlave < PTY_BUFF_SIZE)
@@ -658,6 +810,7 @@ ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit) {
             return -EIO;
         }
         if (pair->ptrMaster < PTY_BUFF_SIZE) {
+            size_t old_ptr_master = pair->ptrMaster;
             size_t written = 0;
             bool translate =
                 (pair->term.c_oflag & OPOST) && (pair->term.c_oflag & ONLCR);
@@ -675,6 +828,8 @@ ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit) {
                 }
                 written++;
             }
+            if (written > 0)
+                pty_packet_mark_data_locked(pair, old_ptr_master);
             mutex_unlock(&pair->lock);
             if (written > 0)
                 pty_notify_pair_master(pair, EPOLLIN);
@@ -729,6 +884,7 @@ static ssize_t pts_write(fd_t *fd, const void *in, size_t offset,
 int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
     int ret = -ENOTTY;
     uint32_t notify_master = 0, notify_slave = 0;
+    uint8_t packet_status = 0;
 
     if (!pair)
         return -EINVAL;
@@ -756,14 +912,39 @@ int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
         break;
     case TCSETS:
     case TCSETSW:
-    case TCSETSF:
+    case TCSETSF: {
+        struct termios old_term = pair->term;
         ret = (!arg || copy_from_user(&pair->term, arg, sizeof(termios)))
                   ? -EFAULT
                   : 0;
+        if (!ret) {
+            pty_packet_termios_changed_locked(pair, &old_term, &notify_master);
+            if (request == TCSETSF)
+                ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
+                                         &notify_slave, &packet_status);
+        }
         break;
+    }
     case TCXONC:
         ret = pty_tcxonc_locked(pair, false, (uintptr_t)arg, &notify_master,
-                                &notify_slave);
+                                &notify_slave, &packet_status);
+        break;
+    case FIONREAD: {
+        int available = (int)pts_data_avail(pair);
+        ret = (!arg || copy_to_user(arg, &available, sizeof(available)))
+                  ? -EFAULT
+                  : 0;
+        break;
+    }
+    case TIOCOUTQ: {
+        int queued = 0;
+        ret =
+            (!arg || copy_to_user(arg, &queued, sizeof(queued))) ? -EFAULT : 0;
+        break;
+    }
+    case TCFLSH:
+        ret = pty_tcflush_locked(pair, (int)(uintptr_t)arg, &notify_master,
+                                 &notify_slave, &packet_status);
         break;
     case TCSBRK:
     case TCSBRKP:
@@ -787,6 +968,8 @@ int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
         printk("pts_ioctl: Unsupported request %#010lx\n", request);
         break;
     }
+    if (!ret)
+        pty_packet_queue_locked(pair, packet_status, &notify_master);
     mutex_unlock(&pair->lock);
 
     if (ret >= 0) {

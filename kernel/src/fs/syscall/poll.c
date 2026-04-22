@@ -57,10 +57,12 @@ static int poll_scan_ready(struct pollfd *fds, int nfds) {
             continue;
         }
 
-        vfs_node_t *node = current_task->fd_info->fds[fds[i].fd]->node;
+        struct vfs_file *file = current_task->fd_info->fds[fds[i].fd];
         uint32_t query_events = poll_to_epoll_comp(fds[i].events) | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
-        int polled = vfs_poll(node, query_events);
+        int polled = EPOLLNVAL;
+        if (file->f_op && file->f_op->poll)
+            polled = (int)file->f_op->poll(file, NULL) & (int)query_events;
         if (polled < 0)
             polled = 0;
 
