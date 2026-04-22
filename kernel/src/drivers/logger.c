@@ -5,6 +5,23 @@
 #include <mm/mm.h>
 #include <boot/boot.h>
 
+// util-linux dmesg defaults to /dev/kmsg. Keep records in Linux kmsg order.
+#define KMSG_TEXT_BUFFER_SIZE (256 * 1024)
+#define KMSG_RECORD_CAPACITY 1024
+#define KMSG_MAX_RECORD_TEXT (sizeof(buf) - 1)
+
+#define SYSLOG_ACTION_CLOSE 0
+#define SYSLOG_ACTION_OPEN 1
+#define SYSLOG_ACTION_READ 2
+#define SYSLOG_ACTION_READ_ALL 3
+#define SYSLOG_ACTION_READ_CLEAR 4
+#define SYSLOG_ACTION_CLEAR 5
+#define SYSLOG_ACTION_CONSOLE_OFF 6
+#define SYSLOG_ACTION_CONSOLE_ON 7
+#define SYSLOG_ACTION_CONSOLE_LEVEL 8
+#define SYSLOG_ACTION_SIZE_UNREAD 9
+#define SYSLOG_ACTION_SIZE_BUFFER 10
+
 #define PAD_ZERO 1 // 0填充
 #define LEFT 2     // 靠左对齐
 #define RIGHT 4    // 靠右对齐
@@ -15,6 +32,278 @@
 #define SIGN 128   // 显示符号位
 
 char buf[4096];
+
+typedef struct kmsg_record {
+    uint64_t seq;
+    uint64_t timestamp_us;
+    uint32_t text_off;
+    uint32_t text_len;
+    uint16_t priority;
+} kmsg_record_t;
+
+static char kmsg_text_ring[KMSG_TEXT_BUFFER_SIZE];
+static kmsg_record_t kmsg_records[KMSG_RECORD_CAPACITY];
+static uint32_t kmsg_record_head = 0;
+static uint32_t kmsg_record_count = 0;
+static uint32_t kmsg_text_head = 0;
+static uint32_t kmsg_text_used = 0;
+static uint64_t kmsg_next_seq = 0;
+static vfs_node_t *kmsg_poll_node = NULL;
+spinlock_t printk_lock = SPIN_INIT;
+
+static inline uint64_t kmsg_oldest_seq_locked(void) {
+    if (kmsg_record_count == 0)
+        return kmsg_next_seq;
+    return kmsg_records[kmsg_record_head].seq;
+}
+
+static inline kmsg_record_t *kmsg_record_at_seq_locked(uint64_t seq) {
+    uint64_t oldest = kmsg_oldest_seq_locked();
+
+    if (seq < oldest || seq >= kmsg_next_seq)
+        return NULL;
+
+    return &kmsg_records[(kmsg_record_head + (uint32_t)(seq - oldest)) %
+                         KMSG_RECORD_CAPACITY];
+}
+
+static void kmsg_copy_from_ring_locked(uint32_t off, char *dst, size_t len) {
+    size_t first;
+
+    if (!dst || len == 0)
+        return;
+
+    first = MIN(len, KMSG_TEXT_BUFFER_SIZE - off);
+    memcpy(dst, kmsg_text_ring + off, first);
+    if (len > first)
+        memcpy(dst + first, kmsg_text_ring, len - first);
+}
+
+static void kmsg_drop_oldest_locked(void) {
+    kmsg_record_t *record;
+
+    if (kmsg_record_count == 0)
+        return;
+
+    record = &kmsg_records[kmsg_record_head];
+    kmsg_text_head =
+        (record->text_off + record->text_len) % KMSG_TEXT_BUFFER_SIZE;
+    if (kmsg_text_used >= record->text_len)
+        kmsg_text_used -= record->text_len;
+    else
+        kmsg_text_used = 0;
+    kmsg_record_head = (kmsg_record_head + 1) % KMSG_RECORD_CAPACITY;
+    kmsg_record_count--;
+}
+
+static bool kmsg_append_record_locked(const char *text, size_t len,
+                                      uint16_t priority) {
+    kmsg_record_t *record;
+    uint32_t tail;
+    size_t first;
+
+    if (!text || len == 0)
+        return false;
+
+    if (len > KMSG_MAX_RECORD_TEXT)
+        len = KMSG_MAX_RECORD_TEXT;
+    if (len > KMSG_TEXT_BUFFER_SIZE)
+        len = KMSG_TEXT_BUFFER_SIZE;
+
+    while (kmsg_record_count >= KMSG_RECORD_CAPACITY ||
+           kmsg_text_used + len > KMSG_TEXT_BUFFER_SIZE) {
+        kmsg_drop_oldest_locked();
+    }
+
+    tail = (kmsg_text_head + kmsg_text_used) % KMSG_TEXT_BUFFER_SIZE;
+    first = MIN(len, KMSG_TEXT_BUFFER_SIZE - tail);
+    memcpy(kmsg_text_ring + tail, text, first);
+    if (len > first)
+        memcpy(kmsg_text_ring, text + first, len - first);
+
+    record = &kmsg_records[(kmsg_record_head + kmsg_record_count) %
+                           KMSG_RECORD_CAPACITY];
+    record->seq = kmsg_next_seq++;
+    record->timestamp_us = nano_time() / 1000ULL;
+    record->text_off = tail;
+    record->text_len = (uint32_t)len;
+    record->priority = priority;
+
+    kmsg_text_used += (uint32_t)len;
+    kmsg_record_count++;
+    return true;
+}
+
+static size_t kmsg_trim_record_text(char *text, size_t len) {
+    while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
+        len--;
+    return len;
+}
+
+static ssize_t kmsg_snapshot_all(char **snapshot_out, bool clear_after) {
+    char *snapshot;
+    size_t len;
+    size_t to_copy;
+
+    if (!snapshot_out)
+        return -EINVAL;
+
+    *snapshot_out = NULL;
+
+    spin_lock(&printk_lock);
+    len = kmsg_text_used;
+    spin_unlock(&printk_lock);
+
+    if (len == 0)
+        return 0;
+
+    snapshot = malloc(len);
+    if (!snapshot)
+        return -ENOMEM;
+
+    spin_lock(&printk_lock);
+    to_copy = MIN(len, (size_t)kmsg_text_used);
+    if (to_copy)
+        kmsg_copy_from_ring_locked(kmsg_text_head, snapshot, to_copy);
+    if (clear_after) {
+        kmsg_record_head = 0;
+        kmsg_record_count = 0;
+        kmsg_text_head = 0;
+        kmsg_text_used = 0;
+    }
+    spin_unlock(&printk_lock);
+
+    *snapshot_out = snapshot;
+    return (ssize_t)to_copy;
+}
+
+size_t logger_kmsg_buffer_size(void) { return KMSG_TEXT_BUFFER_SIZE; }
+
+static inline uint64_t kmsg_file_seq_get(fd_t *file, uint64_t fallback) {
+    if (!file || !file->private_data)
+        return fallback;
+    return (uint64_t)((uintptr_t)file->private_data - 1U);
+}
+
+static inline void kmsg_file_seq_set(fd_t *file, uint64_t seq) {
+    if (!file)
+        return;
+    file->private_data = (void *)(uintptr_t)(seq + 1U);
+}
+
+void logger_kmsg_bind_node(vfs_node_t *node) {
+    if (!node)
+        return;
+
+    spin_lock(&printk_lock);
+    if (!kmsg_poll_node)
+        kmsg_poll_node = vfs_igrab(node);
+    spin_unlock(&printk_lock);
+}
+
+ssize_t logger_kmsg_poll(int events) {
+    ssize_t revents = 0;
+
+    spin_lock(&printk_lock);
+    if ((events & EPOLLIN) && kmsg_record_count > 0)
+        revents |= EPOLLIN | EPOLLRDNORM;
+    spin_unlock(&printk_lock);
+
+    if (events & EPOLLOUT)
+        revents |= EPOLLOUT | EPOLLWRNORM;
+
+    return revents;
+}
+
+ssize_t logger_kmsg_read(fd_t *file, void *buf_user, size_t len,
+                         uint64_t flags) {
+    kmsg_record_t record;
+    char text[KMSG_MAX_RECORD_TEXT + 1];
+    char header[96];
+    size_t text_len;
+    int header_len;
+    size_t total;
+    uint64_t seq;
+    uint64_t oldest;
+
+    if (!file || !buf_user)
+        return -EINVAL;
+
+    logger_kmsg_bind_node(file->f_inode);
+
+    spin_lock(&printk_lock);
+    if (kmsg_record_count == 0) {
+        spin_unlock(&printk_lock);
+        return (flags & O_NONBLOCK) ? -EWOULDBLOCK : 0;
+    }
+
+    oldest = kmsg_oldest_seq_locked();
+    seq = kmsg_file_seq_get(file, oldest);
+    if (seq < oldest)
+        seq = oldest;
+    if (seq >= kmsg_next_seq) {
+        spin_unlock(&printk_lock);
+        return (flags & O_NONBLOCK) ? -EWOULDBLOCK : 0;
+    }
+
+    record = *kmsg_record_at_seq_locked(seq);
+    kmsg_copy_from_ring_locked(record.text_off, text, record.text_len);
+    spin_unlock(&printk_lock);
+
+    text_len = kmsg_trim_record_text(text, record.text_len);
+    text[text_len] = '\0';
+
+    header_len =
+        snprintf(header, sizeof(header), "%u,%llu,%llu,-;",
+                 (unsigned)record.priority, (unsigned long long)record.seq,
+                 (unsigned long long)record.timestamp_us);
+    if (header_len < 0)
+        return -EINVAL;
+
+    total = (size_t)header_len + text_len + 1;
+    if (len < total)
+        return -EINVAL;
+    if (copy_to_user(buf_user, header, (size_t)header_len))
+        return -EFAULT;
+    if (text_len && copy_to_user((char *)buf_user + header_len, text, text_len))
+        return -EFAULT;
+    if (copy_to_user((char *)buf_user + header_len + text_len, "\n", 1))
+        return -EFAULT;
+
+    kmsg_file_seq_set(file, record.seq + 1);
+    return (ssize_t)total;
+}
+
+ssize_t logger_kmsg_write(const void *buf_user, size_t len) {
+    char chunk[KMSG_MAX_RECORD_TEXT];
+    size_t offset = 0;
+    ssize_t written = 0;
+    bool notify = false;
+
+    if (!buf_user)
+        return -EINVAL;
+    if (len == 0)
+        return 0;
+
+    while (offset < len) {
+        size_t part = MIN(sizeof(chunk), len - offset);
+
+        if (copy_from_user(chunk, (const char *)buf_user + offset, part))
+            return written > 0 ? written : -EFAULT;
+
+        spin_lock(&printk_lock);
+        notify |= kmsg_append_record_locked(chunk, part, 6);
+        spin_unlock(&printk_lock);
+
+        offset += part;
+        written += (ssize_t)part;
+    }
+
+    if (notify && kmsg_poll_node)
+        vfs_poll_notify(kmsg_poll_node, EPOLLIN | EPOLLRDNORM | EPOLLPRI);
+
+    return written;
+}
 
 static int get_atoi(const char **str) {
     int n;
@@ -278,6 +567,10 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
             case 'l':
                 lflags = lflags == L_LONG ? L_LLONG : L_LONG;
                 break;
+            case 'z':
+                lflags =
+                    sizeof(size_t) > sizeof(unsigned long) ? L_LLONG : L_LONG;
+                break;
             case 'L':
                 lflags = L_DOUBLE;
                 break;
@@ -346,17 +639,27 @@ int vsprintf(char *buf, const char *fmt, va_list ap) {
     return vsnprintf(buf, SIZE_MAX, fmt, ap);
 }
 
-spinlock_t printk_lock = SPIN_INIT;
-
 int printk(const char *fmt, ...) {
+    bool notify = false;
+
     spin_lock(&printk_lock);
 
     va_list args;
     va_start(args, fmt);
 
-    int len = vsprintf(buf, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
 
     va_end(args);
+
+    if (len < 0) {
+        spin_unlock(&printk_lock);
+        return len;
+    }
+    if ((size_t)len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+
+    if (len > 0)
+        notify = kmsg_append_record_locked(buf, (size_t)len, 6);
 
     device_t *device = device_find(DEV_TTY, 0);
     if (device)
@@ -368,22 +671,40 @@ int printk(const char *fmt, ...) {
 
     spin_unlock(&printk_lock);
 
+    if (notify && kmsg_poll_node)
+        vfs_poll_notify(kmsg_poll_node, EPOLLIN | EPOLLRDNORM | EPOLLPRI);
+
     return len;
 }
 
 int serial_fprintk(const char *fmt, ...) {
+    bool notify = false;
+
     spin_lock(&printk_lock);
 
     va_list args;
     va_start(args, fmt);
 
-    int len = vsprintf(buf, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
 
     va_end(args);
+
+    if (len < 0) {
+        spin_unlock(&printk_lock);
+        return len;
+    }
+    if ((size_t)len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+
+    if (len > 0)
+        notify = kmsg_append_record_locked(buf, (size_t)len, 6);
 
     serial_printk(buf, len);
 
     spin_unlock(&printk_lock);
+
+    if (notify && kmsg_poll_node)
+        vfs_poll_notify(kmsg_poll_node, EPOLLIN | EPOLLRDNORM | EPOLLPRI);
 
     return len;
 }
@@ -410,4 +731,56 @@ int snprintf(char *buffer, size_t capacity, const char *fmt, ...) {
     return ret;
 }
 
-uint64_t sys_syslog(int type, const char *buf, size_t len) { return len; }
+uint64_t sys_syslog(int type, const char *buf, size_t len) {
+    char *snapshot = NULL;
+    ssize_t snap_len;
+    size_t to_copy;
+
+    switch (type) {
+    case SYSLOG_ACTION_CLOSE:
+    case SYSLOG_ACTION_OPEN:
+    case SYSLOG_ACTION_CONSOLE_OFF:
+    case SYSLOG_ACTION_CONSOLE_ON:
+        return 0;
+    case SYSLOG_ACTION_CONSOLE_LEVEL:
+        return len;
+    case SYSLOG_ACTION_SIZE_UNREAD:
+        spin_lock(&printk_lock);
+        to_copy = kmsg_text_used;
+        spin_unlock(&printk_lock);
+        return to_copy;
+    case SYSLOG_ACTION_SIZE_BUFFER:
+        return logger_kmsg_buffer_size();
+    case SYSLOG_ACTION_CLEAR:
+        spin_lock(&printk_lock);
+        kmsg_record_head = 0;
+        kmsg_record_count = 0;
+        kmsg_text_head = 0;
+        kmsg_text_used = 0;
+        spin_unlock(&printk_lock);
+        return 0;
+    case SYSLOG_ACTION_READ:
+    case SYSLOG_ACTION_READ_ALL:
+    case SYSLOG_ACTION_READ_CLEAR:
+        if (len == 0)
+            return 0;
+        if (!buf)
+            return (uint64_t)-EFAULT;
+
+        snap_len = kmsg_snapshot_all(
+            &snapshot, type == SYSLOG_ACTION_READ_CLEAR ? true : false);
+        if (snap_len < 0)
+            return (uint64_t)snap_len;
+
+        to_copy = MIN((size_t)snap_len, len);
+        if (to_copy && copy_to_user((void *)buf, snapshot, to_copy)) {
+            free(snapshot);
+            return (uint64_t)-EFAULT;
+        }
+
+        free(snapshot);
+        return to_copy;
+    default:
+        return (uint64_t)-EINVAL;
+    }
+}

@@ -380,8 +380,6 @@ int smbios_init(void) {
 
     g_smbios.available = true;
 
-    printk("SMBIOS: version %u.%u table=%p size=%zu\n", g_smbios.major,
-           g_smbios.minor, g_smbios.table_start, g_smbios.table_length);
     return 0;
 }
 

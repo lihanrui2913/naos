@@ -3,6 +3,7 @@ MODULES_ROOT ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 GLOBAL_CFLAGS := -fno-stack-protector -Wno-address-of-packed-member -fPIC -fno-builtin -nostdinc -nostdlib \
                     -D_KERNEL \
                     -D_STANDALONE \
+                    -D__aether__ \
                     -I$(MODULES_ROOT)/ \
                     -I$(MODULES_ROOT)/../kernel/src \
                     -I$(MODULES_ROOT)/../kernel/src/libs/fdt \

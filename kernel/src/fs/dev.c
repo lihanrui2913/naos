@@ -1432,18 +1432,33 @@ void setup_console_symlinks() {
 
 ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
                   uint64_t flags) {
-    return 0;
+    fd_t *fd = (fd_t *)flags;
+
+    (void)data;
+    (void)offset;
+
+    return logger_kmsg_read(fd, buf, len, fd ? fd->f_flags : 0);
 }
 
-ssize_t kmsg_poll(void *dev, int events) { return tty_poll(dev, events); }
+ssize_t kmsg_poll(void *dev, int events) {
+    (void)dev;
+    return logger_kmsg_poll(events);
+}
 
 ssize_t kmsg_write(void *data, const void *buf, uint64_t offset, uint64_t len,
                    uint64_t flags) {
-    return tty_write(data, buf, offset, len, flags);
+    (void)data;
+    (void)offset;
+    (void)flags;
+    return logger_kmsg_write(buf, len);
 }
 
 ssize_t kmsg_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
-    return tty_ioctl(data, request, (void *)arg);
+    (void)data;
+    (void)request;
+    (void)arg;
+    (void)fd;
+    return -ENOTTY;
 }
 
 void devfs_nodes_init() {
