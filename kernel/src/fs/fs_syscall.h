@@ -9,6 +9,7 @@
 
 char *at_resolve_pathname(int dirfd, char *pathname);
 char *at_resolve_pathname_fullpath(int dirfd, char *pathname);
+int fsfd_mount_get_path(struct vfs_file *file, struct vfs_path *path);
 
 struct iovec {
     uint8_t *iov_base;
@@ -365,6 +366,10 @@ enum fsconfig_command {
         8, /* Create new superblock, fail if reusing existing superblock */
 #define FSCONFIG_CMD_CREATE_EXCL FSCONFIG_CMD_CREATE_EXCL
 };
+
+/* fsopen/fspick flags */
+#define FSOPEN_CLOEXEC 0x00000001
+#define FSPICK_CLOEXEC 0x00000001
 
 /* FSMOUNT flags */
 #define FSMOUNT_CLOEXEC 0x00000001
@@ -1034,7 +1039,6 @@ uint64_t sys_memfd_create(const char *name, unsigned int flags);
  * Linux contract: create a detached fs context with the new mount API.
  * Current kernel: supports the fs context features implemented by the local
  * VFS.
- * Gaps: only `O_CLOEXEC` is accepted in flags.
  */
 uint64_t sys_fsopen(const char *fsname, unsigned int flags);
 /**

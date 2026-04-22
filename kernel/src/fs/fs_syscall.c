@@ -47,15 +47,41 @@ char *at_resolve_pathname(int dirfd, char *pathname) {
             free(cwd);
             return ret;
         } else { // relative to dirfd, resolve accordingly
-            if (dirfd < 0 || dirfd >= MAX_FD_NUM ||
-                !current_task->fd_info->fds[dirfd] ||
-                !current_task->fd_info->fds[dirfd]->f_path.dentry)
+            struct vfs_file *file;
+            struct vfs_path path = {0};
+            char *dirname;
+            char *out;
+            int ret;
+
+            if (dirfd < 0 || dirfd >= MAX_FD_NUM)
+                return NULL;
+            file = task_get_file(current_task, dirfd);
+            if (!file)
                 return NULL;
 
-            char *dirname =
-                vfs_path_to_string(&current_task->fd_info->fds[dirfd]->f_path,
-                                   task_fs_root_path(current_task));
-            char *out = join_pathname(dirname, pathname);
+            ret = mountfd_get_path(file, &path);
+            if (ret == -EINVAL)
+                ret = fsfd_mount_get_path(file, &path);
+            if (ret == -EINVAL) {
+                if (!file->f_path.dentry) {
+                    vfs_file_put(file);
+                    return NULL;
+                }
+                vfs_path_get(&file->f_path);
+                path = file->f_path;
+                ret = 0;
+            }
+            vfs_file_put(file);
+            if (ret < 0)
+                return NULL;
+
+            dirname =
+                vfs_path_to_string(&path, task_fs_root_path(current_task));
+            vfs_path_put(&path);
+            if (!dirname)
+                return NULL;
+
+            out = join_pathname(dirname, pathname);
             free(dirname);
 
             return out;

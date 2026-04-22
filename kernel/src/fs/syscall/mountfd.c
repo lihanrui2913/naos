@@ -131,6 +131,9 @@ static size_t mountfd_procfs_fdinfo_render(struct vfs_file *file, char *buf,
 
 static const struct vfs_file_operations mountfdfs_dir_file_ops = {
     .llseek = mountfd_llseek,
+    .open = mountfd_open_file,
+    .release = mountfd_release,
+    .show_fdinfo = mountfd_procfs_fdinfo_render,
 };
 
 static const struct vfs_file_operations mountfdfs_file_ops = {
@@ -187,6 +190,7 @@ static int mountfdfs_get_tree(struct vfs_fs_context *fc) {
     sb->s_magic = MOUNTFDFS_MAGIC;
     sb->s_fs_info = fsi;
     sb->s_op = &mountfdfs_super_ops;
+    sb->s_type = &mountfdfs_fs_type;
 
     inode = vfs_alloc_inode(sb);
     if (!inode) {
@@ -281,10 +285,16 @@ int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
     inode->i_ino = ++fsi->next_ino;
     spin_unlock(&fsi->lock);
     inode->inode = inode->i_ino;
-    inode->i_mode = S_IFCHR | 0600;
-    inode->type = file_stream;
-    inode->i_nlink = 1;
-    inode->i_fop = &mountfdfs_file_ops;
+    /*
+     * Linux mount fds are directory-like handles to a mount root and can be
+     * reused as dirfds (for example openat(mfd, ".", O_DIRECTORY)). Model
+     * them as directories so generic dirfd checks don't spuriously fail with
+     * ENOTDIR.
+     */
+    inode->i_mode = S_IFDIR | 0500;
+    inode->type = file_dir;
+    inode->i_nlink = 2;
+    inode->i_fop = &mountfdfs_dir_file_ops;
     inode->i_private = ctx;
 
     snprintf(namebuf, sizeof(namebuf), "mountfd-%llu",

@@ -1,5 +1,6 @@
 #include "fs/vfs/vfs_internal.h"
 #include "task/task.h"
+#include <fs/fs_syscall.h>
 
 static inline bool vfs_path_is_absolute(const char *name) {
     return name && name[0] == '/';
@@ -99,6 +100,8 @@ static int vfs_get_scoped_start(struct vfs_process_fs *fs,
         return -EBADF;
 
     ret = mountfd_get_path(file, scoped);
+    if (ret == -EINVAL)
+        ret = fsfd_mount_get_path(file, scoped);
     if (ret == -EINVAL) {
         vfs_path_get(&file->f_path);
         *scoped = file->f_path;
@@ -225,6 +228,8 @@ static int vfs_get_fs_start(int dfd, const char *name,
         goto err;
 
     fd_path_ret = mountfd_get_path(file, start);
+    if (fd_path_ret == -EINVAL)
+        fd_path_ret = fsfd_mount_get_path(file, start);
     if (fd_path_ret == -EINVAL) {
         vfs_path_get(&file->f_path);
         *start = file->f_path;

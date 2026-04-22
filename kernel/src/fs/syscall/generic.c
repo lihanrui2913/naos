@@ -419,6 +419,8 @@ static int generic_get_fd_path(int fd, struct vfs_path *path) {
         return -EBADF;
 
     ret = mountfd_get_path(file, path);
+    if (ret == -EINVAL)
+        ret = fsfd_mount_get_path(file, path);
     if (ret == -EINVAL) {
         path->mnt = file->f_path.mnt;
         path->dentry = file->f_path.dentry;

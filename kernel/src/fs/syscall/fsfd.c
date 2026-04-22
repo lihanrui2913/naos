@@ -94,6 +94,22 @@ static inline mount_handle_t *fsfd_file_mount(struct vfs_file *file) {
     return (mount_handle_t *)obj;
 }
 
+int fsfd_mount_get_path(struct vfs_file *file, struct vfs_path *path) {
+    mount_handle_t *mnt;
+
+    if (!path)
+        return -EINVAL;
+
+    mnt = fsfd_file_mount(file);
+    if (!mnt || !mnt->mnt || !mnt->mnt->mnt_root)
+        return -EINVAL;
+
+    memset(path, 0, sizeof(*path));
+    path->mnt = vfs_mntget(mnt->mnt);
+    path->dentry = vfs_dget(mnt->mnt->mnt_root);
+    return 0;
+}
+
 static struct vfs_inode *fsfdfs_alloc_inode(struct vfs_super_block *sb) {
     fsfdfs_inode_info_t *info = calloc(1, sizeof(*info));
 
@@ -615,7 +631,7 @@ uint64_t sys_fsopen(const char *fsname_user, unsigned int flags) {
     char fsname[256];
     int ret;
 
-    if (flags & ~O_CLOEXEC)
+    if (flags & ~FSOPEN_CLOEXEC)
         return (uint64_t)-EINVAL;
     if (copy_from_user_str(fsname, fsname_user, sizeof(fsname)))
         return (uint64_t)-EFAULT;
@@ -639,7 +655,7 @@ uint64_t sys_fsopen(const char *fsname_user, unsigned int flags) {
     }
 
     ret = task_install_file(current_task, file,
-                            (flags & O_CLOEXEC) ? FD_CLOEXEC : 0, 0);
+                            (flags & FSOPEN_CLOEXEC) ? FD_CLOEXEC : 0, 0);
     vfs_file_put(file);
     return (uint64_t)ret;
 }
@@ -989,7 +1005,7 @@ uint64_t sys_move_mount(int from_dfd, const char *from_pathname_user,
     }
 
     if (!to_path.dentry || !to_path.dentry->d_inode ||
-        !(to_path.dentry->d_inode->type & file_dir)) {
+        !S_ISDIR(to_path.dentry->d_inode->i_mode)) {
         ret = -ENOTDIR;
         goto out;
     }
