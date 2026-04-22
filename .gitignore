@@ -2,7 +2,6 @@
 /.zed
 /.claude
 /.codex
-/firmware
 /kernel-deps
 /assets
 /modules-*

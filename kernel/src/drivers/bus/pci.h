@@ -31,6 +31,7 @@ typedef struct {
     uint64_t address;
     uint64_t size;
     bool mmio;
+    bool prefetchable;
 } pci_bar_t;
 
 /**

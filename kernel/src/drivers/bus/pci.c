@@ -635,6 +635,7 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                 pci_device->bars[i].size = 0;
                 pci_device->bars[i].address = 0;
                 pci_device->bars[i].mmio = false;
+                pci_device->bars[i].prefetchable = false;
                 continue;
             }
 
@@ -642,6 +643,7 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                 // I/O Space BAR
                 pci_device->bars[i].address = bar & 0xFFFFFFFC;
                 pci_device->bars[i].mmio = false;
+                pci_device->bars[i].prefetchable = false;
 
                 // Probe size
                 op->write32(bus, device, function, segment, offset, 0xFFFFFFFF);
@@ -674,6 +676,7 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                     pci_device->bars[i].address = base;
                     pci_device->bars[i].size = size;
                     pci_device->bars[i].mmio = true;
+                    pci_device->bars[i].prefetchable = prefetchable;
                 } else if (mem_type == 0x02) {
                     // 64-bit Memory BAR
                     if (i >= 5) {
@@ -715,6 +718,7 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                     pci_device->bars[i].address = base;
                     pci_device->bars[i].size = size;
                     pci_device->bars[i].mmio = true;
+                    pci_device->bars[i].prefetchable = prefetchable;
 
                     // 64位BAR占用两个槽位
                     i++;
@@ -722,6 +726,7 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                         pci_device->bars[i].address = 0;
                         pci_device->bars[i].size = 0;
                         pci_device->bars[i].mmio = true;
+                        pci_device->bars[i].prefetchable = prefetchable;
                     }
                 }
             }
@@ -910,6 +915,10 @@ void pci_init() {
     for (uint64_t i = 0; i < pci_device_number; i++) {
         pci_device_t *device = pci_devices[i];
 
+        if (!device || device->desc) {
+            continue;
+        }
+
         for (uint64_t d = 0; d < MAX_PCI_DRIVERS; d++) {
             if (!pci_drivers[d]) {
                 continue;
@@ -929,6 +938,11 @@ void pci_init() {
                 if (ret < 0) {
                     printk("PCI driver %s probe failed!!!\n",
                            pci_drivers[d]->name);
+                    continue;
+                }
+
+                if (ret == 0) {
+                    break;
                 }
             }
         }
@@ -938,14 +952,21 @@ void pci_init() {
 pci_driver_t *pci_drivers[MAX_PCI_DRIVERS] = {NULL};
 
 int regist_pci_driver(pci_driver_t *driver) {
+    if (!driver) {
+        return -EINVAL;
+    }
+
     for (int i = 0; i < MAX_PCI_DRIVERS; i++) {
+        if (pci_drivers[i] == driver) {
+            return 0;
+        }
         if (!pci_drivers[i]) {
             pci_drivers[i] = driver;
-            break;
+            return 0;
         }
     }
 
-    return 0;
+    return -ENOSPC;
 }
 
 pci_driver_t *pci_get_current_probe_driver(void) {
