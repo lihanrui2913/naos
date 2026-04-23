@@ -3,6 +3,8 @@
 
 typedef struct naos_lwip_link {
     netdev_t *netdev;
+    bool netdev_ref_held;
+    bool stopping;
     bool use_static_ipv4;
     ip4_addr_t static_ipaddr;
     ip4_addr_t static_netmask;
@@ -148,8 +150,13 @@ static void naos_lwip_netdev_event(netdev_t *dev, uint32_t events, void *ctx) {
     if (!dev || !link || link->netdev != dev) {
         return;
     }
+    if (events & NETDEV_EVENT_UNREGISTERING) {
+        link->stopping = true;
+        netdev_unregister_listener(dev, naos_lwip_netdev_event, link);
+    }
     if (!(events & (NETDEV_EVENT_ADMIN_UP | NETDEV_EVENT_ADMIN_DOWN |
-                    NETDEV_EVENT_LINK_UP | NETDEV_EVENT_LINK_DOWN))) {
+                    NETDEV_EVENT_LINK_UP | NETDEV_EVENT_LINK_DOWN |
+                    NETDEV_EVENT_UNREGISTERING))) {
         return;
     }
 
@@ -162,7 +169,7 @@ static err_t naos_lwip_linkoutput(struct netif *netif, struct pbuf *p) {
     size_t copied = 0;
     struct pbuf *q = NULL;
 
-    if (!link || !link->netdev || !p) {
+    if (!link || !link->netdev || link->stopping || !p) {
         return ERR_IF;
     }
 
@@ -255,8 +262,15 @@ static void naos_lwip_rx_thread(uint64_t arg) {
     for (;;) {
         arch_enable_interrupt();
 
+        if (link->stopping || !link->netdev) {
+            break;
+        }
+
         int len = netdev_recv(link->netdev, buffer, max_len);
         if (len <= 0) {
+            if (len == -ENODEV || link->stopping) {
+                break;
+            }
             schedule(SCHED_FLAG_YIELD);
             continue;
         }
@@ -275,6 +289,13 @@ static void naos_lwip_rx_thread(uint64_t arg) {
             pbuf_free(p);
         }
     }
+
+    if (link->netdev_ref_held && link->netdev) {
+        netdev_put(link->netdev);
+        link->netdev_ref_held = false;
+    }
+    link->netdev = NULL;
+    task_exit_thread(0);
 }
 
 int lwip_module_init() {
@@ -309,6 +330,10 @@ int lwip_module_init() {
     memset(&naos_link, 0, sizeof(naos_link));
     memset(&naos_lwip_netif, 0, sizeof(naos_lwip_netif));
     naos_link.netdev = netdev;
+    if (!netdev_get(netdev)) {
+        return -ENODEV;
+    }
+    naos_link.netdev_ref_held = true;
 
     ip4_addr_set_zero(&ipaddr);
     ip4_addr_set_zero(&netmask);
@@ -316,6 +341,9 @@ int lwip_module_init() {
 
     if (netifapi_netif_add(&naos_lwip_netif, &ipaddr, &netmask, &gw, &naos_link,
                            naos_lwip_netif_init, tcpip_input) != ERR_OK) {
+        netdev_put(netdev);
+        naos_link.netdev_ref_held = false;
+        naos_link.netdev = NULL;
         return -EIO;
     }
 
@@ -324,7 +352,13 @@ int lwip_module_init() {
 #endif
 
     netifapi_netif_set_default(&naos_lwip_netif);
-    netdev_register_listener(netdev, naos_lwip_netdev_event, &naos_link);
+    if (netdev_register_listener(netdev, naos_lwip_netdev_event, &naos_link) !=
+        0) {
+        netdev_put(netdev);
+        naos_link.netdev_ref_held = false;
+        naos_link.netdev = NULL;
+        return -EIO;
+    }
     naos_lwip_queue_link_state_update(&naos_link);
 
     task_create("lwip-rx", naos_lwip_rx_thread, (uint64_t)&naos_link,

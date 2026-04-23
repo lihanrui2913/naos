@@ -25,6 +25,8 @@ enum netdev_event {
     NETDEV_EVENT_LINK_UP = 1U << 3,
     NETDEV_EVENT_LINK_DOWN = 1U << 4,
     NETDEV_EVENT_CONFIG_CHANGED = 1U << 5,
+    NETDEV_EVENT_UNREGISTERING = 1U << 6,
+    NETDEV_EVENT_UNREGISTERED = 1U << 7,
 };
 
 typedef struct netdev_listener {
@@ -42,8 +44,10 @@ typedef struct netdev {
     uint32_t mtu;
     uint32_t id;
     uint32_t type;
+    uint32_t refcount;
     bool admin_up;
     bool link_up;
+    bool unregistering;
     void *desc;
     netdev_send_t send;
     netdev_recv_t recv;
@@ -63,8 +67,11 @@ netdev_t *netdev_get_by_name(const char *name);
 int netdev_set_name(netdev_t *dev, const char *name);
 int netdev_set_link_state(netdev_t *dev, bool link_up);
 int netdev_set_admin_state(netdev_t *dev, bool admin_up);
+int netdev_unregister(netdev_t *dev);
 bool netdev_link_is_up(const netdev_t *dev);
 bool netdev_admin_is_up(const netdev_t *dev);
+bool netdev_get(netdev_t *dev);
+void netdev_put(netdev_t *dev);
 
 int netdev_register_listener(netdev_t *dev, netdev_event_cb_t cb, void *ctx);
 void netdev_unregister_listener(netdev_t *dev, netdev_event_cb_t cb, void *ctx);

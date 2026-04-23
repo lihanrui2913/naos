@@ -977,6 +977,7 @@ int xhci_submit_xfer(usb_xfer_t *xfer) {
     int timeout_ms;
     int datalen;
     int dir;
+    int actual = 0;
     const void *cmd;
     void *data;
 
@@ -1010,8 +1011,11 @@ int xhci_submit_xfer(usb_xfer_t *xfer) {
     }
 
     if (cmd) {
+        // TODO
         const usb_ctrl_request_t *req = cmd;
-        if (req->bRequest == USB_REQ_SET_ADDRESS) {
+        if (req->bRequestType ==
+                (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE) &&
+            req->bRequest == USB_REQ_SET_ADDRESS) {
             if (xfer->flags & USB_XFER_ASYNC) {
                 pipe->async_active = false;
                 pipe->async_cb = NULL;
@@ -1020,6 +1024,8 @@ int xhci_submit_xfer(usb_xfer_t *xfer) {
                 pipe->async_len = 0;
                 pipe->async_dir = 0;
             }
+            if (xfer->actual_length_out)
+                *xfer->actual_length_out = 0;
             return 0;
         }
         xhci_xfer_setup(pipe, dir, (void *)cmd, data, datalen, 0);
@@ -1035,8 +1041,11 @@ int xhci_submit_xfer(usb_xfer_t *xfer) {
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET)
         return -1;
 
+    actual = xhci_actual_length(pipe, datalen);
+    if (xfer->actual_length_out)
+        *xfer->actual_length_out = actual;
+
     if (dir && data) {
-        int actual = xhci_actual_length(pipe, datalen);
         if (actual > 0)
             dma_sync_device_to_cpu(data, actual);
     }
@@ -1191,7 +1200,7 @@ static int xhci_start_controller(usb_xhci_t *xhci) {
     //         desc.pci.msi_attribute.can_mask = false;
     //         desc.pci.msi_attribute.is_64 = true;
     //         desc.pci.msi_attribute.is_msix = true;
-    //         if (pci_enable_msi(&desc)) {
+    //         if (msi_enable(&desc)) {
     //             if (i == 0) {
     //                 printk("XHCI use polling mode\n");
     //                 xhci->event_task =

@@ -1,18 +1,15 @@
 all:
 ifeq ($(ARCH), x86_64)
-	$(MAKE) -C e1000
-ifneq ($(BUILD_NVIDIA), 0)
-	$(MAKE) -C nvidia_open
-endif
+	$(Q)$(MAKE) -C e1000
 endif
 
-	$(MAKE) -C sound
+	$(Q)$(MAKE) -C sound
 
-	$(MAKE) -C nvme
+	$(Q)$(MAKE) -C nvme
 
-	$(MAKE) -C usb
-	$(MAKE) -C virtio
+	$(Q)$(MAKE) -C usb
+	$(Q)$(MAKE) -C virtio
 
-	$(MAKE) -C hub
-	$(MAKE) -C hid
-	$(MAKE) -C msc
+	$(Q)$(MAKE) -C hub
+	$(Q)$(MAKE) -C hid
+	$(Q)$(MAKE) -C msc

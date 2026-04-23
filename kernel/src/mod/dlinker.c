@@ -28,7 +28,15 @@ static void *find_symbol_address(const char *symbol_name, Elf64_Ehdr *ehdr,
 static bool get_elf_symbol_table(Elf64_Ehdr *ehdr, Elf64_Sym **symtab,
                                  char **strtab, size_t *num_symbols);
 static bool elf_symbol_is_exported(const Elf64_Sym *sym);
+static bool elf_symbol_can_describe_ip(const Elf64_Sym *sym);
+static bool module_symbol_can_describe_ip(const module_symbol_t *sym);
 static inline uint64_t dlinker_call_ifunc_resolver(uint64_t resolver_addr);
+static bool update_symbol_lookup_result(symbol_lookup_result_t *result,
+                                        const char *name,
+                                        const char *module_name,
+                                        uint64_t symbol_addr,
+                                        uint64_t symbol_size, bool is_module,
+                                        bool exact_match);
 
 typedef struct {
     const char **exports;
@@ -221,6 +229,10 @@ static void *lookup_kernel_symbol_by_name(const char *name) {
 
 static module_symbol_t *find_module_symbol(const char *name) {
     for (size_t i = 0; i < loaded_module_symbol_count; i++) {
+        if (!loaded_module_symbols[i].exported) {
+            continue;
+        }
+
         if (strcmp(loaded_module_symbols[i].name, name) == 0) {
             return &loaded_module_symbols[i];
         }
@@ -252,22 +264,23 @@ static bool ensure_module_symbol_capacity(size_t wanted) {
 }
 
 static bool register_module_symbol(const char *module_name, const char *name,
-                                   uint64_t addr) {
+                                   uint64_t addr, uint64_t size, uint8_t type,
+                                   bool exported) {
     if (name == NULL || *name == '\0') {
         return true;
     }
 
-    if (!strcmp(name, "dlmain")) {
+    if (exported && !strcmp(name, "dlmain")) {
         return true;
     }
 
-    if (find_module_symbol(name) != NULL) {
+    if (exported && find_module_symbol(name) != NULL) {
         serial_fprintk("Skipping duplicate module symbol %s from %s\n", name,
                        module_name);
         return true;
     }
 
-    if (lookup_kernel_symbol_by_name(name) != NULL) {
+    if (exported && lookup_kernel_symbol_by_name(name) != NULL) {
         serial_fprintk(
             "Skipping module symbol %s from %s due to kernel conflict\n", name,
             module_name);
@@ -285,8 +298,21 @@ static bool register_module_symbol(const char *module_name, const char *name,
         return false;
     }
 
+    char *dup_module_name = strdup(module_name ? module_name : "<module>");
+    if (dup_module_name == NULL) {
+        serial_fprintk("Cannot duplicate module name %s for symbol %s\n",
+                       module_name ? module_name : "<module>", name);
+        free(dup_name);
+        return false;
+    }
+
+    loaded_module_symbols[loaded_module_symbol_count].module_name =
+        dup_module_name;
     loaded_module_symbols[loaded_module_symbol_count].name = dup_name;
     loaded_module_symbols[loaded_module_symbol_count].addr = addr;
+    loaded_module_symbols[loaded_module_symbol_count].size = size;
+    loaded_module_symbols[loaded_module_symbol_count].type = type;
+    loaded_module_symbols[loaded_module_symbol_count].exported = exported;
     loaded_module_symbol_count++;
     return true;
 }
@@ -459,6 +485,63 @@ static bool elf_symbol_is_imported(const Elf64_Sym *sym) {
     return bind == STB_GLOBAL || bind == STB_WEAK;
 }
 
+static bool elf_symbol_can_describe_ip(const Elf64_Sym *sym) {
+    if (sym == NULL || sym->st_name == 0 || sym->st_shndx == SHN_UNDEF ||
+        sym->st_value == 0) {
+        return false;
+    }
+
+    uint8_t type = ELF64_ST_TYPE(sym->st_info);
+    return type == STT_FUNC || type == STT_NOTYPE;
+}
+
+static bool module_symbol_can_describe_ip(const module_symbol_t *sym) {
+    if (sym == NULL || sym->name == NULL || sym->addr == 0) {
+        return false;
+    }
+
+    return sym->type == STT_FUNC || sym->type == STT_NOTYPE;
+}
+
+static bool update_symbol_lookup_result(symbol_lookup_result_t *result,
+                                        const char *name,
+                                        const char *module_name,
+                                        uint64_t symbol_addr,
+                                        uint64_t symbol_size, bool is_module,
+                                        bool exact_match) {
+    if (result == NULL || name == NULL || *name == '\0') {
+        return false;
+    }
+
+    if (result->name != NULL) {
+        if (exact_match != result->exact_match) {
+            if (!exact_match) {
+                return false;
+            }
+        } else if (symbol_addr < result->symbol_addr) {
+            return false;
+        } else if (symbol_addr == result->symbol_addr) {
+            if (exact_match) {
+                if (result->symbol_size != 0 &&
+                    (symbol_size == 0 || symbol_size >= result->symbol_size)) {
+                    return false;
+                }
+            } else if (symbol_size <= result->symbol_size) {
+                return false;
+            }
+        }
+    }
+
+    result->name = name;
+    result->module_name = module_name;
+    result->symbol_addr = symbol_addr;
+    result->symbol_size = symbol_size;
+    result->offset = 0;
+    result->is_module = is_module;
+    result->exact_match = exact_match;
+    return true;
+}
+
 static void register_module_symbols(module_t *module, Elf64_Ehdr *ehdr,
                                     uint64_t offset) {
     Elf64_Sym *symtab = NULL;
@@ -473,14 +556,16 @@ static void register_module_symbols(module_t *module, Elf64_Ehdr *ehdr,
 
     for (size_t i = 0; i < num_symbols; i++) {
         Elf64_Sym *sym = &symtab[i];
-        if (!elf_symbol_is_exported(sym)) {
+        bool exported = elf_symbol_is_exported(sym);
+        if (!exported && !elf_symbol_can_describe_ip(sym)) {
             continue;
         }
 
         uint64_t addr =
             sym->st_shndx == SHN_ABS ? sym->st_value : offset + sym->st_value;
-        register_module_symbol(module->module_name, &strtab[sym->st_name],
-                               addr);
+        register_module_symbol(module->module_name, &strtab[sym->st_name], addr,
+                               sym->st_size, ELF64_ST_TYPE(sym->st_info),
+                               exported);
     }
 }
 
@@ -978,6 +1063,77 @@ dlfunc_t *find_func(const char *name) {
     }
 
     return NULL;
+}
+
+static bool lookup_module_symbol_by_addr(uint64_t addr,
+                                         symbol_lookup_result_t *result) {
+    bool found = false;
+
+    for (size_t i = 0; i < loaded_module_symbol_count; i++) {
+        module_symbol_t *sym = &loaded_module_symbols[i];
+        if (!module_symbol_can_describe_ip(sym)) {
+            continue;
+        }
+
+        if (addr < sym->addr) {
+            continue;
+        }
+
+        bool exact_match = sym->size != 0 && addr - sym->addr < sym->size;
+        if (update_symbol_lookup_result(result, sym->name, sym->module_name,
+                                        sym->addr, sym->size, true,
+                                        exact_match)) {
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+static bool lookup_kernel_symbol_by_addr(uint64_t addr,
+                                         symbol_lookup_result_t *result) {
+    if (!init_kernel_symbol_table()) {
+        return false;
+    }
+
+    bool found = false;
+
+    for (size_t i = 0; i < kernel_symbol_table.num_symbols; i++) {
+        Elf64_Sym *sym = &kernel_symbol_table.symtab[i];
+        if (!elf_symbol_can_describe_ip(sym) || addr < sym->st_value) {
+            continue;
+        }
+
+        const char *symbol_name = &kernel_symbol_table.strtab[sym->st_name];
+        bool exact_match =
+            sym->st_size != 0 && addr - sym->st_value < sym->st_size;
+
+        if (update_symbol_lookup_result(result, symbol_name, NULL,
+                                        sym->st_value, sym->st_size, false,
+                                        exact_match)) {
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+bool dlinker_lookup_symbol_by_addr(uint64_t addr,
+                                   symbol_lookup_result_t *result) {
+    if (result == NULL) {
+        return false;
+    }
+
+    memset(result, 0, sizeof(*result));
+
+    bool found_module = lookup_module_symbol_by_addr(addr, result);
+    bool found_kernel = lookup_kernel_symbol_by_addr(addr, result);
+
+    if (result->name != NULL) {
+        result->offset = addr - result->symbol_addr;
+    }
+
+    return found_module || found_kernel;
 }
 
 void dlinker_init() {

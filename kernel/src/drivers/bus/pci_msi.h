@@ -92,4 +92,4 @@ struct msi_desc_t {
  *
  * @return 返回码
  */
-int pci_enable_msi(struct msi_desc_t *msi_desc);
+int msi_enable(struct msi_desc_t *msi_desc);

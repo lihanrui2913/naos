@@ -132,7 +132,34 @@ void irq_init() {
 }
 
 int lookup_kallsyms(uint64_t addr, int level) {
-    printk("function:<unknown>() \t(+) 0000 address:%#018lx\n", addr);
+    symbol_lookup_result_t symbol = {0};
+
+    if (!dlinker_lookup_symbol_by_addr(addr, &symbol) || symbol.name == NULL) {
+        printk("#%02d <unknown> address:%#018lx\n", level, addr);
+        return 0;
+    }
+
+    if (symbol.is_module) {
+        if (symbol.symbol_size != 0) {
+            printk("#%02d %s+%#lx/%#lx [%s] address:%#018lx%s\n", level,
+                   symbol.name, symbol.offset, symbol.symbol_size,
+                   symbol.module_name ? symbol.module_name : "<module>", addr,
+                   symbol.exact_match ? "" : " (nearest)");
+        } else {
+            printk("#%02d %s+%#lx [%s] address:%#018lx%s\n", level, symbol.name,
+                   symbol.offset,
+                   symbol.module_name ? symbol.module_name : "<module>", addr,
+                   symbol.exact_match ? "" : " (nearest)");
+        }
+    } else if (symbol.symbol_size != 0) {
+        printk("#%02d %s+%#lx/%#lx [kernel] address:%#018lx%s\n", level,
+               symbol.name, symbol.offset, symbol.symbol_size, addr,
+               symbol.exact_match ? "" : " (nearest)");
+    } else {
+        printk("#%02d %s+%#lx [kernel] address:%#018lx%s\n", level, symbol.name,
+               symbol.offset, addr, symbol.exact_match ? "" : " (nearest)");
+    }
+
     return 0;
 }
 

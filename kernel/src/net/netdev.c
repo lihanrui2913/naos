@@ -1,7 +1,9 @@
 #include <net/netdev.h>
 #include <mm/mm.h>
+#include <task/task.h>
 
 netdev_t *netdevs[MAX_NETDEV_NUM] = {NULL};
+static spinlock_t netdevs_lock = SPIN_INIT;
 
 static void netdev_default_name(char *name, uint32_t type, uint32_t id) {
     if (!name) {
@@ -21,6 +23,7 @@ netdev_t *netdev_register(const char *name, uint32_t type, void *desc,
                           netdev_recv_t recv) {
     netdev_t *dev = NULL;
 
+    spin_lock(&netdevs_lock);
     for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
         if (netdevs[i] != NULL) {
             continue;
@@ -38,6 +41,7 @@ netdev_t *netdev_register(const char *name, uint32_t type, void *desc,
         dev->send = send;
         dev->recv = recv;
         dev->lock = SPIN_INIT;
+        dev->refcount = 1;
 
         if (name && name[0] != '\0') {
             strncpy(dev->name, name, NETDEV_NAME_LEN - 1);
@@ -58,9 +62,11 @@ netdev_t *netdev_register(const char *name, uint32_t type, void *desc,
         }
 
         netdevs[i] = dev;
+        spin_unlock(&netdevs_lock);
         netdev_notify(dev, NETDEV_EVENT_REGISTERED);
         return dev;
     }
+    spin_unlock(&netdevs_lock);
 
     return NULL;
 }
@@ -71,18 +77,35 @@ void regist_netdev(void *desc, uint8_t *mac, uint32_t mtu, netdev_send_t send,
                           recv);
 }
 
-netdev_t *get_default_netdev() { return netdevs[0]; }
+netdev_t *get_default_netdev() {
+    netdev_t *dev = NULL;
+
+    spin_lock(&netdevs_lock);
+    for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
+        if (netdevs[i] && !netdevs[i]->unregistering) {
+            dev = netdevs[i];
+            break;
+        }
+    }
+    spin_unlock(&netdevs_lock);
+
+    return dev;
+}
 
 netdev_t *netdev_get_by_name(const char *name) {
     if (!name) {
         return NULL;
     }
 
+    spin_lock(&netdevs_lock);
     for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
-        if (netdevs[i] && strcmp(netdevs[i]->name, name) == 0) {
+        if (netdevs[i] && !netdevs[i]->unregistering &&
+            strcmp(netdevs[i]->name, name) == 0) {
+            spin_unlock(&netdevs_lock);
             return netdevs[i];
         }
     }
+    spin_unlock(&netdevs_lock);
 
     return NULL;
 }
@@ -93,6 +116,10 @@ int netdev_set_name(netdev_t *dev, const char *name) {
     }
 
     spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
     strncpy(dev->name, name, NETDEV_NAME_LEN - 1);
     dev->name[NETDEV_NAME_LEN - 1] = '\0';
     spin_unlock(&dev->lock);
@@ -109,6 +136,10 @@ int netdev_set_link_state(netdev_t *dev, bool link_up) {
     }
 
     spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
     changed = dev->link_up != link_up;
     dev->link_up = link_up;
     spin_unlock(&dev->lock);
@@ -129,6 +160,10 @@ int netdev_set_admin_state(netdev_t *dev, bool admin_up) {
     }
 
     spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
     changed = dev->admin_up != admin_up;
     dev->admin_up = admin_up;
     spin_unlock(&dev->lock);
@@ -149,12 +184,104 @@ bool netdev_admin_is_up(const netdev_t *dev) {
     return dev ? dev->admin_up : false;
 }
 
+bool netdev_get(netdev_t *dev) {
+    if (!dev) {
+        return false;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return false;
+    }
+    dev->refcount++;
+    spin_unlock(&dev->lock);
+
+    return true;
+}
+
+void netdev_put(netdev_t *dev) {
+    bool release = false;
+
+    if (!dev) {
+        return;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->refcount > 0) {
+        dev->refcount--;
+    }
+    release = dev->unregistering && dev->refcount == 0;
+    spin_unlock(&dev->lock);
+
+    if (release) {
+        free(dev);
+    }
+}
+
+int netdev_unregister(netdev_t *dev) {
+    uint32_t slot = UINT32_MAX;
+
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&netdevs_lock);
+    for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
+        if (netdevs[i] == dev) {
+            slot = i;
+            netdevs[i] = NULL;
+            break;
+        }
+    }
+    spin_unlock(&netdevs_lock);
+
+    if (slot == UINT32_MAX) {
+        return -ENOENT;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return 0;
+    }
+    dev->unregistering = true;
+    dev->link_up = false;
+    dev->admin_up = false;
+    spin_unlock(&dev->lock);
+
+    netdev_notify(dev, NETDEV_EVENT_LINK_DOWN | NETDEV_EVENT_ADMIN_DOWN |
+                           NETDEV_EVENT_UNREGISTERING);
+
+    for (;;) {
+        uint32_t refs = 0;
+
+        spin_lock(&dev->lock);
+        refs = dev->refcount;
+        spin_unlock(&dev->lock);
+
+        if (refs <= 1) {
+            break;
+        }
+
+        schedule(SCHED_FLAG_YIELD);
+    }
+
+    netdev_notify(dev, NETDEV_EVENT_UNREGISTERED);
+    netdev_put(dev);
+    return 0;
+}
+
 int netdev_register_listener(netdev_t *dev, netdev_event_cb_t cb, void *ctx) {
     if (!dev || !cb) {
         return -EINVAL;
     }
 
     spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
     for (uint32_t i = 0; i < NETDEV_MAX_EVENT_LISTENERS; i++) {
         if (dev->listeners[i].cb == NULL) {
             dev->listeners[i].cb = cb;
@@ -207,23 +334,35 @@ int netdev_send(netdev_t *dev, void *data, uint32_t len) {
     if (dev == NULL || data == NULL) {
         return -EINVAL;
     }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
 
     if (len == 0) {
+        netdev_put(dev);
         return 0;
     }
-    return dev->send(dev->desc, data, len);
+
+    int ret = dev->send(dev->desc, data, len);
+    netdev_put(dev);
+    return ret;
 }
 
 int netdev_recv(netdev_t *dev, void *data, uint32_t len) {
     if (dev == NULL || data == NULL) {
         return -EINVAL;
     }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
 
     if (len == 0) {
+        netdev_put(dev);
         return 0;
     }
 
     int ret = dev->recv(dev->desc, data, len);
 
+    netdev_put(dev);
     return ret;
 }

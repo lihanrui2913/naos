@@ -4,7 +4,6 @@ NAOS_BUILD_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 PROJECT_ROOT ?= $(abspath $(NAOS_BUILD_DIR)/..)
 BUILD_MODE ?= debug
-BUILD_NVIDIA ?= 0
 ARCH ?= x86_64
 ROOT_DIR ?= "$(PROJECT_ROOT)"
 
@@ -92,5 +91,5 @@ define PRINT_STEP
 endef
 endif
 
-export PROJECT_ROOT BUILD_MODE BUILD_NVIDIA
+export PROJECT_ROOT BUILD_MODE
 export ARCH ROOT_DIR CC CXX LD NM OBJCOPY CC_IS_CLANG V Q

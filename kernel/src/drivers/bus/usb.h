@@ -138,8 +138,6 @@ struct usb_bus_notifier_ops {
 
 #define USB_MAXADDR 127
 
-#define USB_CNTL_FLAG_NATIVE_ADDR (1U << 0)
-
 /****************************************************************
  * usb structs and flags
  ****************************************************************/
@@ -373,6 +371,7 @@ struct usb_xfer {
     uint64_t timeout_ns;
     usb_xfer_cb cb;
     void *user_data;
+    int *actual_length_out;
     uint32_t flags;
 };
 
@@ -540,5 +539,6 @@ struct usb_driver {
  * Register a USB function driver with the USB core.
  */
 void regist_usb_driver(usb_driver_t *driver);
+void unregist_usb_driver(usb_driver_t *driver);
 usb_driver_t *usb_get_current_probe_driver(void);
 usb_driver_t *usb_get_current_remove_driver(void);

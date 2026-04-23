@@ -5,9 +5,6 @@ export ROOTFS_SYSROOT = $(CWD)/rootfs-$(ARCH)
 all:
 	sh build_initramfs.sh
 ifeq ($(ARCH), x86_64)
-ifneq ($(BUILD_NVIDIA), 0)
-	sh get_nvidia_firmware.sh
-endif
 endif
 	sh build_rootfs.sh
 

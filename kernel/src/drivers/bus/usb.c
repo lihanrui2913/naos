@@ -902,6 +902,18 @@ void regist_usb_driver(usb_driver_t *driver) {
     }
 }
 
+void unregist_usb_driver(usb_driver_t *driver) {
+    if (!driver)
+        return;
+
+    for (int i = 0; i < MAX_USBDEV_NUM; i++) {
+        if (usb_drivers[i] == driver) {
+            usb_drivers[i] = NULL;
+            return;
+        }
+    }
+}
+
 void usb_register_bus_notifier(usb_bus_notifier_ops_t *ops) {
     spin_lock(&usb_notifier_lock);
     usb_bus_notifier = ops;

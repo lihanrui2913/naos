@@ -121,7 +121,7 @@ static inline void __msix_clear_entry(pci_device_t *pci_dev,
     entry_ptr[1] = 0;
 }
 
-int pci_enable_msi(struct msi_desc_t *msi_desc) {
+int msi_enable(struct msi_desc_t *msi_desc) {
     pci_device_t *ptr;
     uint32_t cap_ptr;
     uint16_t command;
