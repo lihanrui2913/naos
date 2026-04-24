@@ -8,6 +8,7 @@
 #include <fs/proc.h>
 #include <task/task.h>
 #include <net/netlink.h>
+#include <net/netdev.h>
 #include <libs/hashmap.h>
 #include <libs/strerror.h>
 #include <init/callbacks.h>
@@ -41,6 +42,22 @@ typedef struct unix_socket_bind_bucket {
     uint64_t hash;
     socket_t *head;
 } unix_socket_bind_bucket_t;
+
+#define SIOCGIFINDEX 0x8933
+
+typedef struct naos_ifreq {
+    char ifr_name[IFNAMSIZ];
+    union {
+        short ifru_flags;
+        int ifru_ifindex;
+        int ifru_metric;
+        int ifru_mtu;
+        char ifru_slave[IFNAMSIZ];
+        char ifru_newname[IFNAMSIZ];
+        char ifru_pad[24];
+        void *ifru_data;
+    } ifr_ifru;
+} naos_ifreq_t;
 
 static inline void socket_notify_sock(socket_t *sock, uint32_t events);
 static inline void unix_socket_snapshot_peer_cred(socket_t *sock,
@@ -2550,7 +2567,29 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
 
     socket_t *sock = handler->sock;
 
-    switch (cmd) {
+    switch (cmd & 0xFFFFFFFF) {
+    case SIOCGIFINDEX:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            req.ifr_name[IFNAMSIZ - 1] = '\0';
+            dev = netdev_get_by_name(req.ifr_name);
+            if (!dev)
+                return -ENODEV;
+
+            req.ifr_ifru.ifru_ifindex = (int)(dev->id + 1);
+            netdev_put(dev);
+
+            if (copy_to_user((void *)arg, &req, sizeof(req)))
+                return -EFAULT;
+            return 0;
+        }
     case FIONREAD:
         if (!arg)
             return -EFAULT;
@@ -2567,6 +2606,7 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
     case FIONBIO:
         return 0;
     default:
+        printk("Unsupported unix socket ioctl cmd = %#010x\n", cmd);
         return -ENOTTY;
     }
 }

@@ -4,6 +4,48 @@
 
 #define FIONBIO_INTERNAL_DISABLE ((ssize_t) - 1)
 #define FIONBIO_INTERNAL_ENABLE ((ssize_t) - 2)
+#define SIOCGIFINDEX 0x8933
+#define SIOCGIWNAME 0x8B01
+#define SIOCGIWMODE 0x8B07
+#define SIOCGIWAP 0x8B15
+#define SIOCGIWESSID 0x8B1B
+#define IW_MODE_INFRA 2
+#ifndef ARPHRD_ETHER
+#define ARPHRD_ETHER 1
+#endif
+
+typedef struct naos_iw_point {
+    void *pointer;
+    uint16_t length;
+    uint16_t flags;
+} naos_iw_point_t;
+
+typedef struct naos_iwreq {
+    union {
+        char ifrn_name[IFNAMSIZ];
+    } ifr_ifrn;
+    union {
+        char name[IFNAMSIZ];
+        uint32_t mode;
+        struct sockaddr ap_addr;
+        naos_iw_point_t essid;
+    } u;
+} naos_iwreq_t;
+
+typedef struct naos_ifreq {
+    char ifr_name[IFNAMSIZ];
+    union {
+        struct sockaddr ifru_addr;
+        struct sockaddr ifru_hwaddr;
+        short ifru_flags;
+        int ifru_ifindex;
+        int ifru_metric;
+        int ifru_mtu;
+        char ifru_slave[IFNAMSIZ];
+        char ifru_newname[IFNAMSIZ];
+        void *ifru_data;
+    } ifr_ifru;
+} naos_ifreq_t;
 
 extern int err_to_errno(err_t err);
 
@@ -1809,6 +1851,8 @@ static int lwip_socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         return -EBADF;
     }
 
+    cmd &= 0xFFFFFFFF;
+
     if (cmd == FIONREAD) {
         int value = lwip_socket_recv_avail(sock);
         if (copy_to_user((void *)arg, &value, sizeof(value))) {
@@ -1835,6 +1879,83 @@ static int lwip_socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         netconn_set_nonblocking(sock->conn, value ? 1 : 0);
         return 0;
     }
+
+    if (cmd == SIOCGIFINDEX) {
+        naos_ifreq_t req;
+        netdev_t *dev;
+
+        if (!arg || copy_from_user(&req, (const void *)arg, sizeof(req))) {
+            return -EFAULT;
+        }
+
+        req.ifr_name[IFNAMSIZ - 1] = '\0';
+        dev = netdev_get_by_name(req.ifr_name);
+        if (!dev) {
+            return -ENODEV;
+        }
+
+        req.ifr_ifru.ifru_ifindex = (int)(dev->id + 1);
+        netdev_put(dev);
+
+        if (copy_to_user((void *)arg, &req, sizeof(req))) {
+            return -EFAULT;
+        }
+        return 0;
+    }
+
+    if (cmd == SIOCGIWNAME || cmd == SIOCGIWMODE || cmd == SIOCGIWAP ||
+        cmd == SIOCGIWESSID) {
+        naos_iwreq_t req;
+        netdev_t *dev;
+        netdev_wireless_info_t wireless;
+
+        if (!arg || copy_from_user(&req, (const void *)arg, sizeof(req))) {
+            return -EFAULT;
+        }
+
+        req.ifr_ifrn.ifrn_name[IFNAMSIZ - 1] = '\0';
+        dev = netdev_get_by_name(req.ifr_ifrn.ifrn_name);
+        if (!dev) {
+            return -ENODEV;
+        }
+
+        if (!netdev_get_wireless_info(dev, &wireless)) {
+            netdev_put(dev);
+            return -EOPNOTSUPP;
+        }
+
+        if (cmd == SIOCGIWNAME) {
+            memset(req.u.name, 0, sizeof(req.u.name));
+            strncpy(req.u.name, "IEEE 802.11", IFNAMSIZ - 1);
+        } else if (cmd == SIOCGIWMODE) {
+            req.u.mode = IW_MODE_INFRA;
+        } else if (cmd == SIOCGIWAP) {
+            memset(&req.u.ap_addr, 0, sizeof(req.u.ap_addr));
+            req.u.ap_addr.sa_family = ARPHRD_ETHER;
+            if (wireless.connected) {
+                memcpy(req.u.ap_addr.sa_data, wireless.bssid,
+                       sizeof(wireless.bssid));
+            }
+        } else if (cmd == SIOCGIWESSID) {
+            req.u.essid.flags = wireless.connected && wireless.ssid_len ? 1 : 0;
+            req.u.essid.length = wireless.ssid_len;
+            if (req.u.essid.pointer && wireless.ssid_len) {
+                if (copy_to_user(req.u.essid.pointer, wireless.ssid,
+                                 wireless.ssid_len)) {
+                    netdev_put(dev);
+                    return -EFAULT;
+                }
+            }
+        }
+        netdev_put(dev);
+
+        if (copy_to_user((void *)arg, &req, sizeof(req))) {
+            return -EFAULT;
+        }
+        return 0;
+    }
+
+    printk("Unknown lwip socket ioctl: %#010x\n", cmd);
 
     return -ENOTTY;
 }

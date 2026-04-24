@@ -18,7 +18,7 @@
 #include <task/keyring.h>
 #include <task/ns.h>
 
-sched_rq_t *schedulers[MAX_CPU_NUM];
+sched_rq_t schedulers[MAX_CPU_NUM];
 
 spinlock_t task_queue_lock = SPIN_INIT;
 task_t *idle_tasks[MAX_CPU_NUM];
@@ -1023,7 +1023,7 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task->sched_info = calloc(1, sizeof(struct sched_entity));
     if (!task->sched_info)
         goto fail;
-    add_sched_entity(task, schedulers[task->cpu_id]);
+    add_sched_entity(task, &schedulers[task->cpu_id]);
 
     on_new_task_call(task);
 
@@ -1085,9 +1085,9 @@ void task_init() {
     next_task_pid = 1;
 
     for (uint64_t cpu = 0; cpu < cpu_count; cpu++) {
-        schedulers[cpu] = calloc(1, sizeof(sched_rq_t));
-        schedulers[cpu]->sched_queue = create_llist_queue();
-        spin_init(&schedulers[cpu]->lock);
+        memset(&schedulers[cpu], 0, sizeof(sched_rq_t));
+        schedulers[cpu].sched_queue = create_llist_queue();
+        spin_init(&schedulers[cpu].lock);
     }
     for (uint32_t i = 0; i < MAX_WORKER_NUM; i++) {
         llist_init_head(&worker_tick_queues[i]);
@@ -1100,9 +1100,9 @@ void task_init() {
         idle_task->state = TASK_READY;
         idle_task->current_state = TASK_RUNNING;
         idle_task->last_sched_in_ns = nano_time();
-        schedulers[cpu]->idle = idle_task->sched_info;
-        remove_sched_entity(idle_task, schedulers[cpu]);
-        schedulers[cpu]->curr = idle_task->sched_info;
+        schedulers[cpu].idle = idle_task->sched_info;
+        remove_sched_entity(idle_task, &schedulers[cpu]);
+        schedulers[cpu].curr = idle_task->sched_info;
     }
 
     init_task = task_create("init", init_thread, 0, NORMAL_PRIORITY);
@@ -1158,12 +1158,11 @@ int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
 
     task->status = EOK;
 
-    if (target_cpu != current_task->cpu_id && task->sched_info &&
-        schedulers[target_cpu]) {
-        spin_lock(&schedulers[target_cpu]->lock);
-        should_trigger_sched_ipi = (schedulers[target_cpu]->curr ==
+    if (target_cpu != current_task->cpu_id && task->sched_info) {
+        spin_lock(&schedulers[target_cpu].lock);
+        should_trigger_sched_ipi = (schedulers[target_cpu].curr ==
                                     (struct sched_entity *)task->sched_info);
-        spin_unlock(&schedulers[target_cpu]->lock);
+        spin_unlock(&schedulers[target_cpu].lock);
     }
 
     task->state = state;
@@ -1176,7 +1175,7 @@ int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
     else
         task_timeout_cancel(task);
 
-    remove_sched_entity(task, schedulers[task->cpu_id]);
+    remove_sched_entity(task, &schedulers[task->cpu_id]);
 
     if (task->wake_pending) {
         task->wake_pending = false;
@@ -1184,7 +1183,7 @@ int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
         task->state = TASK_READY;
         task->force_wakeup_ns = UINT64_MAX;
         task->blocking_reason = NULL;
-        add_sched_entity(task, schedulers[task->cpu_id]);
+        add_sched_entity(task, &schedulers[task->cpu_id]);
         result = task->status;
     } else {
         should_sleep = true;
@@ -1247,7 +1246,7 @@ void task_unblock(task_t *task, int reason) {
     task->force_wakeup_ns = UINT64_MAX;
     task->wake_pending = false;
 
-    add_sched_entity(task, schedulers[task->cpu_id]);
+    add_sched_entity(task, &schedulers[task->cpu_id]);
     should_trigger_sched_ipi =
         task->cpu_id != current_task->cpu_id && task->cpu_id < cpu_count;
 
@@ -1292,7 +1291,7 @@ void task_exit_inner(task_t *task, int64_t code) {
     task->last_sched_in_ns = 0;
 
     struct sched_entity *entity = (struct sched_entity *)task->sched_info;
-    remove_sched_entity(task, schedulers[task->cpu_id]);
+    remove_sched_entity(task, &schedulers[task->cpu_id]);
     if (entity) {
         entity->task = NULL;
     }
@@ -1609,13 +1608,13 @@ void schedule(uint64_t sched_flags) {
 
     task_t *next = NULL;
     if (sched_flags & SCHED_FLAG_YIELD) {
-        next = sched_pick_next_task_excluding(schedulers[cpu_id], prev);
+        next = sched_pick_next_task_excluding(&schedulers[cpu_id], prev);
 
         if (next == prev) {
             next = idle_tasks[cpu_id];
         }
     } else {
-        next = sched_pick_next_task(schedulers[cpu_id]);
+        next = sched_pick_next_task(&schedulers[cpu_id]);
     }
 
     if (next->state == TASK_DIED) {

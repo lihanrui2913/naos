@@ -3,11 +3,10 @@
 
 struct vfs_super_block *vfs_alloc_super(struct vfs_file_system_type *type,
                                         unsigned long sb_flags) {
-    struct vfs_super_block *sb = malloc(sizeof(*sb));
+    struct vfs_super_block *sb = calloc(1, sizeof(*sb));
     if (!sb)
         return NULL;
 
-    memset(sb, 0, sizeof(*sb));
     sb->s_type = type;
     sb->s_flags = sb_flags;
     spin_init(&sb->s_inode_lock);

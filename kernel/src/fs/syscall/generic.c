@@ -29,6 +29,24 @@ typedef struct linux_file_handle_prefix {
     int handle_type;
 } linux_file_handle_prefix_t;
 
+static const char *generic_file_type_name(uint32_t type) {
+    if (type & file_socket)
+        return "socket";
+    if (type & file_fifo)
+        return "fifo";
+    if (type & file_stream)
+        return "stream";
+    if (type & file_dir)
+        return "dir";
+    if (type & file_symlink)
+        return "symlink";
+    if (type & file_block)
+        return "block";
+    if (type & file_none)
+        return "file";
+    return "unknown";
+}
+
 static int
 generic_copy_file_handle_prefix_from_user(const struct file_handle *user_handle,
                                           linux_file_handle_prefix_t *prefix) {
@@ -1680,6 +1698,37 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             ret = -ENOTTY;
         }
         break;
+    }
+
+    if (ret == -ENOTTY) {
+        const char *sb_type =
+            (f->f_inode && f->f_inode->i_sb && f->f_inode->i_sb->s_type &&
+             f->f_inode->i_sb->s_type->name)
+                ? f->f_inode->i_sb->s_type->name
+                : "<unknown>";
+        const char *dentry_name =
+            (f->f_path.dentry && f->f_path.dentry->d_name.name &&
+             f->f_path.dentry->d_name.name[0])
+                ? f->f_path.dentry->d_name.name
+                : "<anonymous>";
+        const char *inode_type =
+            f->f_inode ? generic_file_type_name(f->f_inode->type) : "<none>";
+        char *full_path = NULL;
+
+        if (current_task && f->f_path.dentry)
+            full_path =
+                vfs_path_to_string(&f->f_path, task_fs_root_path(current_task));
+
+        printk("Ioctl not implemented: fd=%d sb_type=%s inode_type=%s "
+               "ino=%llu dentry=%s path=%s cmd=%#010x "
+               "[dir=%u size=%u type=%#x nr=%#x]\n",
+               fd, sb_type, inode_type,
+               (unsigned long long)(f->f_inode ? f->f_inode->i_ino : 0),
+               dentry_name, full_path ? full_path : "<unresolved>", cmd,
+               (unsigned int)((cmd >> 30) & 0x3),
+               (unsigned int)((cmd >> 16) & 0x3fff),
+               (unsigned int)((cmd >> 8) & 0xff), (unsigned int)(cmd & 0xff));
+        free(full_path);
     }
 
     return ret;

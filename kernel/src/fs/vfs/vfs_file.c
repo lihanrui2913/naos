@@ -105,11 +105,10 @@ struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
     if (!path || !path->dentry || !path->dentry->d_inode)
         return NULL;
 
-    file = malloc(sizeof(*file));
+    file = calloc(1, sizeof(*file));
     if (!file)
         return NULL;
 
-    memset(file, 0, sizeof(*file));
     vfs_path_get((struct vfs_path *)path);
     file->f_path = *path;
     file->f_inode = vfs_igrab(path->dentry->d_inode);
@@ -450,154 +449,6 @@ int vfs_close_file(struct vfs_file *file) {
     return 0;
 }
 
-static bool vfs_file_has_pagecache(struct vfs_file *file) {
-    return file && file->f_inode && file->f_inode->i_mapping.a_ops &&
-           file->f_inode->i_mapping.a_ops->readpage &&
-           S_ISREG(file->f_inode->i_mode) && !(file->f_flags & O_DIRECT);
-}
-
-static bool vfs_file_can_write_pagecache(struct vfs_file *file) {
-    return vfs_file_has_pagecache(file) &&
-           file->f_inode->i_mapping.a_ops->writepage;
-}
-
-static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
-                                       size_t count, loff_t pos) {
-    struct vfs_inode *inode = file->f_inode;
-    uint64_t i_size = inode->i_size;
-
-    if (pos < 0)
-        return -EINVAL;
-    if ((uint64_t)pos >= i_size)
-        return 0;
-
-    count = MIN(count, (size_t)(i_size - (uint64_t)pos));
-    uint8_t *dst = (uint8_t *)buf;
-    size_t read_total = 0;
-
-    while (read_total < count) {
-        uint64_t page_index = (uint64_t)pos / PAGE_SIZE;
-        uint64_t page_offset = (uint64_t)pos % PAGE_SIZE;
-        uint64_t chunk = MIN((uint64_t)PAGE_SIZE - page_offset,
-                             (uint64_t)(count - read_total));
-        bool created = false;
-
-        cache_entry_t *entry =
-            cache_page_get_or_create(inode, page_index, &created);
-        if (!entry)
-            return read_total > 0 ? (ssize_t)read_total : -ENOMEM;
-
-        if (created) {
-            int ret = inode->i_mapping.a_ops->readpage(
-                file, &inode->i_mapping, page_index, cache_entry_data(entry));
-            if (ret < 0) {
-                cache_entry_abort_fill(entry);
-                return read_total > 0 ? (ssize_t)read_total : ret;
-            }
-            cache_entry_mark_ready(entry, (size_t)ret);
-        }
-
-        size_t valid = cache_entry_valid_bytes(entry);
-        if (valid == 0 || page_offset >= valid) {
-            cache_entry_put(entry);
-            break;
-        }
-        chunk = MIN(chunk, valid - page_offset);
-
-        void *src = (uint8_t *)cache_entry_data(entry) + page_offset;
-        if (!memcpy(dst, src, (size_t)chunk)) {
-            cache_entry_put(entry);
-            return read_total > 0 ? (ssize_t)read_total : -EFAULT;
-        }
-
-        cache_entry_put(entry);
-        dst += chunk;
-        pos += (loff_t)chunk;
-        read_total += (size_t)chunk;
-    }
-
-    if (read_total > 0) {
-        uint64_t next_index = (uint64_t)pos / PAGE_SIZE;
-        uint64_t next_page_base = next_index * PAGE_SIZE;
-        if (next_page_base < i_size) {
-            cache_entry_t *prefetch_entry =
-                cache_page_try_get(inode, next_index);
-            if (!prefetch_entry) {
-                prefetch_entry =
-                    cache_page_get_or_create(inode, next_index, NULL);
-                if (prefetch_entry) {
-                    int ret = inode->i_mapping.a_ops->readpage(
-                        file, &inode->i_mapping, next_index,
-                        cache_entry_data(prefetch_entry));
-                    if (ret < 0)
-                        cache_entry_abort_fill(prefetch_entry);
-                    else
-                        cache_entry_mark_ready(prefetch_entry, (size_t)ret);
-                    cache_entry_put(prefetch_entry);
-                }
-            } else {
-                cache_entry_put(prefetch_entry);
-            }
-        }
-    }
-
-    return (ssize_t)read_total;
-}
-
-static ssize_t vfs_file_write_pagecache(struct vfs_file *file, const void *buf,
-                                        size_t count, loff_t pos) {
-    struct vfs_inode *inode = file->f_inode;
-    const uint8_t *src = (const uint8_t *)buf;
-    size_t write_total = 0;
-
-    if (pos < 0)
-        return -EINVAL;
-
-    while (write_total < count) {
-        uint64_t page_index = (uint64_t)pos / PAGE_SIZE;
-        uint64_t page_offset = (uint64_t)pos % PAGE_SIZE;
-        uint64_t chunk = MIN((uint64_t)PAGE_SIZE - page_offset,
-                             (uint64_t)(count - write_total));
-        bool created = false;
-
-        cache_entry_t *entry =
-            cache_page_get_or_create(inode, page_index, &created);
-        if (!entry)
-            return write_total > 0 ? (ssize_t)write_total : -ENOMEM;
-
-        if (created && chunk < PAGE_SIZE) {
-            int ret = inode->i_mapping.a_ops->readpage(
-                file, &inode->i_mapping, page_index, cache_entry_data(entry));
-            if (ret < 0) {
-                cache_entry_abort_fill(entry);
-                return write_total > 0 ? (ssize_t)write_total : -EIO;
-            }
-            cache_entry_mark_ready(entry, (size_t)ret);
-        } else if (created) {
-            cache_entry_mark_ready(entry, PAGE_SIZE);
-        }
-
-        void *dst = (uint8_t *)cache_entry_data(entry) + page_offset;
-        if (!memcpy(dst, src, (size_t)chunk)) {
-            cache_entry_put(entry);
-            return write_total > 0 ? (ssize_t)write_total : -EFAULT;
-        }
-
-        cache_entry_extend_valid(entry, (size_t)(page_offset + chunk));
-        cache_page_mark_dirty(entry);
-        cache_entry_put(entry);
-
-        src += chunk;
-        pos += (loff_t)chunk;
-        write_total += (size_t)chunk;
-    }
-
-    if ((uint64_t)pos > inode->i_size)
-        inode->i_size = (uint64_t)pos;
-
-    return (ssize_t)write_total;
-}
-
 ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
                       loff_t *ppos) {
     ssize_t ret;
@@ -611,13 +462,8 @@ ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
         mutex_lock(&file->f_pos_lock);
     pos = ppos ? *ppos : file->f_pos;
 
-    if (vfs_file_has_pagecache(file)) {
-        ret = vfs_file_read_pagecache(file, buf, count, pos);
-        new_pos = (ret >= 0) ? (loff_t)((uint64_t)pos + (uint64_t)ret) : pos;
-    } else {
-        new_pos = pos;
-        ret = file->f_op->read(file, buf, count, &new_pos);
-    }
+    new_pos = pos;
+    ret = file->f_op->read(file, buf, count, &new_pos);
 
     if (ret >= 0) {
         if (ppos)
@@ -646,16 +492,8 @@ ssize_t vfs_write_file(struct vfs_file *file, const void *buf, size_t count,
     if (!ppos && (file->f_flags & O_APPEND))
         pos = (loff_t)file->f_inode->i_size;
 
-    if (vfs_file_can_write_pagecache(file)) {
-        ret = vfs_file_write_pagecache(file, buf, count, pos);
-        if (ret >= 0)
-            new_pos = (loff_t)((uint64_t)pos + (uint64_t)ret);
-        else
-            new_pos = pos;
-    } else {
-        new_pos = pos;
-        ret = file->f_op->write(file, buf, count, &new_pos);
-    }
+    new_pos = pos;
+    ret = file->f_op->write(file, buf, count, &new_pos);
 
     if (ret >= 0) {
         if (ppos)

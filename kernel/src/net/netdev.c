@@ -1,4 +1,5 @@
 #include <net/netdev.h>
+#include <net/netlink.h>
 #include <mm/mm.h>
 #include <task/task.h>
 
@@ -103,6 +104,8 @@ netdev_t *get_default_netdev() {
 }
 
 netdev_t *netdev_get_by_name(const char *name) {
+    netdev_t *dev = NULL;
+
     if (!name) {
         return NULL;
     }
@@ -111,13 +114,74 @@ netdev_t *netdev_get_by_name(const char *name) {
     for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
         if (netdevs[i] && !netdevs[i]->unregistering &&
             strcmp(netdevs[i]->name, name) == 0) {
-            spin_unlock(&netdevs_lock);
-            return netdevs[i];
+            spin_lock(&netdevs[i]->lock);
+            if (!netdevs[i]->unregistering) {
+                netdevs[i]->refcount++;
+                dev = netdevs[i];
+            }
+            spin_unlock(&netdevs[i]->lock);
+            break;
         }
     }
     spin_unlock(&netdevs_lock);
 
-    return NULL;
+    return dev;
+}
+
+netdev_t *netdev_get_by_index(uint32_t ifindex) {
+    netdev_t *dev = NULL;
+
+    if (ifindex == 0) {
+        return NULL;
+    }
+
+    spin_lock(&netdevs_lock);
+    for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
+        if (!netdevs[i] || netdevs[i]->unregistering) {
+            continue;
+        }
+        if (netdevs[i]->id + 1 != ifindex) {
+            continue;
+        }
+
+        spin_lock(&netdevs[i]->lock);
+        if (!netdevs[i]->unregistering) {
+            netdevs[i]->refcount++;
+            dev = netdevs[i];
+        }
+        spin_unlock(&netdevs[i]->lock);
+        break;
+    }
+    spin_unlock(&netdevs_lock);
+
+    return dev;
+}
+
+size_t netdev_snapshot(netdev_t **out, size_t max) {
+    size_t count = 0;
+
+    if (!out || max == 0) {
+        return 0;
+    }
+
+    spin_lock(&netdevs_lock);
+    for (uint32_t i = 0; i < MAX_NETDEV_NUM && count < max; i++) {
+        netdev_t *dev = netdevs[i];
+
+        if (!dev) {
+            continue;
+        }
+
+        spin_lock(&dev->lock);
+        if (!dev->unregistering) {
+            dev->refcount++;
+            out[count++] = dev;
+        }
+        spin_unlock(&dev->lock);
+    }
+    spin_unlock(&netdevs_lock);
+
+    return count;
 }
 
 int netdev_set_name(netdev_t *dev, const char *name) {
@@ -136,6 +200,311 @@ int netdev_set_name(netdev_t *dev, const char *name) {
 
     netdev_notify(dev, NETDEV_EVENT_CONFIG_CHANGED);
     return 0;
+}
+
+int netdev_set_trigger_scan(netdev_t *dev, netdev_trigger_scan_t trigger_scan) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->trigger_scan = trigger_scan;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_set_trigger_connect(netdev_t *dev,
+                               netdev_trigger_connect_t trigger_connect) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->trigger_connect = trigger_connect;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_set_trigger_disconnect(
+    netdev_t *dev, netdev_trigger_disconnect_t trigger_disconnect) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->trigger_disconnect = trigger_disconnect;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_set_wireless_info(netdev_t *dev,
+                             const netdev_wireless_info_t *info) {
+    if (!dev || !info) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->wireless = *info;
+    dev->wireless.wiphy_name[NETDEV_WIPHY_NAME_LEN - 1] = '\0';
+    spin_unlock(&dev->lock);
+
+    netdev_notify(dev, NETDEV_EVENT_CONFIG_CHANGED);
+    return 0;
+}
+
+bool netdev_get_wireless_info(netdev_t *dev, netdev_wireless_info_t *info) {
+    if (!dev || !info) {
+        return false;
+    }
+
+    spin_lock(&dev->lock);
+    *info = dev->wireless;
+    spin_unlock(&dev->lock);
+    return info->present;
+}
+
+int netdev_set_ipv4_info(netdev_t *dev, const netdev_ipv4_info_t *info) {
+    if (!dev || !info) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->ipv4 = *info;
+    spin_unlock(&dev->lock);
+
+    netdev_notify(dev, NETDEV_EVENT_CONFIG_CHANGED);
+    return 0;
+}
+
+bool netdev_get_ipv4_info(netdev_t *dev, netdev_ipv4_info_t *info) {
+    if (!dev || !info) {
+        return false;
+    }
+
+    spin_lock(&dev->lock);
+    *info = dev->ipv4;
+    spin_unlock(&dev->lock);
+    return info->present;
+}
+
+int netdev_trigger_scan(netdev_t *dev, const netdev_scan_params_t *params,
+                        uint32_t request_portid) {
+    netdev_trigger_scan_t trigger_scan;
+    void *desc;
+
+    if (!dev) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->lock);
+    trigger_scan = dev->trigger_scan;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (!trigger_scan) {
+        netdev_put(dev);
+        return -EOPNOTSUPP;
+    }
+
+    int ret = trigger_scan(desc, params, request_portid);
+    netdev_put(dev);
+    return ret;
+}
+
+int netdev_trigger_connect(netdev_t *dev, const netdev_connect_params_t *params,
+                           uint32_t request_portid) {
+    netdev_trigger_connect_t trigger_connect;
+    void *desc;
+    int ret;
+
+    if (!dev || !params) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->lock);
+    trigger_connect = dev->trigger_connect;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (!trigger_connect) {
+        netdev_put(dev);
+        return -EOPNOTSUPP;
+    }
+
+    ret = trigger_connect(desc, params, request_portid);
+    netdev_put(dev);
+    return ret;
+}
+
+int netdev_trigger_disconnect(netdev_t *dev, uint16_t reason_code,
+                              uint32_t request_portid) {
+    netdev_trigger_disconnect_t trigger_disconnect;
+    void *desc;
+    int ret;
+
+    if (!dev) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->lock);
+    trigger_disconnect = dev->trigger_disconnect;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (!trigger_disconnect) {
+        netdev_put(dev);
+        return -EOPNOTSUPP;
+    }
+
+    ret = trigger_disconnect(desc, reason_code, request_portid);
+    netdev_put(dev);
+    return ret;
+}
+
+int netdev_scan_begin(netdev_t *dev, uint32_t request_portid) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    if (dev->scan.running) {
+        spin_unlock(&dev->lock);
+        return -EBUSY;
+    }
+    /* Keep the BSS cache across scans, like cfg80211 does. */
+    dev->scan.running = true;
+    dev->scan.last_aborted = false;
+    dev->scan.request_portid = request_portid;
+    dev->scan.generation++;
+    spin_unlock(&dev->lock);
+
+    return 0;
+}
+
+int netdev_scan_store_result(netdev_t *dev,
+                             const netdev_scan_result_t *result) {
+    uint32_t slot = NETDEV_MAX_SCAN_RESULTS;
+
+    if (!dev || !result) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    /* BSS cache updates are not limited to an active scan window. */
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+
+    for (uint32_t i = 0; i < NETDEV_MAX_SCAN_RESULTS; i++) {
+        if (!dev->scan.results[i].valid) {
+            if (slot == NETDEV_MAX_SCAN_RESULTS)
+                slot = i;
+            continue;
+        }
+        if (memcmp(dev->scan.results[i].bssid, result->bssid,
+                   sizeof(result->bssid)) == 0 &&
+            dev->scan.results[i].frequency == result->frequency) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == NETDEV_MAX_SCAN_RESULTS) {
+        spin_unlock(&dev->lock);
+        return -ENOSPC;
+    }
+
+    dev->scan.results[slot] = *result;
+    dev->scan.results[slot].valid = true;
+
+    dev->scan.result_count = 0;
+    for (uint32_t i = 0; i < NETDEV_MAX_SCAN_RESULTS; i++) {
+        if (dev->scan.results[i].valid)
+            dev->scan.result_count++;
+    }
+
+    printk("netdev: scan cache update if=%s slot=%u count=%u running=%d\n",
+           dev->name, slot, dev->scan.result_count, dev->scan.running ? 1 : 0);
+
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_scan_complete(netdev_t *dev, bool aborted) {
+    uint32_t request_portid;
+    uint32_t result_count;
+
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->scan.running = false;
+    dev->scan.last_aborted = aborted;
+    request_portid = dev->scan.request_portid;
+    result_count = dev->scan.result_count;
+    spin_unlock(&dev->lock);
+
+    netlink_publish_scan_event(dev, aborted);
+
+    printk("netdev: scan complete if=%s aborted=%d count=%u\n", dev->name,
+           aborted ? 1 : 0, result_count);
+
+    spin_lock(&dev->lock);
+    if (!dev->unregistering && dev->scan.request_portid == request_portid)
+        dev->scan.request_portid = 0;
+    spin_unlock(&dev->lock);
+
+    return 0;
+}
+
+bool netdev_get_scan_state(netdev_t *dev, netdev_scan_state_t *state) {
+    if (!dev || !state) {
+        return false;
+    }
+
+    spin_lock(&dev->lock);
+    *state = dev->scan;
+    spin_unlock(&dev->lock);
+    return state->running || state->result_count > 0;
 }
 
 int netdev_set_link_state(netdev_t *dev, bool link_up) {
@@ -338,6 +707,8 @@ void netdev_notify(netdev_t *dev, uint32_t events) {
             listeners[i].cb(dev, events, listeners[i].ctx);
         }
     }
+
+    netlink_publish_netdev_event(dev, events);
 }
 
 int netdev_send(netdev_t *dev, void *data, uint32_t len) {

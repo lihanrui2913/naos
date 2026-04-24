@@ -284,7 +284,6 @@ static void lwip_sys_thread_entry(uint64_t arg) {
     arch_enable_interrupt();
     fn(thread_arg);
     arch_disable_interrupt();
-    task_exit_thread(0);
 }
 
 sys_thread_t sys_thread_new(const char *name, lwip_thread_fn thread, void *arg,

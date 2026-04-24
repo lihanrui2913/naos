@@ -23,6 +23,27 @@ typedef struct naos_lwip_netdev_event {
     ip4_addr_t static_gw;
 } naos_lwip_netdev_event_t;
 
+static void naos_lwip_publish_ipv4_state(netdev_t *netdev) {
+    netdev_ipv4_info_t info;
+
+    if (!netdev) {
+        return;
+    }
+
+    memset(&info, 0, sizeof(info));
+
+    if (netdev_admin_is_up(netdev) && netdev_link_is_up(netdev) &&
+        !ip4_addr_isany_val(*netif_ip4_addr(&naos_lwip_netif))) {
+        info.present = true;
+        info.address = ip4_addr_get_u32(netif_ip4_addr(&naos_lwip_netif));
+        info.netmask = ip4_addr_get_u32(netif_ip4_netmask(&naos_lwip_netif));
+        info.gateway = ip4_addr_get_u32(netif_ip4_gw(&naos_lwip_netif));
+        info.has_default_route = info.gateway != 0;
+    }
+
+    netdev_set_ipv4_info(netdev, &info);
+}
+
 static void naos_lwip_log_dns_servers(void) {
     for (u8_t i = 0; i < DNS_MAX_SERVERS; i++) {
         const ip_addr_t *server = dns_getserver(i);
@@ -59,6 +80,7 @@ static void naos_lwip_status_callback(struct netif *netif) {
     }
 #endif
 
+    naos_lwip_publish_ipv4_state(naos_link.netdev);
     naos_lwip_set_fallback_dns();
     naos_lwip_log_dns_servers();
 }
@@ -83,6 +105,7 @@ static void naos_lwip_apply_link_state(void *arg) {
 #endif
         netifapi_netif_set_link_down(&naos_lwip_netif);
         netifapi_netif_set_down(&naos_lwip_netif);
+        naos_lwip_publish_ipv4_state(naos_link.netdev);
         free(event);
         return;
     }
@@ -98,6 +121,7 @@ static void naos_lwip_apply_link_state(void *arg) {
         }
 #endif
         netifapi_netif_set_link_down(&naos_lwip_netif);
+        naos_lwip_publish_ipv4_state(naos_link.netdev);
         free(event);
         return;
     }
@@ -116,6 +140,7 @@ static void naos_lwip_apply_link_state(void *arg) {
 #endif
 #endif
 
+    naos_lwip_publish_ipv4_state(naos_link.netdev);
     naos_lwip_set_fallback_dns();
     free(event);
 }
@@ -250,13 +275,13 @@ static void naos_lwip_rx_thread(uint64_t arg) {
     uint8_t *buffer = NULL;
 
     if (!link || !link->netdev) {
-        task_exit_thread(0);
+        return;
     }
 
     max_len = netdev_max_frame_len(link->netdev->mtu);
     buffer = alloc_frames_bytes(max_len);
     if (!buffer) {
-        task_exit_thread(0);
+        return;
     }
 
     for (;;) {
@@ -295,7 +320,6 @@ static void naos_lwip_rx_thread(uint64_t arg) {
         link->netdev_ref_held = false;
     }
     link->netdev = NULL;
-    task_exit_thread(0);
 }
 
 int lwip_module_init() {

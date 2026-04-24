@@ -23,7 +23,7 @@ static inline configfs_inode_info_t *configfs_i(struct vfs_inode *inode) {
 }
 
 static struct vfs_inode *configfs_alloc_inode(struct vfs_super_block *sb) {
-    configfs_inode_info_t *info = malloc(sizeof(*info));
+    configfs_inode_info_t *info = calloc(1, sizeof(*info));
     (void)sb;
     if (info)
         memset(info, 0, sizeof(*info));

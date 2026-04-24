@@ -587,11 +587,10 @@ struct vfs_mount *vfs_mount_alloc(struct vfs_super_block *sb,
     if (!sb || !sb->s_root)
         return NULL;
 
-    mnt = malloc(sizeof(*mnt));
+    mnt = calloc(1, sizeof(*mnt));
     if (!mnt)
         return NULL;
 
-    memset(mnt, 0, sizeof(*mnt));
     mnt->mnt_parent = mnt;
     mnt->mnt_root = vfs_dget(sb->s_root);
     mnt->mnt_sb = sb;

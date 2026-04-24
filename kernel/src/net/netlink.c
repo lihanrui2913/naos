@@ -5,6 +5,7 @@
 #include <libs/klibc.h>
 #include <fs/fs_syscall.h>
 #include <fs/proc.h>
+#include <net/netdev.h>
 #include <net/real_socket.h>
 #include <bpf/socket_filter.h>
 #include <init/callbacks.h>
@@ -44,6 +45,10 @@ static int netlink_wait_sock(struct netlink_sock *sock, uint32_t events,
                              const char *reason);
 static bool netlink_buffer_has_msg(struct netlink_sock *sock);
 static size_t netlink_buffer_peek_msg_len(struct netlink_sock *sock);
+static size_t netlink_deliver_to_socket(struct netlink_sock *target,
+                                        const char *data, size_t len,
+                                        uint32_t sender_pid,
+                                        uint32_t sender_groups);
 static size_t netlink_buffer_read_packet(struct netlink_sock *sock, char *out,
                                          size_t out_len, uint32_t *nl_pid,
                                          uint32_t *nl_groups, bool peek);
@@ -78,15 +83,1994 @@ netlink_lookup_sock_by_portid_locked(int protocol, uint32_t portid) {
     return NULL;
 }
 
+static inline uint32_t netlink_group_bit(uint32_t group) {
+    if (group == 0 || group > 32)
+        return 0;
+    return 1U << (group - 1);
+}
+
+static inline bool netlink_is_zero_mac(const uint8_t *addr) {
+    static const uint8_t zero_mac[6] = {0};
+
+    return !addr || memcmp(addr, zero_mac, sizeof(zero_mac)) == 0;
+}
+
+static int netlink_append_raw_message(char *buf, size_t *offset,
+                                      size_t capacity, uint16_t type,
+                                      uint16_t flags, uint32_t seq,
+                                      const void *payload, size_t payload_len) {
+    struct nlmsghdr *nlh;
+    size_t total_len;
+    size_t start;
+
+    if (!buf || !offset)
+        return -EINVAL;
+
+    total_len = NLMSG_SPACE(payload_len);
+    if (*offset > capacity || total_len > capacity - *offset)
+        return -EMSGSIZE;
+
+    start = *offset;
+    nlh = (struct nlmsghdr *)(buf + start);
+    nlh->nlmsg_len = NLMSG_LENGTH(payload_len);
+    nlh->nlmsg_type = type;
+    nlh->nlmsg_flags = flags;
+    nlh->nlmsg_seq = seq;
+    nlh->nlmsg_pid = 0;
+
+    if (payload && payload_len)
+        memcpy(NLMSG_DATA(nlh), payload, payload_len);
+
+    if (total_len > nlh->nlmsg_len)
+        memset(buf + start + nlh->nlmsg_len, 0, total_len - nlh->nlmsg_len);
+
+    *offset += total_len;
+    return 0;
+}
+
+static int netlink_append_ack(char *buf, size_t *offset, size_t capacity,
+                              const struct nlmsghdr *req, int error) {
+    struct nlmsgerr err = {0};
+
+    if (req)
+        err.msg = *req;
+    err.error = error;
+
+    return netlink_append_raw_message(buf, offset, capacity, NLMSG_ERROR, 0,
+                                      req ? req->nlmsg_seq : 0, &err,
+                                      sizeof(err));
+}
+
+static int netlink_append_done(char *buf, size_t *offset, size_t capacity,
+                               const struct nlmsghdr *req) {
+    return netlink_append_raw_message(buf, offset, capacity, NLMSG_DONE, 0,
+                                      req ? req->nlmsg_seq : 0, NULL, 0);
+}
+
+static int netlink_flush_reply_to_socket(struct netlink_sock *sock, char *buf,
+                                         size_t *offset) {
+    if (!sock || !buf || !offset)
+        return -EINVAL;
+    if (*offset == 0)
+        return 0;
+    if (!netlink_deliver_to_socket(sock, buf, *offset, 0, 0))
+        return -ENOBUFS;
+    memset(buf, 0, *offset);
+    *offset = 0;
+    return 0;
+}
+
+static int netlink_append_attr(char *buf, size_t *offset, size_t capacity,
+                               uint16_t type, const void *data, size_t len) {
+    struct rtattr *rta;
+    size_t total_len;
+
+    if (!buf || !offset)
+        return -EINVAL;
+
+    total_len = RTA_SPACE(len);
+    if (*offset > capacity || total_len > capacity - *offset)
+        return -EMSGSIZE;
+
+    rta = (struct rtattr *)(buf + *offset);
+    rta->rta_len = (uint16_t)RTA_LENGTH(len);
+    rta->rta_type = type;
+
+    if (data && len)
+        memcpy(RTA_DATA(rta), data, len);
+
+    if (total_len > rta->rta_len)
+        memset(buf + *offset + rta->rta_len, 0, total_len - rta->rta_len);
+
+    *offset += total_len;
+    return 0;
+}
+
+static uint32_t rtnetlink_dev_flags(const netdev_t *dev) {
+    uint32_t flags = IFF_BROADCAST | IFF_MULTICAST;
+
+    if (!dev)
+        return flags;
+    if (dev->admin_up)
+        flags |= IFF_UP;
+    if (dev->link_up)
+        flags |= IFF_RUNNING | IFF_LOWER_UP;
+
+    return flags;
+}
+
+static uint8_t rtnetlink_dev_operstate(const netdev_t *dev) {
+    if (!dev)
+        return IF_OPER_UNKNOWN;
+    return dev->link_up ? IF_OPER_UP : IF_OPER_DOWN;
+}
+
+static int rtnetlink_append_link_msg(char *buf, size_t *offset, size_t capacity,
+                                     const netdev_t *dev, uint16_t nlmsg_type,
+                                     uint16_t nlmsg_flags, uint32_t seq) {
+    struct nlmsghdr *nlh;
+    struct ifinfomsg *ifi;
+    uint32_t mtu;
+    uint32_t txqlen = 0;
+    uint8_t operstate;
+    uint8_t linkmode = 0;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !dev)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(buf, offset, capacity, nlmsg_type,
+                                     nlmsg_flags, seq, NULL,
+                                     sizeof(struct ifinfomsg));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
+    memset(ifi, 0, sizeof(*ifi));
+    ifi->ifi_type = ARPHRD_ETHER;
+    ifi->ifi_index = (int32_t)(dev->id + 1);
+    ifi->ifi_flags = rtnetlink_dev_flags(dev);
+    ifi->ifi_change = 0xFFFFFFFFU;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_IFNAME, dev->name,
+                              strlen(dev->name) + 1);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_ADDRESS, dev->mac,
+                              sizeof(dev->mac));
+    if (ret < 0)
+        return ret;
+
+    if (dev->type == NETDEV_TYPE_WIFI) {
+        ret = netlink_append_attr(buf, &cur, capacity, IFLA_WIRELESS, NULL, 0);
+        if (ret < 0)
+            return ret;
+    }
+
+    mtu = dev->mtu;
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_MTU, &mtu, sizeof(mtu));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_TXQLEN, &txqlen,
+                              sizeof(txqlen));
+    if (ret < 0)
+        return ret;
+
+    operstate = rtnetlink_dev_operstate(dev);
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_OPERSTATE, &operstate,
+                              sizeof(operstate));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFLA_LINKMODE, &linkmode,
+                              sizeof(linkmode));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int rtnetlink_handle_getlink(struct netlink_sock *sender_sock,
+                                    const struct nlmsghdr *req,
+                                    const struct ifinfomsg *ifi_req) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    uint32_t seq = req ? req->nlmsg_seq : 0;
+    bool dump = req && (req->nlmsg_flags & NLM_F_DUMP);
+    size_t count = 0;
+    size_t offset = 0;
+    int ret = 0;
+    char reply[NETLINK_BUFFER_SIZE];
+
+    memset(reply, 0, sizeof(reply));
+
+    if (!sender_sock)
+        return -EINVAL;
+
+    if (!dump && ifi_req && ifi_req->ifi_index > 0) {
+        netdev_t *dev = netdev_get_by_index((uint32_t)ifi_req->ifi_index);
+
+        if (!dev)
+            return -ENODEV;
+
+        ret = rtnetlink_append_link_msg(reply, &offset, sizeof(reply), dev,
+                                        RTM_NEWLINK, 0, seq);
+        netdev_put(dev);
+        if (ret < 0)
+            return ret;
+    } else {
+        count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+        for (size_t i = 0; i < count; i++) {
+            size_t prev_offset = offset;
+            ret = rtnetlink_append_link_msg(reply, &offset, sizeof(reply),
+                                            devs[i], RTM_NEWLINK, NLM_F_MULTI,
+                                            seq);
+            if (ret == -EMSGSIZE && prev_offset > 0) {
+                ret = netlink_flush_reply_to_socket(sender_sock, reply,
+                                                    &prev_offset);
+                if (ret < 0)
+                    break;
+                offset = 0;
+                ret = rtnetlink_append_link_msg(reply, &offset, sizeof(reply),
+                                                devs[i], RTM_NEWLINK,
+                                                NLM_F_MULTI, seq);
+            }
+            if (ret < 0)
+                break;
+        }
+
+        for (size_t i = 0; i < count; i++)
+            netdev_put(devs[i]);
+
+        if (ret < 0)
+            return ret;
+
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+        if (ret == -EMSGSIZE && offset > 0) {
+            ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+            if (ret < 0)
+                return ret;
+            ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+        }
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int rtnetlink_handle_setlink(struct netlink_sock *sender_sock,
+                                    const struct nlmsghdr *req,
+                                    const struct ifinfomsg *ifi_req) {
+    netdev_t *dev;
+    int ret = 0;
+
+    if (!sender_sock || !req || !ifi_req || ifi_req->ifi_index <= 0)
+        return -EINVAL;
+
+    dev = netdev_get_by_index((uint32_t)ifi_req->ifi_index);
+    if (!dev)
+        return -ENODEV;
+
+    if (ifi_req->ifi_change & IFF_UP)
+        ret = netdev_set_admin_state(dev, !!(ifi_req->ifi_flags & IFF_UP));
+
+    netdev_put(dev);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static uint8_t rtnetlink_prefixlen_from_netmask(uint32_t netmask_be) {
+    uint32_t mask = __builtin_bswap32(netmask_be);
+    uint8_t prefix = 0;
+
+    while (mask & 0x80000000U) {
+        prefix++;
+        mask <<= 1;
+    }
+
+    return prefix;
+}
+
+static int rtnetlink_append_addr_msg(char *buf, size_t *offset, size_t capacity,
+                                     const struct nlmsghdr *req,
+                                     const netdev_t *dev,
+                                     const netdev_ipv4_info_t *ipv4,
+                                     uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct ifaddrmsg *ifa;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req || !dev || !ipv4 || !ipv4->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(buf, offset, capacity, RTM_NEWADDR, flags,
+                                     req->nlmsg_seq, NULL,
+                                     sizeof(struct ifaddrmsg));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
+    memset(ifa, 0, sizeof(*ifa));
+    ifa->ifa_family = AF_INET;
+    ifa->ifa_prefixlen = rtnetlink_prefixlen_from_netmask(ipv4->netmask);
+    ifa->ifa_scope = RT_SCOPE_UNIVERSE;
+    ifa->ifa_index = dev->id + 1;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+    ret = netlink_append_attr(buf, &cur, capacity, IFA_ADDRESS, &ipv4->address,
+                              sizeof(ipv4->address));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFA_LOCAL, &ipv4->address,
+                              sizeof(ipv4->address));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, IFA_LABEL, dev->name,
+                              strlen(dev->name) + 1);
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int rtnetlink_append_route_msg(char *buf, size_t *offset,
+                                      size_t capacity,
+                                      const struct nlmsghdr *req,
+                                      const netdev_t *dev,
+                                      const netdev_ipv4_info_t *ipv4,
+                                      bool default_route, uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct rtmsg *rtm;
+    uint32_t table = RT_TABLE_MAIN;
+    uint32_t ifindex = dev->id + 1;
+    uint32_t dst = ipv4->address & ipv4->netmask;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req || !dev || !ipv4 || !ipv4->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret =
+        netlink_append_raw_message(buf, offset, capacity, RTM_NEWROUTE, flags,
+                                   req->nlmsg_seq, NULL, sizeof(struct rtmsg));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_table = RT_TABLE_MAIN;
+    rtm->rtm_protocol = RTPROT_KERNEL;
+    rtm->rtm_scope = default_route ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
+    rtm->rtm_type = RTN_UNICAST;
+    rtm->rtm_dst_len =
+        default_route ? 0 : rtnetlink_prefixlen_from_netmask(ipv4->netmask);
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    if (!default_route) {
+        ret = netlink_append_attr(buf, &cur, capacity, RTA_DST, &dst,
+                                  sizeof(dst));
+        if (ret < 0)
+            return ret;
+    } else {
+        ret = netlink_append_attr(buf, &cur, capacity, RTA_GATEWAY,
+                                  &ipv4->gateway, sizeof(ipv4->gateway));
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = netlink_append_attr(buf, &cur, capacity, RTA_OIF, &ifindex,
+                              sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, RTA_PREFSRC, &ipv4->address,
+                              sizeof(ipv4->address));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, RTA_TABLE, &table,
+                              sizeof(table));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int rtnetlink_append_rule_msg(char *buf, size_t *offset, size_t capacity,
+                                     const struct nlmsghdr *req, uint8_t table,
+                                     uint32_t priority, uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct fib_rule_hdr *frh;
+    uint32_t table32 = table;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(buf, offset, capacity, RTM_NEWRULE, flags,
+                                     req->nlmsg_seq, NULL,
+                                     sizeof(struct fib_rule_hdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    frh = (struct fib_rule_hdr *)NLMSG_DATA(nlh);
+    memset(frh, 0, sizeof(*frh));
+    frh->family = AF_INET;
+    frh->table = table;
+    frh->action = FR_ACT_TO_TBL;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    ret = netlink_append_attr(buf, &cur, capacity, FRA_TABLE, &table32,
+                              sizeof(table32));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, FRA_PRIORITY, &priority,
+                              sizeof(priority));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int rtnetlink_handle_getaddr(struct netlink_sock *sender_sock,
+                                    const struct nlmsghdr *req) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t count;
+    size_t offset = 0;
+    int ret = 0;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+
+    for (size_t i = 0; i < count; i++) {
+        netdev_ipv4_info_t ipv4;
+
+        if (!netdev_get_ipv4_info(devs[i], &ipv4))
+            continue;
+
+        size_t prev_offset = offset;
+        ret = rtnetlink_append_addr_msg(reply, &offset, sizeof(reply), req,
+                                        devs[i], &ipv4, NLM_F_MULTI);
+        if (ret == -EMSGSIZE && prev_offset > 0) {
+            ret =
+                netlink_flush_reply_to_socket(sender_sock, reply, &prev_offset);
+            if (ret < 0)
+                break;
+            offset = 0;
+            ret = rtnetlink_append_addr_msg(reply, &offset, sizeof(reply), req,
+                                            devs[i], &ipv4, NLM_F_MULTI);
+        }
+        if (ret < 0)
+            break;
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int rtnetlink_handle_getroute(struct netlink_sock *sender_sock,
+                                     const struct nlmsghdr *req) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t count;
+    size_t offset = 0;
+    int ret = 0;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+
+    for (size_t i = 0; i < count; i++) {
+        netdev_ipv4_info_t ipv4;
+
+        if (!netdev_get_ipv4_info(devs[i], &ipv4))
+            continue;
+
+        size_t prev_offset = offset;
+        ret = rtnetlink_append_route_msg(reply, &offset, sizeof(reply), req,
+                                         devs[i], &ipv4, false, NLM_F_MULTI);
+        if (ret == -EMSGSIZE && prev_offset > 0) {
+            ret =
+                netlink_flush_reply_to_socket(sender_sock, reply, &prev_offset);
+            if (ret < 0)
+                break;
+            offset = 0;
+            ret =
+                rtnetlink_append_route_msg(reply, &offset, sizeof(reply), req,
+                                           devs[i], &ipv4, false, NLM_F_MULTI);
+        }
+        if (ret < 0)
+            break;
+
+        if (ipv4.has_default_route) {
+            prev_offset = offset;
+            ret = rtnetlink_append_route_msg(reply, &offset, sizeof(reply), req,
+                                             devs[i], &ipv4, true, NLM_F_MULTI);
+            if (ret == -EMSGSIZE && prev_offset > 0) {
+                ret = netlink_flush_reply_to_socket(sender_sock, reply,
+                                                    &prev_offset);
+                if (ret < 0)
+                    break;
+                offset = 0;
+                ret = rtnetlink_append_route_msg(reply, &offset, sizeof(reply),
+                                                 req, devs[i], &ipv4, true,
+                                                 NLM_F_MULTI);
+            }
+            if (ret < 0)
+                break;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int rtnetlink_handle_getrule(struct netlink_sock *sender_sock,
+                                    const struct nlmsghdr *req) {
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+
+    ret = rtnetlink_append_rule_msg(reply, &offset, sizeof(reply), req,
+                                    RT_TABLE_LOCAL, 0, NLM_F_MULTI);
+    if (ret < 0)
+        return ret;
+
+    ret = rtnetlink_append_rule_msg(reply, &offset, sizeof(reply), req,
+                                    RT_TABLE_MAIN, 32766, NLM_F_MULTI);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = rtnetlink_append_rule_msg(reply, &offset, sizeof(reply), req,
+                                        RT_TABLE_MAIN, 32766, NLM_F_MULTI);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = rtnetlink_append_rule_msg(reply, &offset, sizeof(reply), req,
+                                    RT_TABLE_DEFAULT, 32767, NLM_F_MULTI);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = rtnetlink_append_rule_msg(reply, &offset, sizeof(reply), req,
+                                        RT_TABLE_DEFAULT, 32767, NLM_F_MULTI);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int rtnetlink_handle_request(struct netlink_sock *sender_sock,
+                                    const struct nlmsghdr *req) {
+    const struct ifinfomsg *ifi_req = NULL;
+    size_t payload_len = 0;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    if (req->nlmsg_len < sizeof(*req))
+        return -EINVAL;
+
+    payload_len = req->nlmsg_len - NLMSG_HDRLEN;
+    if (payload_len >= sizeof(struct ifinfomsg))
+        ifi_req = (const struct ifinfomsg *)NLMSG_DATA(req);
+
+    switch (req->nlmsg_type) {
+    case RTM_GETLINK:
+        return rtnetlink_handle_getlink(sender_sock, req, ifi_req);
+    case RTM_GETADDR:
+        return rtnetlink_handle_getaddr(sender_sock, req);
+    case RTM_GETROUTE:
+        return rtnetlink_handle_getroute(sender_sock, req);
+    case RTM_GETRULE:
+        return rtnetlink_handle_getrule(sender_sock, req);
+    case RTM_SETLINK:
+        return rtnetlink_handle_setlink(sender_sock, req, ifi_req);
+    default:
+        printk("Unsupported req->nlmsg_type = %d\n", req->nlmsg_type);
+        return -EOPNOTSUPP;
+    }
+}
+
+struct naos_genl_family_desc {
+    uint16_t id;
+    const char *name;
+    uint8_t version;
+    uint32_t maxattr;
+};
+
+static const struct naos_genl_family_desc naos_genl_ctrl_family = {
+    .id = GENL_ID_CTRL,
+    .name = "nlctrl",
+    .version = 2,
+    .maxattr = CTRL_ATTR_MCAST_GROUPS,
+};
+
+static const struct naos_genl_family_desc naos_genl_nl80211_family = {
+    .id = NAOS_GENL_ID_NL80211,
+    .name = NL80211_GENL_NAME,
+    .version = NL80211_GENL_VERSION,
+    .maxattr = NL80211_ATTR_BSSID,
+};
+
+static const struct rtattr *netlink_find_attr(const void *data, size_t len,
+                                              uint16_t type) {
+    const struct rtattr *rta = (const struct rtattr *)data;
+    int remaining = (int)len;
+
+    while (RTA_OK(rta, remaining)) {
+        if (rta->rta_type == type)
+            return rta;
+        rta = RTA_NEXT(rta, remaining);
+    }
+
+    return NULL;
+}
+
+static int netlink_start_nested_attr(char *buf, size_t *offset, size_t capacity,
+                                     uint16_t type, size_t *nested_start) {
+    struct rtattr *rta;
+    size_t start;
+
+    if (!buf || !offset || !nested_start)
+        return -EINVAL;
+    if (*offset > capacity || RTA_ALIGN(sizeof(*rta)) > capacity - *offset)
+        return -EMSGSIZE;
+
+    start = *offset;
+    rta = (struct rtattr *)(buf + start);
+    rta->rta_len = sizeof(*rta);
+    rta->rta_type = type;
+    *offset += RTA_ALIGN(sizeof(*rta));
+    *nested_start = start;
+    return 0;
+}
+
+static void netlink_end_nested_attr(char *buf, size_t end_offset,
+                                    size_t nested_start) {
+    struct rtattr *rta;
+
+    if (!buf || end_offset < nested_start)
+        return;
+
+    rta = (struct rtattr *)(buf + nested_start);
+    rta->rta_len = (uint16_t)(end_offset - nested_start);
+}
+
+static int genl_append_ctrl_mcast_groups(char *buf, size_t *offset,
+                                         size_t capacity) {
+    size_t groups_start;
+    size_t group_start;
+    uint32_t group_id;
+    int ret;
+
+    ret = netlink_start_nested_attr(buf, offset, capacity,
+                                    CTRL_ATTR_MCAST_GROUPS, &groups_start);
+    if (ret < 0)
+        return ret;
+
+    group_id = NL80211_MCGRP_SCAN_ID;
+    ret = netlink_start_nested_attr(buf, offset, capacity, 1, &group_start);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_NAME,
+                              NL80211_MCGRP_SCAN_NAME,
+                              strlen(NL80211_MCGRP_SCAN_NAME) + 1);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_ID,
+                              &group_id, sizeof(group_id));
+    if (ret < 0)
+        return ret;
+
+    netlink_end_nested_attr(buf, *offset, group_start);
+
+    group_id = NL80211_MCGRP_MLME_ID;
+    ret = netlink_start_nested_attr(buf, offset, capacity, 2, &group_start);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_NAME,
+                              NL80211_MCGRP_MLME_NAME,
+                              strlen(NL80211_MCGRP_MLME_NAME) + 1);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_ID,
+                              &group_id, sizeof(group_id));
+    if (ret < 0)
+        return ret;
+
+    netlink_end_nested_attr(buf, *offset, group_start);
+    netlink_end_nested_attr(buf, *offset, groups_start);
+    return 0;
+}
+
+static const struct naos_genl_family_desc *naos_genl_family_by_id(uint16_t id) {
+    if (id == naos_genl_ctrl_family.id)
+        return &naos_genl_ctrl_family;
+    if (id == naos_genl_nl80211_family.id)
+        return &naos_genl_nl80211_family;
+    return NULL;
+}
+
+static const struct naos_genl_family_desc *
+naos_genl_family_by_name(const char *name) {
+    if (!name)
+        return NULL;
+    if (strcmp(name, naos_genl_ctrl_family.name) == 0)
+        return &naos_genl_ctrl_family;
+    if (strcmp(name, naos_genl_nl80211_family.name) == 0)
+        return &naos_genl_nl80211_family;
+    return NULL;
+}
+
+static int
+genl_append_ctrl_family_msg(char *buf, size_t *offset, size_t capacity,
+                            const struct nlmsghdr *req,
+                            const struct naos_genl_family_desc *fam) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint16_t family_id;
+    uint32_t version;
+    uint32_t hdrsize = 0;
+    uint32_t maxattr;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req || !fam)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(buf, offset, capacity, GENL_ID_CTRL, 0,
+                                     req->nlmsg_seq, NULL,
+                                     sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = CTRL_CMD_NEWFAMILY;
+    genlh->version = naos_genl_ctrl_family.version;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    family_id = fam->id;
+    ret = netlink_append_attr(buf, &cur, capacity, CTRL_ATTR_FAMILY_ID,
+                              &family_id, sizeof(family_id));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, CTRL_ATTR_FAMILY_NAME,
+                              fam->name, strlen(fam->name) + 1);
+    if (ret < 0)
+        return ret;
+
+    version = fam->version;
+    ret = netlink_append_attr(buf, &cur, capacity, CTRL_ATTR_VERSION, &version,
+                              sizeof(version));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, CTRL_ATTR_HDRSIZE, &hdrsize,
+                              sizeof(hdrsize));
+    if (ret < 0)
+        return ret;
+
+    maxattr = fam->maxattr;
+    ret = netlink_append_attr(buf, &cur, capacity, CTRL_ATTR_MAXATTR, &maxattr,
+                              sizeof(maxattr));
+    if (ret < 0)
+        return ret;
+
+    if (fam->id == NAOS_GENL_ID_NL80211) {
+        ret = genl_append_ctrl_mcast_groups(buf, &cur, capacity);
+        if (ret < 0)
+            return ret;
+    }
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int genl_append_nl80211_supported_iftypes(char *buf, size_t *offset,
+                                                 size_t capacity,
+                                                 uint32_t interface_modes) {
+    size_t nested_start;
+    int ret;
+
+    ret = netlink_start_nested_attr(
+        buf, offset, capacity, NL80211_ATTR_SUPPORTED_IFTYPES, &nested_start);
+    if (ret < 0)
+        return ret;
+
+    for (uint32_t iftype = 0; iftype < 32; iftype++) {
+        if (!(interface_modes & (1UL << iftype)))
+            continue;
+        ret = netlink_append_attr(buf, offset, capacity, (uint16_t)iftype, NULL,
+                                  0);
+        if (ret < 0)
+            return ret;
+    }
+
+    netlink_end_nested_attr(buf, *offset, nested_start);
+    return 0;
+}
+
+static int genl_append_nl80211_wiphy_msg(char *buf, size_t *offset,
+                                         size_t capacity,
+                                         const struct nlmsghdr *req,
+                                         const netdev_t *dev,
+                                         const netdev_wireless_info_t *wireless,
+                                         uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint8_t max_scan_ssids;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req || !dev || !wireless || !wireless->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(
+        buf, offset, capacity, NAOS_GENL_ID_NL80211, flags, req->nlmsg_seq,
+        NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_NEW_WIPHY;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY_NAME,
+                              wireless->wiphy_name,
+                              strlen(wireless->wiphy_name) + 1);
+    if (ret < 0)
+        return ret;
+
+    ret = genl_append_nl80211_supported_iftypes(buf, &cur, capacity,
+                                                wireless->interface_modes);
+    if (ret < 0)
+        return ret;
+
+    max_scan_ssids = wireless->max_scan_ssids > UINT8_MAX
+                         ? UINT8_MAX
+                         : (uint8_t)wireless->max_scan_ssids;
+    ret = netlink_append_attr(buf, &cur, capacity,
+                              NL80211_ATTR_MAX_NUM_SCAN_SSIDS, &max_scan_ssids,
+                              sizeof(max_scan_ssids));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int genl_append_nl80211_interface_msg(
+    char *buf, size_t *offset, size_t capacity, const struct nlmsghdr *req,
+    const netdev_t *dev, const netdev_wireless_info_t *wireless,
+    uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint32_t ifindex;
+    uint32_t iftype;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !req || !dev || !wireless || !wireless->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(
+        buf, offset, capacity, NAOS_GENL_ID_NL80211, flags, req->nlmsg_seq,
+        NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_NEW_INTERFACE;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ifindex = dev->id + 1;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFINDEX,
+                              &ifindex, sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFNAME,
+                              dev->name, strlen(dev->name) + 1);
+    if (ret < 0)
+        return ret;
+
+    iftype = wireless->iftype;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFTYPE, &iftype,
+                              sizeof(iftype));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_MAC, dev->mac,
+                              sizeof(dev->mac));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int genl_append_nl80211_scan_result_msg(
+    char *buf, size_t *offset, size_t capacity, const struct nlmsghdr *req,
+    const netdev_t *dev, const netdev_wireless_info_t *wireless,
+    const netdev_scan_state_t *scan, const netdev_scan_result_t *result,
+    uint16_t flags) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint32_t ifindex;
+    uint32_t generation;
+    size_t start;
+    size_t cur;
+    size_t bss_start;
+    uint32_t bss_status;
+    int ret;
+
+    if (!buf || !offset || !req || !dev || !wireless || !scan || !result ||
+        !result->valid)
+        return -EINVAL;
+
+    start = *offset;
+    ret = netlink_append_raw_message(
+        buf, offset, capacity, NAOS_GENL_ID_NL80211, flags, req->nlmsg_seq,
+        NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_NEW_SCAN_RESULTS;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ifindex = dev->id + 1;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFINDEX,
+                              &ifindex, sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    generation = scan->generation;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_GENERATION,
+                              &generation, sizeof(generation));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_start_nested_attr(buf, &cur, capacity, NL80211_ATTR_BSS,
+                                    &bss_start);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_BSSID,
+                              result->bssid, sizeof(result->bssid));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_FREQUENCY,
+                              &result->frequency, sizeof(result->frequency));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_TSF,
+                              &result->tsf, sizeof(result->tsf));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_BEACON_INTERVAL,
+                              &result->beacon_interval,
+                              sizeof(result->beacon_interval));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_CAPABILITY,
+                              &result->capability, sizeof(result->capability));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity,
+                              NL80211_BSS_INFORMATION_ELEMENTS, result->ies,
+                              result->ie_len);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_BEACON_IES,
+                              result->ies, result->ie_len);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_SIGNAL_MBM,
+                              &result->signal_mbm, sizeof(result->signal_mbm));
+    if (ret < 0)
+        return ret;
+
+    ret =
+        netlink_append_attr(buf, &cur, capacity, NL80211_BSS_SEEN_MS_AGO,
+                            &result->seen_ms_ago, sizeof(result->seen_ms_ago));
+    if (ret < 0)
+        return ret;
+
+    if (wireless->connected &&
+        memcmp(wireless->bssid, result->bssid, sizeof(result->bssid)) == 0) {
+        bss_status = NL80211_BSS_STATUS_ASSOCIATED;
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_BSS_STATUS,
+                                  &bss_status, sizeof(bss_status));
+        if (ret < 0)
+            return ret;
+    }
+
+    netlink_end_nested_attr(buf, cur, bss_start);
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int genl_append_nl80211_scan_event_msg(
+    char *buf, size_t *offset, size_t capacity, const netdev_t *dev,
+    const netdev_wireless_info_t *wireless, const netdev_scan_state_t *scan,
+    bool aborted) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint32_t ifindex;
+    uint32_t generation;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !dev || !wireless || !scan)
+        return -EINVAL;
+
+    start = *offset;
+    ret =
+        netlink_append_raw_message(buf, offset, capacity, NAOS_GENL_ID_NL80211,
+                                   0, 0, NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd =
+        aborted ? NL80211_CMD_SCAN_ABORTED : NL80211_CMD_NEW_SCAN_RESULTS;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ifindex = dev->id + 1;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFINDEX,
+                              &ifindex, sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    generation = scan->generation;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_GENERATION,
+                              &generation, sizeof(generation));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int
+genl_append_nl80211_connect_event_msg(char *buf, size_t *offset,
+                                      size_t capacity, const netdev_t *dev,
+                                      const netdev_wireless_info_t *wireless,
+                                      uint32_t seq, uint16_t status_code) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint32_t ifindex;
+    size_t start;
+    size_t cur;
+    int ret;
+
+    if (!buf || !offset || !dev || !wireless || !wireless->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret =
+        netlink_append_raw_message(buf, offset, capacity, NAOS_GENL_ID_NL80211,
+                                   0, seq, NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_CONNECT;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ifindex = dev->id + 1;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFINDEX,
+                              &ifindex, sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_STATUS_CODE,
+                              &status_code, sizeof(status_code));
+    if (ret < 0)
+        return ret;
+
+    if (wireless->ssid_len) {
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_SSID,
+                                  wireless->ssid, wireless->ssid_len);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!netlink_is_zero_mac(wireless->bssid)) {
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_MAC,
+                                  wireless->bssid, sizeof(wireless->bssid));
+        if (ret < 0)
+            return ret;
+
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_BSSID,
+                                  wireless->bssid, sizeof(wireless->bssid));
+        if (ret < 0)
+            return ret;
+    }
+
+    if (wireless->frequency) {
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY_FREQ,
+                                  &wireless->frequency,
+                                  sizeof(wireless->frequency));
+        if (ret < 0)
+            return ret;
+    }
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static int genl_append_nl80211_disconnect_event_msg(
+    char *buf, size_t *offset, size_t capacity, const netdev_t *dev,
+    const netdev_wireless_info_t *wireless, uint32_t seq, uint16_t reason_code,
+    bool by_ap) {
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t wiphy_index;
+    uint32_t ifindex;
+    size_t start;
+    size_t cur;
+    uint8_t disconnected_by_ap = by_ap ? 1 : 0;
+    int ret;
+
+    if (!buf || !offset || !dev || !wireless || !wireless->present)
+        return -EINVAL;
+
+    start = *offset;
+    ret =
+        netlink_append_raw_message(buf, offset, capacity, NAOS_GENL_ID_NL80211,
+                                   0, seq, NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)(buf + start);
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_DISCONNECT;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = start + NLMSG_ALIGN(nlh->nlmsg_len);
+
+    wiphy_index = wireless->wiphy_index;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_WIPHY,
+                              &wiphy_index, sizeof(wiphy_index));
+    if (ret < 0)
+        return ret;
+
+    ifindex = dev->id + 1;
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_IFINDEX,
+                              &ifindex, sizeof(ifindex));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_REASON_CODE,
+                              &reason_code, sizeof(reason_code));
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, &cur, capacity,
+                              NL80211_ATTR_DISCONNECTED_BY_AP,
+                              &disconnected_by_ap, sizeof(disconnected_by_ap));
+    if (ret < 0)
+        return ret;
+
+    if (wireless->ssid_len) {
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_SSID,
+                                  wireless->ssid, wireless->ssid_len);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!netlink_is_zero_mac(wireless->bssid)) {
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_MAC,
+                                  wireless->bssid, sizeof(wireless->bssid));
+        if (ret < 0)
+            return ret;
+
+        ret = netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_BSSID,
+                                  wireless->bssid, sizeof(wireless->bssid));
+        if (ret < 0)
+            return ret;
+    }
+
+    nlh->nlmsg_len = (uint32_t)(cur - start);
+    *offset = cur;
+    return 0;
+}
+
+static void genl_parse_scan_params(const struct rtattr *scan_ssids_attr,
+                                   netdev_scan_params_t *params) {
+    const struct rtattr *rta;
+    int remaining;
+
+    if (!params)
+        return;
+
+    memset(params, 0, sizeof(*params));
+    params->n_ssids = 1;
+
+    if (!scan_ssids_attr || scan_ssids_attr->rta_len <= RTA_LENGTH(0))
+        return;
+
+    rta = (const struct rtattr *)RTA_DATA(scan_ssids_attr);
+    remaining = (int)(scan_ssids_attr->rta_len - RTA_LENGTH(0));
+    params->n_ssids = 0;
+
+    while (RTA_OK(rta, remaining) && params->n_ssids < NETDEV_MAX_SCAN_SSIDS) {
+        size_t ssid_len =
+            rta->rta_len > RTA_LENGTH(0) ? rta->rta_len - RTA_LENGTH(0) : 0;
+
+        if (ssid_len > sizeof(params->ssids[0].ssid))
+            ssid_len = sizeof(params->ssids[0].ssid);
+
+        params->ssids[params->n_ssids].len = (uint8_t)ssid_len;
+        memcpy(params->ssids[params->n_ssids].ssid, RTA_DATA(rta), ssid_len);
+        params->n_ssids++;
+        rta = RTA_NEXT(rta, remaining);
+    }
+
+    if (params->n_ssids == 0)
+        params->n_ssids = 1;
+}
+
+static void genl_parse_connect_params(const void *attrs, size_t attr_len,
+                                      netdev_connect_params_t *params) {
+    const struct rtattr *ssid_attr;
+    const struct rtattr *auth_type_attr;
+    const struct rtattr *freq_attr;
+    const struct rtattr *privacy_attr;
+    const struct rtattr *bssid_attr;
+    const struct rtattr *mac_attr;
+    size_t ssid_len;
+
+    if (!params)
+        return;
+
+    memset(params, 0, sizeof(*params));
+    params->auth_type = NL80211_AUTHTYPE_AUTOMATIC;
+
+    ssid_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_SSID);
+    if (ssid_attr && ssid_attr->rta_len > RTA_LENGTH(0)) {
+        ssid_len = ssid_attr->rta_len - RTA_LENGTH(0);
+        if (ssid_len > sizeof(params->ssid))
+            ssid_len = sizeof(params->ssid);
+        params->ssid_len = (uint8_t)ssid_len;
+        memcpy(params->ssid, RTA_DATA(ssid_attr), ssid_len);
+    }
+
+    auth_type_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_AUTH_TYPE);
+    if (auth_type_attr &&
+        auth_type_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t))) {
+        params->auth_type = *(const uint32_t *)RTA_DATA(auth_type_attr);
+    }
+
+    freq_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_WIPHY_FREQ);
+    if (freq_attr && freq_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t)))
+        params->frequency = *(const uint32_t *)RTA_DATA(freq_attr);
+
+    params->privacy =
+        netlink_find_attr(attrs, attr_len, NL80211_ATTR_PRIVACY) != NULL;
+
+    bssid_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_BSSID);
+    mac_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_MAC);
+    if (bssid_attr && bssid_attr->rta_len >= RTA_LENGTH(6)) {
+        memcpy(params->bssid, RTA_DATA(bssid_attr), sizeof(params->bssid));
+        params->has_bssid = true;
+    } else if (mac_attr && mac_attr->rta_len >= RTA_LENGTH(6)) {
+        memcpy(params->bssid, RTA_DATA(mac_attr), sizeof(params->bssid));
+        params->has_bssid = true;
+    }
+}
+
+static int genl_handle_ctrl_getfamily(struct netlink_sock *sender_sock,
+                                      const struct nlmsghdr *req,
+                                      const struct genlmsghdr *genlh,
+                                      const void *attrs, size_t attr_len) {
+    const struct naos_genl_family_desc *fam = NULL;
+    const struct rtattr *name_attr;
+    const struct rtattr *id_attr;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    int ret;
+
+    (void)genlh;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    name_attr = netlink_find_attr(attrs, attr_len, CTRL_ATTR_FAMILY_NAME);
+    id_attr = netlink_find_attr(attrs, attr_len, CTRL_ATTR_FAMILY_ID);
+
+    if (name_attr && name_attr->rta_len > sizeof(*name_attr)) {
+        fam = naos_genl_family_by_name((const char *)RTA_DATA(name_attr));
+    } else if (id_attr && id_attr->rta_len >= RTA_LENGTH(sizeof(uint16_t))) {
+        fam = naos_genl_family_by_id(*(const uint16_t *)RTA_DATA(id_attr));
+    } else {
+        fam = &naos_genl_nl80211_family;
+    }
+
+    if (!fam)
+        return -ENOENT;
+
+    memset(reply, 0, sizeof(reply));
+    ret = genl_append_ctrl_family_msg(reply, &offset, sizeof(reply), req, fam);
+    if (ret < 0)
+        return ret;
+
+    if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0, 0))
+        return -ENOBUFS;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_get_wiphy(struct netlink_sock *sender_sock,
+                                         const struct nlmsghdr *req,
+                                         const void *attrs, size_t attr_len) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    const struct rtattr *wiphy_attr;
+    uint32_t want_wiphy = 0;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t count;
+    size_t offset = 0;
+    int ret = -ENOENT;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    wiphy_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_WIPHY);
+    if (wiphy_attr && wiphy_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t)))
+        want_wiphy = *(const uint32_t *)RTA_DATA(wiphy_attr);
+
+    memset(reply, 0, sizeof(reply));
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+
+    for (size_t i = 0; i < count; i++) {
+        netdev_wireless_info_t wireless;
+
+        if (!netdev_get_wireless_info(devs[i], &wireless))
+            continue;
+        if (want_wiphy && wireless.wiphy_index != want_wiphy)
+            continue;
+
+        ret = genl_append_nl80211_wiphy_msg(
+            reply, &offset, sizeof(reply), req, devs[i], &wireless,
+            (req->nlmsg_flags & NLM_F_DUMP) ? NLM_F_MULTI : 0);
+        if (ret < 0)
+            break;
+        if (!(req->nlmsg_flags & NLM_F_DUMP))
+            break;
+        ret = 0;
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (ret < 0)
+        return ret;
+
+    if ((req->nlmsg_flags & NLM_F_DUMP)) {
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!offset || !netlink_deliver_to_socket(sender_sock, reply, offset, 0, 0))
+        return -ENOBUFS;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_get_interface(struct netlink_sock *sender_sock,
+                                             const struct nlmsghdr *req,
+                                             const void *attrs,
+                                             size_t attr_len) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    const struct rtattr *ifindex_attr;
+    const struct rtattr *wiphy_attr;
+    uint32_t want_ifindex = 0;
+    uint32_t want_wiphy = 0;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t count;
+    size_t offset = 0;
+    int ret = -ENOENT;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (ifindex_attr && ifindex_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t)))
+        want_ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+
+    wiphy_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_WIPHY);
+    if (wiphy_attr && wiphy_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t)))
+        want_wiphy = *(const uint32_t *)RTA_DATA(wiphy_attr);
+
+    memset(reply, 0, sizeof(reply));
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+
+    for (size_t i = 0; i < count; i++) {
+        netdev_wireless_info_t wireless;
+
+        if (!netdev_get_wireless_info(devs[i], &wireless))
+            continue;
+        if (want_ifindex && devs[i]->id + 1 != want_ifindex)
+            continue;
+        if (want_wiphy && wireless.wiphy_index != want_wiphy)
+            continue;
+
+        ret = genl_append_nl80211_interface_msg(
+            reply, &offset, sizeof(reply), req, devs[i], &wireless,
+            (req->nlmsg_flags & NLM_F_DUMP) ? NLM_F_MULTI : 0);
+        if (ret < 0)
+            break;
+        if (!(req->nlmsg_flags & NLM_F_DUMP))
+            break;
+        ret = 0;
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (ret < 0)
+        return ret;
+
+    if ((req->nlmsg_flags & NLM_F_DUMP)) {
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!offset || !netlink_deliver_to_socket(sender_sock, reply, offset, 0, 0))
+        return -ENOBUFS;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_trigger_scan(struct netlink_sock *sender_sock,
+                                            const struct nlmsghdr *req,
+                                            const void *attrs,
+                                            size_t attr_len) {
+    const struct rtattr *ifindex_attr;
+    const struct rtattr *scan_ssids_attr;
+    netdev_scan_params_t params;
+    netdev_t *dev;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    uint32_t ifindex;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (!ifindex_attr || ifindex_attr->rta_len < RTA_LENGTH(sizeof(uint32_t)))
+        return -EINVAL;
+
+    ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+    dev = netdev_get_by_index(ifindex);
+    if (!dev)
+        return -ENODEV;
+
+    scan_ssids_attr =
+        netlink_find_attr(attrs, attr_len, NL80211_ATTR_SCAN_SSIDS);
+    genl_parse_scan_params(scan_ssids_attr, &params);
+
+    ret = netdev_trigger_scan(dev, &params, sender_sock->portid);
+    netdev_put(dev);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_get_scan(struct netlink_sock *sender_sock,
+                                        const struct nlmsghdr *req,
+                                        const void *attrs, size_t attr_len) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    const struct rtattr *ifindex_attr;
+    uint32_t want_ifindex = 0;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t count;
+    size_t offset = 0;
+    int ret = 0;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (ifindex_attr && ifindex_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t)))
+        want_ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+
+    memset(reply, 0, sizeof(reply));
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+
+    for (size_t i = 0; i < count; i++) {
+        netdev_wireless_info_t wireless;
+        netdev_scan_state_t scan;
+
+        if (!netdev_get_wireless_info(devs[i], &wireless))
+            continue;
+        if (want_ifindex && devs[i]->id + 1 != want_ifindex)
+            continue;
+        if (!netdev_get_scan_state(devs[i], &scan))
+            continue;
+
+        for (uint32_t j = 0; j < NETDEV_MAX_SCAN_RESULTS; j++) {
+            if (!scan.results[j].valid)
+                continue;
+
+            size_t prev_offset = offset;
+            ret = genl_append_nl80211_scan_result_msg(
+                reply, &offset, sizeof(reply), req, devs[i], &wireless, &scan,
+                &scan.results[j], NLM_F_MULTI);
+            if (ret == -EMSGSIZE && prev_offset > 0) {
+                ret = netlink_flush_reply_to_socket(sender_sock, reply,
+                                                    &prev_offset);
+                if (ret < 0)
+                    break;
+                offset = 0;
+                ret = genl_append_nl80211_scan_result_msg(
+                    reply, &offset, sizeof(reply), req, devs[i], &wireless,
+                    &scan, &scan.results[j], NLM_F_MULTI);
+            }
+            if (ret < 0)
+                break;
+        }
+        if (ret < 0)
+            break;
+        ret = 0;
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    if (ret == -EMSGSIZE && offset > 0) {
+        ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+        if (ret < 0)
+            return ret;
+        ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    }
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int
+genl_handle_nl80211_get_protocol_features(struct netlink_sock *sender_sock,
+                                          const struct nlmsghdr *req) {
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t features = 0;
+    size_t cur;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+    ret = netlink_append_raw_message(reply, &offset, sizeof(reply),
+                                     NAOS_GENL_ID_NL80211, 0, req->nlmsg_seq,
+                                     NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)reply;
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_GET_PROTOCOL_FEATURES;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = NLMSG_ALIGN(nlh->nlmsg_len);
+    ret = netlink_append_attr(reply, &cur, sizeof(reply),
+                              NL80211_ATTR_PROTOCOL_FEATURES, &features,
+                              sizeof(features));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)cur;
+
+    if (!netlink_deliver_to_socket(sender_sock, reply, cur, 0, 0))
+        return -ENOBUFS;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_connect(struct netlink_sock *sender_sock,
+                                       const struct nlmsghdr *req,
+                                       const void *attrs, size_t attr_len) {
+    const struct rtattr *ifindex_attr;
+    netdev_connect_params_t params;
+    netdev_t *dev;
+    uint32_t ifindex;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (!ifindex_attr || ifindex_attr->rta_len < RTA_LENGTH(sizeof(uint32_t)))
+        return -EINVAL;
+
+    genl_parse_connect_params(attrs, attr_len, &params);
+    if (!params.ssid_len && !params.has_bssid)
+        return -EINVAL;
+
+    ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+    dev = netdev_get_by_index(ifindex);
+    if (!dev)
+        return -ENODEV;
+
+    ret = netdev_trigger_connect(dev, &params, sender_sock->portid);
+    netdev_put(dev);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_disconnect(struct netlink_sock *sender_sock,
+                                          const struct nlmsghdr *req,
+                                          const void *attrs, size_t attr_len) {
+    const struct rtattr *ifindex_attr;
+    const struct rtattr *reason_attr;
+    netdev_t *dev;
+    uint32_t ifindex;
+    uint16_t reason_code = 3;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (!ifindex_attr || ifindex_attr->rta_len < RTA_LENGTH(sizeof(uint32_t)))
+        return -EINVAL;
+
+    reason_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_REASON_CODE);
+    if (reason_attr && reason_attr->rta_len >= RTA_LENGTH(sizeof(uint16_t)))
+        reason_code = *(const uint16_t *)RTA_DATA(reason_attr);
+
+    ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+    dev = netdev_get_by_index(ifindex);
+    if (!dev)
+        return -ENODEV;
+
+    ret = netdev_trigger_disconnect(dev, reason_code, sender_sock->portid);
+    netdev_put(dev);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int genl_handle_request(struct netlink_sock *sender_sock,
+                               const struct nlmsghdr *req) {
+    const struct genlmsghdr *genlh;
+    const void *attrs;
+    size_t payload_len;
+    size_t attr_len;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+    if (req->nlmsg_len < NLMSG_LENGTH(sizeof(struct genlmsghdr)))
+        return -EINVAL;
+
+    genlh = (const struct genlmsghdr *)NLMSG_DATA(req);
+    payload_len = req->nlmsg_len - NLMSG_HDRLEN;
+    if (payload_len < sizeof(*genlh))
+        return -EINVAL;
+
+    attrs = (const char *)genlh + GENL_HDRLEN;
+    attr_len = payload_len - GENL_HDRLEN;
+
+    if (req->nlmsg_type == GENL_ID_CTRL) {
+        if (genlh->cmd == CTRL_CMD_GETFAMILY)
+            return genl_handle_ctrl_getfamily(sender_sock, req, genlh, attrs,
+                                              attr_len);
+        printk("Unsupported GENL_ID_CTRL genlh->cmd = %d\n", genlh->cmd);
+        return -EOPNOTSUPP;
+    }
+
+    if (req->nlmsg_type == NAOS_GENL_ID_NL80211) {
+        switch (genlh->cmd) {
+        case NL80211_CMD_GET_WIPHY:
+            return genl_handle_nl80211_get_wiphy(sender_sock, req, attrs,
+                                                 attr_len);
+        case NL80211_CMD_GET_INTERFACE:
+            return genl_handle_nl80211_get_interface(sender_sock, req, attrs,
+                                                     attr_len);
+        case NL80211_CMD_TRIGGER_SCAN:
+            return genl_handle_nl80211_trigger_scan(sender_sock, req, attrs,
+                                                    attr_len);
+        case NL80211_CMD_GET_SCAN:
+            return genl_handle_nl80211_get_scan(sender_sock, req, attrs,
+                                                attr_len);
+        case NL80211_CMD_CONNECT:
+            return genl_handle_nl80211_connect(sender_sock, req, attrs,
+                                               attr_len);
+        case NL80211_CMD_DISCONNECT:
+            return genl_handle_nl80211_disconnect(sender_sock, req, attrs,
+                                                  attr_len);
+        case NL80211_CMD_GET_PROTOCOL_FEATURES:
+            return genl_handle_nl80211_get_protocol_features(sender_sock, req);
+        default:
+            printk("Unsupported NAOS_GENL_ID_NL80211 genlh->cmd = %d\n",
+                   genlh->cmd);
+            return -EOPNOTSUPP;
+        }
+    }
+
+    return -ENOENT;
+}
+
 static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
                                   const char *data, size_t len,
                                   uint32_t sender_pid) {
-    (void)sender_sock;
-    (void)data;
-    (void)len;
     (void)sender_pid;
+    const struct nlmsghdr *req;
+    size_t remaining;
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    int ret = -EOPNOTSUPP;
 
-    return -EOPNOTSUPP;
+    if (!sender_sock || !data || len < sizeof(struct nlmsghdr))
+        return -EINVAL;
+
+    if (sender_sock->protocol == NETLINK_ROUTE ||
+        sender_sock->protocol == NETLINK_GENERIC) {
+        remaining = len;
+        req = (const struct nlmsghdr *)data;
+
+        while (NLMSG_OK(req, remaining)) {
+            ret = sender_sock->protocol == NETLINK_ROUTE
+                      ? rtnetlink_handle_request(sender_sock, req)
+                      : genl_handle_request(sender_sock, req);
+            if (ret < 0) {
+                if (sender_sock->protocol == NETLINK_GENERIC &&
+                    req->nlmsg_len >= NLMSG_LENGTH(sizeof(struct genlmsghdr))) {
+                    const struct genlmsghdr *genlh =
+                        (const struct genlmsghdr *)NLMSG_DATA(req);
+                    printk("netlink: error protocol=%d nlmsg_type=%u "
+                           "genl_cmd=%u seq=%u ret=%d flags=0x%x\n",
+                           sender_sock->protocol, req->nlmsg_type, genlh->cmd,
+                           req->nlmsg_seq, ret, req->nlmsg_flags);
+                } else {
+                    printk("netlink: error protocol=%d nlmsg_type=%u seq=%u "
+                           "ret=%d flags=0x%x\n",
+                           sender_sock->protocol, req->nlmsg_type,
+                           req->nlmsg_seq, ret, req->nlmsg_flags);
+                }
+                memset(reply, 0, sizeof(reply));
+                offset = 0;
+                if (netlink_append_ack(reply, &offset, sizeof(reply), req,
+                                       ret) < 0)
+                    return ret;
+                if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0,
+                                               0))
+                    return -ENOBUFS;
+                return ret;
+            }
+
+            if ((req->nlmsg_flags & NLM_F_ACK) &&
+                !(req->nlmsg_flags & NLM_F_DUMP)) {
+                memset(reply, 0, sizeof(reply));
+                offset = 0;
+                if (netlink_append_ack(reply, &offset, sizeof(reply), req, 0) <
+                    0)
+                    return -EMSGSIZE;
+                if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0,
+                                               0))
+                    return -ENOBUFS;
+            }
+
+            req = NLMSG_NEXT(req, remaining);
+        }
+
+        return 0;
+    }
+    printk("Unsupported sender_sock->protocol = %d\n", sender_sock->protocol);
+
+    return ret;
 }
 
 static int netlink_wait_for_message(struct netlink_sock *sock, fd_t *file,
@@ -266,10 +2250,72 @@ static skb_buff_t *netlink_packet_build_skb(const char *data, size_t len,
 
 static void netlink_buffer_init(struct netlink_buffer *buf) {
     memset(buf, 0, sizeof(struct netlink_buffer));
-    buf->size = NETLINK_BUFFER_SIZE;
-    skb_queue_init(&buf->queue, NETLINK_BUFFER_SIZE,
-                   netlink_packet_meta_destroy);
+    buf->size = NETLINK_BUFFER_INITIAL_SIZE;
+    buf->max_size = NETLINK_BUFFER_MAX_SIZE;
+    skb_queue_init(&buf->queue, buf->size, netlink_packet_meta_destroy);
     buf->lock = SPIN_INIT;
+}
+
+static inline size_t
+netlink_buffer_trim_target(const struct netlink_buffer *buf,
+                           size_t incoming_len) {
+    size_t reserve;
+
+    if (!buf)
+        return 0;
+
+    reserve = MAX(incoming_len, buf->size / 4);
+    if (reserve >= buf->size)
+        return 0;
+    return buf->size - reserve;
+}
+
+static void netlink_buffer_resize_locked(struct netlink_buffer *buf,
+                                         size_t new_size) {
+    if (!buf)
+        return;
+    if (new_size < NETLINK_BUFFER_INITIAL_SIZE)
+        new_size = NETLINK_BUFFER_INITIAL_SIZE;
+    if (new_size > buf->max_size)
+        new_size = buf->max_size;
+    if (new_size <= buf->size)
+        return;
+
+    buf->size = new_size;
+    skb_queue_set_limit(&buf->queue, new_size);
+}
+
+static bool netlink_buffer_make_room_locked(struct netlink_buffer *buf,
+                                            size_t len) {
+    size_t target_size;
+    size_t trim_target;
+    skb_buff_t *skb;
+
+    if (!buf || len == 0)
+        return false;
+    if (len > buf->max_size)
+        return false;
+
+    while (skb_queue_space(&buf->queue) < len && buf->size < buf->max_size) {
+        target_size = buf->size ? buf->size : NETLINK_BUFFER_INITIAL_SIZE;
+        while (target_size < len && target_size < buf->max_size)
+            target_size <<= 1;
+        if (target_size < buf->size * 2 && buf->size < buf->max_size)
+            target_size = MIN(buf->size * 2, buf->max_size);
+        netlink_buffer_resize_locked(buf, target_size);
+    }
+
+    trim_target = netlink_buffer_trim_target(buf, len);
+    while ((skb_queue_space(&buf->queue) < len ||
+            skb_queue_bytes(&buf->queue) > trim_target) &&
+           skb_queue_packets(&buf->queue) > 0) {
+        skb = skb_queue_pop(&buf->queue);
+        if (skb)
+            skb_free(skb, buf->queue.priv_destructor);
+    }
+
+    buf->used_bytes = skb_queue_bytes(&buf->queue);
+    return skb_queue_space(&buf->queue) >= len;
 }
 
 static inline void netlink_notify_sock(struct netlink_sock *sock,
@@ -370,7 +2416,7 @@ size_t netlink_buffer_write_packet(struct netlink_sock *sock, const char *data,
         len = MIN(len, accept_bytes);
     }
 
-    if (len > buf->size)
+    if (len > buf->max_size)
         return 0;
 
     skb = netlink_packet_build_skb(data, len, nl_pid, nl_groups);
@@ -378,7 +2424,8 @@ size_t netlink_buffer_write_packet(struct netlink_sock *sock, const char *data,
         return 0;
 
     spin_lock(&buf->lock);
-    if (!skb_queue_push(&buf->queue, skb)) {
+    if (!netlink_buffer_make_room_locked(buf, len) ||
+        !skb_queue_push(&buf->queue, skb)) {
         spin_unlock(&buf->lock);
         skb_free(skb, netlink_packet_meta_destroy);
         return 0;
@@ -668,7 +2715,7 @@ size_t netlink_getsockopt(uint64_t fd, int level, int optname, void *optval,
         case SO_RCVBUFFORCE:
             if (!optval || !optlen || *optlen < sizeof(int))
                 return -EINVAL;
-            *(int *)optval = (int)NETLINK_BUFFER_SIZE;
+            *(int *)optval = (int)nl_sk->buffer->size;
             *optlen = sizeof(int);
             break;
         default:
@@ -738,6 +2785,31 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
         case SO_SNDBUFFORCE:
         case SO_RCVBUF:
         case SO_RCVBUFFORCE:
+            if (!optval || optlen < sizeof(int))
+                return -EINVAL;
+            if (nl_sk->buffer) {
+                int req_size = *(const int *)optval;
+                size_t new_size = req_size > 0 ? (size_t)req_size
+                                               : NETLINK_BUFFER_INITIAL_SIZE;
+
+                spin_lock(&nl_sk->buffer->lock);
+                if (new_size > nl_sk->buffer->max_size)
+                    nl_sk->buffer->max_size = new_size;
+                if (new_size < NETLINK_BUFFER_INITIAL_SIZE)
+                    new_size = NETLINK_BUFFER_INITIAL_SIZE;
+                if (new_size > nl_sk->buffer->max_size)
+                    new_size = nl_sk->buffer->max_size;
+                skb_queue_set_limit(&nl_sk->buffer->queue, new_size);
+                nl_sk->buffer->size = new_size;
+                if (skb_queue_bytes(&nl_sk->buffer->queue) > new_size) {
+                    while (skb_queue_bytes(&nl_sk->buffer->queue) > new_size &&
+                           skb_queue_packets(&nl_sk->buffer->queue) > 0)
+                        skb_queue_drop_head(&nl_sk->buffer->queue);
+                }
+                nl_sk->buffer->used_bytes =
+                    skb_queue_bytes(&nl_sk->buffer->queue);
+                spin_unlock(&nl_sk->buffer->lock);
+            }
             break;
         default:
             printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
@@ -818,13 +2890,13 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
     }
 
     bool peek = !!(flags & MSG_PEEK);
-    char temp_buf[NETLINK_BUFFER_SIZE];
+    char *temp_buf = NULL;
     uint32_t sender_pid = 0;
     uint32_t sender_groups = 0;
     size_t packet_len;
     size_t bytes_read;
     size_t bytes_copied;
-    size_t name_len = sizeof(struct sockaddr_nl);
+    size_t name_len = 0;
 
     msg->msg_flags = 0;
 
@@ -834,10 +2906,19 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
         return (size_t)wait_ret;
 
     packet_len = netlink_buffer_peek_msg_len(nl_sk);
-    bytes_read = netlink_buffer_read_packet(nl_sk, temp_buf, sizeof(temp_buf),
-                                            &sender_pid, &sender_groups, peek);
-    if (bytes_read == 0)
+    if (packet_len == 0)
         return -EAGAIN;
+
+    temp_buf = malloc(packet_len);
+    if (!temp_buf)
+        return -ENOMEM;
+
+    bytes_read = netlink_buffer_read_packet(nl_sk, temp_buf, packet_len,
+                                            &sender_pid, &sender_groups, peek);
+    if (bytes_read == 0) {
+        free(temp_buf);
+        return -EAGAIN;
+    }
 
     bytes_copied = netlink_copy_to_iov(msg->msg_iov, msg->msg_iovlen, temp_buf,
                                        bytes_read);
@@ -850,7 +2931,7 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
             memcpy(msg->msg_name, &nl_addr, name_len);
         }
     }
-    msg->msg_namelen = sizeof(struct sockaddr_nl);
+    msg->msg_namelen = msg->msg_name ? sizeof(struct sockaddr_nl) : 0;
 
     if (msg->msg_control && msg->msg_controllen > 0 && nl_sk->passcred) {
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
@@ -876,6 +2957,7 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
     if (bytes_copied < bytes_read)
         msg->msg_flags |= MSG_TRUNC;
 
+    free(temp_buf);
     return (flags & MSG_TRUNC) ? packet_len : bytes_copied;
 }
 
@@ -998,7 +3080,8 @@ size_t netlink_sendto(uint64_t fd, uint8_t *in, size_t limit, int flags,
         return limit;
     }
 
-    return (size_t)netlink_send_to_kernel(nl_sk, (char *)in, limit, sender_pid);
+    int ret = netlink_send_to_kernel(nl_sk, (char *)in, limit, sender_pid);
+    return ret < 0 ? (size_t)ret : limit;
 }
 
 size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
@@ -1016,6 +3099,7 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
     }
 
     bool peek = !!(flags & MSG_PEEK);
+    char *temp_buf = NULL;
     uint32_t sender_pid = 0;
     uint32_t sender_groups = 0;
     int wait_ret =
@@ -1027,11 +3111,23 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
         return (size_t)wait_ret;
 
     msg_len = netlink_buffer_peek_msg_len(nl_sk);
-    bytes_read = netlink_buffer_read_packet(nl_sk, (char *)out, limit,
+    if (msg_len == 0)
+        return -EAGAIN;
+
+    temp_buf = malloc(msg_len);
+    if (!temp_buf)
+        return -ENOMEM;
+
+    bytes_read = netlink_buffer_read_packet(nl_sk, temp_buf, msg_len,
                                             &sender_pid, &sender_groups, peek);
     if (bytes_read == 0) {
+        free(temp_buf);
         return -EAGAIN;
     }
+
+    if (out && limit > 0)
+        memcpy(out, temp_buf, MIN(limit, bytes_read));
+    free(temp_buf);
 
     if (addr) {
         struct sockaddr_nl nl_addr_out;
@@ -1046,7 +3142,7 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
         memcpy(len, &addr_len, sizeof(uint32_t));
     }
 
-    return (flags & MSG_TRUNC) ? msg_len : bytes_read;
+    return (flags & MSG_TRUNC) ? msg_len : MIN(limit, bytes_read);
 }
 
 socket_op_t netlink_ops = {
@@ -1257,6 +3353,7 @@ int netlink_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         return 0;
 
     default:
+        printk("Unsupported netlink ioctl cmd = %#010x\n", cmd);
         return -ENOTTY;
     }
 }
@@ -1374,4 +3471,187 @@ void netlink_kernel_uevent_send(const char *buf, int len) {
     // This will save to pool and broadcast to existing sockets
     netlink_broadcast_to_group(buf, len, 0, 1, NETLINK_KOBJECT_UEVENT, seqnum,
                                devpath);
+}
+
+void netlink_publish_scan_event(netdev_t *dev, bool aborted) {
+    netdev_wireless_info_t wireless;
+    netdev_scan_state_t scan;
+    char buffer[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    struct netlink_sock *sock = NULL;
+    uint32_t groups = netlink_group_bit(NL80211_MCGRP_SCAN_ID);
+
+    if (!dev)
+        return;
+    if (!netdev_get_wireless_info(dev, &wireless))
+        return;
+    if (!netdev_get_scan_state(dev, &scan))
+        return;
+
+    memset(buffer, 0, sizeof(buffer));
+    if (genl_append_nl80211_scan_event_msg(buffer, &offset, sizeof(buffer), dev,
+                                           &wireless, &scan, aborted) < 0)
+        return;
+
+    netlink_broadcast_to_group(buffer, offset, 0, groups, NETLINK_GENERIC, 0,
+                               NULL);
+
+    if (!scan.request_portid)
+        return;
+
+    spin_lock(&netlink_sockets_lock);
+    sock = netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC,
+                                                scan.request_portid);
+    if (sock) {
+        spin_lock(&sock->lock);
+        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        spin_unlock(&sock->lock);
+    }
+    spin_unlock(&netlink_sockets_lock);
+}
+
+void netlink_publish_connect_result(netdev_t *dev, uint32_t request_portid,
+                                    uint16_t status_code) {
+    netdev_wireless_info_t wireless;
+    char buffer[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    struct netlink_sock *sock = NULL;
+    uint32_t groups = netlink_group_bit(NL80211_MCGRP_MLME_ID);
+
+    if (!dev)
+        return;
+    if (!netdev_get_wireless_info(dev, &wireless))
+        return;
+
+    memset(buffer, 0, sizeof(buffer));
+    if (genl_append_nl80211_connect_event_msg(buffer, &offset, sizeof(buffer),
+                                              dev, &wireless, 0,
+                                              status_code) < 0)
+        return;
+
+    netlink_broadcast_to_group(buffer, offset, 0, groups, NETLINK_GENERIC, 0,
+                               NULL);
+
+    if (!request_portid)
+        return;
+
+    spin_lock(&netlink_sockets_lock);
+    sock =
+        netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC, request_portid);
+    if (sock) {
+        spin_lock(&sock->lock);
+        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        spin_unlock(&sock->lock);
+    }
+    spin_unlock(&netlink_sockets_lock);
+}
+
+void netlink_publish_disconnect_event(struct netdev *dev,
+                                      uint32_t request_portid,
+                                      uint16_t reason_code, bool by_ap) {
+    netdev_wireless_info_t wireless;
+    char buffer[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    struct netlink_sock *sock = NULL;
+    uint32_t groups = netlink_group_bit(NL80211_MCGRP_MLME_ID);
+
+    if (!dev)
+        return;
+    if (!netdev_get_wireless_info(dev, &wireless))
+        return;
+
+    memset(buffer, 0, sizeof(buffer));
+    if (genl_append_nl80211_disconnect_event_msg(buffer, &offset,
+                                                 sizeof(buffer), dev, &wireless,
+                                                 0, reason_code, by_ap) < 0)
+        return;
+
+    netlink_broadcast_to_group(buffer, offset, 0, groups, NETLINK_GENERIC, 0,
+                               NULL);
+
+    if (!request_portid)
+        return;
+
+    spin_lock(&netlink_sockets_lock);
+    sock =
+        netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC, request_portid);
+    if (sock) {
+        spin_lock(&sock->lock);
+        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        spin_unlock(&sock->lock);
+    }
+    spin_unlock(&netlink_sockets_lock);
+}
+
+void netlink_publish_netdev_event(netdev_t *dev, uint32_t events) {
+    char buffer[NETLINK_BUFFER_SIZE];
+    struct nlmsghdr req = {0};
+    netdev_ipv4_info_t ipv4;
+    size_t offset = 0;
+    uint16_t msg_type;
+    uint32_t groups = netlink_group_bit(RTNLGRP_LINK);
+
+    if (!dev || !events)
+        return;
+
+    if (events & NETDEV_EVENT_UNREGISTERED)
+        msg_type = RTM_DELLINK;
+    else if (events & (NETDEV_EVENT_REGISTERED | NETDEV_EVENT_ADMIN_UP |
+                       NETDEV_EVENT_ADMIN_DOWN | NETDEV_EVENT_LINK_UP |
+                       NETDEV_EVENT_LINK_DOWN | NETDEV_EVENT_CONFIG_CHANGED))
+        msg_type = RTM_NEWLINK;
+    else
+        return;
+
+    memset(buffer, 0, sizeof(buffer));
+    if (rtnetlink_append_link_msg(buffer, &offset, sizeof(buffer), dev,
+                                  msg_type, 0, 0) < 0)
+        return;
+
+    netlink_broadcast_to_group(buffer, offset, 0, groups, NETLINK_ROUTE, 0,
+                               NULL);
+
+    if (!(events & NETDEV_EVENT_CONFIG_CHANGED) ||
+        !netdev_get_ipv4_info(dev, &ipv4) || !ipv4.present)
+        return;
+
+    memset(&req, 0, sizeof(req));
+
+    offset = 0;
+    memset(buffer, 0, sizeof(buffer));
+    if (rtnetlink_append_addr_msg(buffer, &offset, sizeof(buffer), &req, dev,
+                                  &ipv4, 0) == 0) {
+        netlink_broadcast_to_group(buffer, offset, 0,
+                                   netlink_group_bit(RTNLGRP_IPV4_IFADDR),
+                                   NETLINK_ROUTE, 0, NULL);
+    }
+
+    offset = 0;
+    memset(buffer, 0, sizeof(buffer));
+    if (rtnetlink_append_route_msg(buffer, &offset, sizeof(buffer), &req, dev,
+                                   &ipv4, false, 0) == 0) {
+        netlink_broadcast_to_group(buffer, offset, 0,
+                                   netlink_group_bit(RTNLGRP_IPV4_ROUTE),
+                                   NETLINK_ROUTE, 0, NULL);
+    }
+
+    if (ipv4.has_default_route) {
+        offset = 0;
+        memset(buffer, 0, sizeof(buffer));
+        if (rtnetlink_append_route_msg(buffer, &offset, sizeof(buffer), &req,
+                                       dev, &ipv4, true, 0) == 0) {
+            netlink_broadcast_to_group(buffer, offset, 0,
+                                       netlink_group_bit(RTNLGRP_IPV4_ROUTE),
+                                       NETLINK_ROUTE, 0, NULL);
+        }
+    }
+
+    offset = 0;
+    memset(buffer, 0, sizeof(buffer));
+    if (rtnetlink_append_rule_msg(buffer, &offset, sizeof(buffer), &req,
+                                  RT_TABLE_MAIN, 32766, 0) == 0) {
+        netlink_broadcast_to_group(buffer, offset, 0,
+                                   netlink_group_bit(RTNLGRP_IPV4_RULE),
+                                   NETLINK_ROUTE, 0, NULL);
+    }
 }

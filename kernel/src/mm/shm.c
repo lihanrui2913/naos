@@ -82,7 +82,7 @@ static void *find_free_region(vma_manager_t *mgr, size_t size) {
 }
 
 static shm_mapping_t *mapping_add(task_t *task, shm_t *shm, uint64_t uaddr) {
-    shm_mapping_t *m = malloc(sizeof(*m));
+    shm_mapping_t *m = calloc(1, sizeof(*m));
     if (!m)
         return NULL;
 
@@ -390,7 +390,7 @@ void shm_fork(task_t *parent, task_t *child) {
 
     child->shm_ids = NULL;
     for (shm_mapping_t *m = parent->shm_ids; m; m = m->next) {
-        shm_mapping_t *cm = malloc(sizeof(*cm));
+        shm_mapping_t *cm = calloc(1, sizeof(*cm));
         if (!cm)
             continue;
         cm->shm = m->shm;

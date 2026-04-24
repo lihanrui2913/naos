@@ -11,7 +11,11 @@ typedef void (*netdev_event_cb_t)(struct netdev *dev, uint32_t events,
 #define MAX_NETDEV_NUM 8
 #define NETDEV_ETH_FRAME_OVERHEAD 18
 #define NETDEV_NAME_LEN 16
+#define NETDEV_WIPHY_NAME_LEN 16
 #define NETDEV_MAX_EVENT_LISTENERS 8
+#define NETDEV_MAX_SCAN_SSIDS 4
+#define NETDEV_MAX_SCAN_RESULTS 64
+#define NETDEV_MAX_SCAN_IE_LEN 768
 
 enum netdev_type {
     NETDEV_TYPE_ETHERNET = 0,
@@ -34,6 +38,78 @@ typedef struct netdev_listener {
     void *ctx;
 } netdev_listener_t;
 
+typedef struct netdev_wireless_info {
+    bool present;
+    bool connected;
+    uint32_t wiphy_index;
+    uint32_t iftype;
+    uint32_t interface_modes;
+    uint32_t max_scan_ssids;
+    uint32_t frequency;
+    uint8_t ssid_len;
+    uint8_t ssid[32];
+    uint8_t bssid[6];
+    char wiphy_name[NETDEV_WIPHY_NAME_LEN];
+} netdev_wireless_info_t;
+
+typedef struct netdev_ipv4_info {
+    bool present;
+    bool has_default_route;
+    uint32_t address;
+    uint32_t netmask;
+    uint32_t gateway;
+} netdev_ipv4_info_t;
+
+typedef struct netdev_scan_ssid {
+    uint8_t len;
+    uint8_t ssid[32];
+} netdev_scan_ssid_t;
+
+typedef struct netdev_scan_params {
+    uint32_t n_ssids;
+    netdev_scan_ssid_t ssids[NETDEV_MAX_SCAN_SSIDS];
+} netdev_scan_params_t;
+
+typedef struct netdev_scan_result {
+    bool valid;
+    uint8_t bssid[6];
+    uint32_t frequency;
+    int32_t signal_mbm;
+    uint64_t tsf;
+    uint32_t seen_ms_ago;
+    uint16_t beacon_interval;
+    uint16_t capability;
+    uint16_t ie_len;
+    uint8_t ies[NETDEV_MAX_SCAN_IE_LEN];
+} netdev_scan_result_t;
+
+typedef struct netdev_scan_state {
+    bool running;
+    bool last_aborted;
+    uint32_t generation;
+    uint32_t request_portid;
+    uint32_t result_count;
+    netdev_scan_result_t results[NETDEV_MAX_SCAN_RESULTS];
+} netdev_scan_state_t;
+
+typedef int (*netdev_trigger_scan_t)(void *desc,
+                                     const netdev_scan_params_t *params,
+                                     uint32_t request_portid);
+typedef struct netdev_connect_params {
+    bool has_bssid;
+    bool privacy;
+    uint8_t ssid_len;
+    uint8_t ssid[32];
+    uint8_t bssid[6];
+    uint32_t frequency;
+    uint32_t auth_type;
+} netdev_connect_params_t;
+typedef int (*netdev_trigger_connect_t)(void *desc,
+                                        const netdev_connect_params_t *params,
+                                        uint32_t request_portid);
+typedef int (*netdev_trigger_disconnect_t)(void *desc, uint16_t reason_code,
+                                           uint32_t request_portid);
+
 static inline uint32_t netdev_max_frame_len(uint32_t mtu) {
     return mtu + NETDEV_ETH_FRAME_OVERHEAD;
 }
@@ -51,7 +127,13 @@ typedef struct netdev {
     void *desc;
     netdev_send_t send;
     netdev_recv_t recv;
+    netdev_trigger_scan_t trigger_scan;
+    netdev_trigger_connect_t trigger_connect;
+    netdev_trigger_disconnect_t trigger_disconnect;
     spinlock_t lock;
+    netdev_wireless_info_t wireless;
+    netdev_ipv4_info_t ipv4;
+    netdev_scan_state_t scan;
     netdev_listener_t listeners[NETDEV_MAX_EVENT_LISTENERS];
 } netdev_t;
 
@@ -63,8 +145,29 @@ void regist_netdev(void *desc, uint8_t *mac, uint32_t mtu, netdev_send_t send,
 
 netdev_t *get_default_netdev();
 netdev_t *netdev_get_by_name(const char *name);
+netdev_t *netdev_get_by_index(uint32_t ifindex);
+size_t netdev_snapshot(netdev_t **out, size_t max);
 
 int netdev_set_name(netdev_t *dev, const char *name);
+int netdev_set_trigger_scan(netdev_t *dev, netdev_trigger_scan_t trigger_scan);
+int netdev_set_trigger_connect(netdev_t *dev,
+                               netdev_trigger_connect_t trigger_connect);
+int netdev_set_trigger_disconnect(
+    netdev_t *dev, netdev_trigger_disconnect_t trigger_disconnect);
+int netdev_set_wireless_info(netdev_t *dev, const netdev_wireless_info_t *info);
+bool netdev_get_wireless_info(netdev_t *dev, netdev_wireless_info_t *info);
+int netdev_set_ipv4_info(netdev_t *dev, const netdev_ipv4_info_t *info);
+bool netdev_get_ipv4_info(netdev_t *dev, netdev_ipv4_info_t *info);
+int netdev_trigger_scan(netdev_t *dev, const netdev_scan_params_t *params,
+                        uint32_t request_portid);
+int netdev_trigger_connect(netdev_t *dev, const netdev_connect_params_t *params,
+                           uint32_t request_portid);
+int netdev_trigger_disconnect(netdev_t *dev, uint16_t reason_code,
+                              uint32_t request_portid);
+int netdev_scan_begin(netdev_t *dev, uint32_t request_portid);
+int netdev_scan_store_result(netdev_t *dev, const netdev_scan_result_t *result);
+int netdev_scan_complete(netdev_t *dev, bool aborted);
+bool netdev_get_scan_state(netdev_t *dev, netdev_scan_state_t *state);
 int netdev_set_link_state(netdev_t *dev, bool link_up);
 int netdev_set_admin_state(netdev_t *dev, bool admin_up);
 int netdev_unregister(netdev_t *dev);

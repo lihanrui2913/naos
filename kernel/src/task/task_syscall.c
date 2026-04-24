@@ -9,6 +9,7 @@
 #include <task/ptrace.h>
 #include <task/task_syscall.h>
 
+extern sched_rq_t schedulers[MAX_CPU_NUM];
 extern hashmap_t task_parent_map;
 extern hashmap_t task_pgid_map;
 extern struct llist_header should_free_tasks;
@@ -2546,7 +2547,7 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
         ret = (uint64_t)-ENOMEM;
         goto fail;
     }
-    add_sched_entity(child, schedulers[child->cpu_id]);
+    add_sched_entity(child, &schedulers[child->cpu_id]);
 
     on_new_task_call(child);
     for (uint64_t i = 0; i < MAX_FD_NUM; i++) {

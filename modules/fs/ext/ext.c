@@ -590,7 +590,7 @@ static inline ext_mount_ctx_t *ext_sb_info(struct vfs_super_block *sb) {
 }
 
 static inline ext_inode_info_t *ext_i(struct vfs_inode *inode) {
-    return inode ? container_of(inode, ext_inode_info_t, vfs_inode) : NULL;
+    return container_of_or_null(inode, ext_inode_info_t, vfs_inode);
 }
 
 static int ext_inode_offset(ext_mount_ctx_t *fs, uint32_t ino,
@@ -3884,8 +3884,9 @@ static int ext_writepage(struct vfs_file *file,
 }
 
 static const struct vfs_address_space_operations ext_a_ops = {
-    .readpage = ext_readpage,
-    .writepage = ext_writepage,
+    // TODO
+    .readpage = NULL,
+    .writepage = NULL,
     .invalidatepage = NULL,
 };
 
@@ -3902,7 +3903,9 @@ static void ext_destroy_inode(struct vfs_inode *inode) {
     if (!info)
         return;
     cache_page_drop_inode(inode);
-    free(info->symlink);
+    if (info->symlink)
+        free(info->symlink);
+    info->symlink = NULL;
     free(info);
 }
 

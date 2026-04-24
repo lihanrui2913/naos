@@ -75,11 +75,10 @@ void vfs_dentry_unhash(struct vfs_dentry *dentry) {
 struct vfs_dentry *vfs_d_alloc(struct vfs_super_block *sb,
                                struct vfs_dentry *parent,
                                const struct vfs_qstr *name) {
-    struct vfs_dentry *dentry = malloc(sizeof(*dentry));
+    struct vfs_dentry *dentry = calloc(1, sizeof(*dentry));
     if (!dentry)
         return NULL;
 
-    memset(dentry, 0, sizeof(*dentry));
     spin_init(&dentry->d_lock);
     spin_init(&dentry->d_children_lock);
     vfs_lockref_init(&dentry->d_lockref, 1);

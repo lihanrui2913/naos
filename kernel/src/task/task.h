@@ -277,7 +277,5 @@ extern spinlock_t task_queue_lock;
 
 extern task_t *idle_tasks[MAX_CPU_NUM];
 
-extern struct sched_rq *schedulers[MAX_CPU_NUM];
-
 #define SCHED_FLAG_YIELD (1UL << 0)
 void schedule(uint64_t sched_flags);

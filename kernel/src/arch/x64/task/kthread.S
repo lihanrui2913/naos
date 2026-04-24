@@ -21,4 +21,4 @@ kernel_thread_func:
     movq %rdx, %rdi
     callq *%rbx
     movq $0, %rdi
-    jmp task_exit
+    jmp task_exit_thread
