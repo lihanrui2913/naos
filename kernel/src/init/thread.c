@@ -64,11 +64,11 @@ void init_thread(uint64_t arg) {
 
     arch_input_dev_init();
 
-    real_socket_init();
-
     fbdev_init();
 
     drm_init_after_pci_sysfs();
+
+    real_socket_init();
 
     devtmpfs_init_umount();
     sysfs_init_umount();

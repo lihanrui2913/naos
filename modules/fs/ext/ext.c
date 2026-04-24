@@ -1093,9 +1093,9 @@ static int ext_block_all_zero(void *buf, uint32_t count) {
     uint32_t *entries = (uint32_t *)buf;
     for (uint32_t i = 0; i < count; i++) {
         if (entries[i])
-            return 0;
+            return false;
     }
-    return 1;
+    return true;
 }
 
 static uint16_t ext_extent_inode_max_entries(void) {
@@ -3827,30 +3827,24 @@ static int ext_readpage(struct vfs_file *file,
                         void *page) {
     ext_mount_ctx_t *fs;
     ext_inode_disk_t disk_inode = {0};
-    struct vfs_inode *inode = mapping->host;
     int ret;
 
-    if (!inode || !file)
+    if (!file || !file->f_inode || !page)
+        return -EINVAL;
+    if ((file->f_inode->type & file_block) ||
+        (file->f_inode->type & file_stream))
+        return device_read(file->f_inode->i_rdev, page, index * PAGE_SIZE,
+                           PAGE_SIZE, file);
+    if (!S_ISREG(file->f_inode->i_mode))
         return -EINVAL;
 
-    fs = ext_sb_info(inode->i_sb);
+    fs = ext_sb_info(file->f_inode->i_sb);
     spin_lock(&rwlock);
-    ret = ext_load_inode_locked(inode, &disk_inode);
-    if (!ret) {
-        uint64_t offset = index * PAGE_SIZE;
-        uint64_t size = ext_inode_size_get(&disk_inode);
-        uint64_t valid = 0;
-
-        if (offset < size)
-            valid = MIN((uint64_t)PAGE_SIZE, size - offset);
-
-        memset(page, 0, PAGE_SIZE);
-        if (valid > 0) {
-            ret = ext_read_inode_data_locked(fs, (uint32_t)inode->i_ino,
-                                             &disk_inode, page, (size_t)offset,
-                                             (size_t)valid);
-        }
-    }
+    ret = ext_load_inode_locked(file->f_inode, &disk_inode);
+    if (!ret)
+        ret = ext_read_inode_data_locked(fs, (uint32_t)file->f_inode->i_ino,
+                                         &disk_inode, page, index * PAGE_SIZE,
+                                         PAGE_SIZE);
     spin_unlock(&rwlock);
     return ret;
 }
@@ -3860,34 +3854,36 @@ static int ext_writepage(struct vfs_file *file,
                          const void *page) {
     ext_mount_ctx_t *fs;
     ext_inode_disk_t disk_inode = {0};
-    struct vfs_inode *inode = mapping->host;
     int ret;
 
-    if (!inode || !file)
+    if (!file || !file->f_inode || !page)
+        return -EINVAL;
+    if ((file->f_inode->type & file_block) ||
+        (file->f_inode->type & file_stream))
+        return device_write(file->f_inode->i_rdev, (void *)page,
+                            index * PAGE_SIZE, PAGE_SIZE, file);
+    if (!S_ISREG(file->f_inode->i_mode))
         return -EINVAL;
 
-    fs = ext_sb_info(inode->i_sb);
+    fs = ext_sb_info(file->f_inode->i_sb);
     spin_lock(&rwlock);
-    ret = ext_load_inode_locked(inode, &disk_inode);
+    ret = ext_load_inode_locked(file->f_inode, &disk_inode);
     if (!ret) {
-        uint64_t offset = index * PAGE_SIZE;
-        uint64_t valid = PAGE_SIZE;
-        uint64_t size = ext_inode_size_get(&disk_inode);
-
-        if (offset + PAGE_SIZE > size)
-            valid = (size > offset) ? (size - offset) : 0;
-
-        ret =
-            ext_write_inode_data_locked(fs, (uint32_t)inode->i_ino, &disk_inode,
-                                        page, (size_t)offset, (size_t)valid);
-        if (ret >= 0)
-            ret = ext_store_inode_locked(inode, &disk_inode, true);
+        ret = ext_write_inode_data_locked(fs, (uint32_t)file->f_inode->i_ino,
+                                          &disk_inode, page, index * PAGE_SIZE,
+                                          PAGE_SIZE);
+        if (ret >= 0) {
+            int write_ret =
+                ext_store_inode_locked(file->f_inode, &disk_inode, true);
+            if (write_ret < 0)
+                ret = write_ret;
+        }
     }
     spin_unlock(&rwlock);
     return ret;
 }
 
-static const struct vfs_address_space_operations ext_aops = {
+static const struct vfs_address_space_operations ext_a_ops = {
     .readpage = ext_readpage,
     .writepage = ext_writepage,
     .invalidatepage = NULL,
@@ -3897,8 +3893,7 @@ static struct vfs_inode *ext_alloc_inode(struct vfs_super_block *sb) {
     ext_inode_info_t *info = calloc(1, sizeof(*info));
     if (!info)
         return NULL;
-    info->vfs_inode.i_mapping.a_ops = &ext_aops;
-    info->vfs_inode.i_mapping.host = &info->vfs_inode;
+    info->vfs_inode.i_mapping.a_ops = &ext_a_ops;
     return &info->vfs_inode;
 }
 

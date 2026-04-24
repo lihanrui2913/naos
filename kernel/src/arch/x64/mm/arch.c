@@ -30,6 +30,10 @@ uint64_t get_arch_page_table_flags(uint64_t flags) {
         result |= (ARCH_PT_FLAG_PCD | ARCH_PT_FLAG_PWT);
     }
 
+    if ((flags & PT_FLAG_COW) != 0) {
+        result |= ARCH_PT_FLAG_COW;
+    }
+
     return result;
 }
 

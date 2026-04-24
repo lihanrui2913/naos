@@ -37,15 +37,15 @@ struct vfs_inode *vfs_alloc_inode(struct vfs_super_block *sb) {
     if (sb->s_op && sb->s_op->alloc_inode)
         inode = sb->s_op->alloc_inode(sb);
     if (!inode)
-        inode = malloc(sizeof(*inode));
+        inode = calloc(1, sizeof(*inode));
     if (!inode)
         return NULL;
 
-    memset(inode, 0, sizeof(*inode));
     inode->i_sb = sb;
     inode->i_blkbits = 12;
     inode->i_state = VFS_I_NEW;
     inode->i_mapping.host = inode;
+    spin_init(&inode->i_mapping.lock);
     inode->inode = 0;
     inode->type = file_none;
     inode->rw_hint = 0;

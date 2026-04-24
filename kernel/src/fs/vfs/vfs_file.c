@@ -4,55 +4,6 @@
 #include <mm/cache.h>
 #include <mm/mm.h>
 
-static bool vfs_buffer_is_userspace(const void *buf, size_t len) {
-    return buf && !check_user_overflow((uint64_t)buf, len);
-}
-
-static bool vfs_copy_to_user_or_kernel(void *dst, const void *src, size_t len,
-                                       bool dst_is_user) {
-    if (len == 0)
-        return true;
-    if (dst_is_user)
-        return !copy_to_user(dst, src, len);
-    memcpy(dst, src, len);
-    return true;
-}
-
-static bool vfs_copy_from_user_or_kernel(void *dst, const void *src, size_t len,
-                                         bool src_is_user) {
-    if (len == 0)
-        return true;
-    if (src_is_user)
-        return !copy_from_user(dst, src, len);
-    memcpy(dst, src, len);
-    return true;
-}
-
-int vfs_generic_file_readpage(struct vfs_file *file,
-                              struct vfs_address_space *mapping, uint64_t index,
-                              void *page) {
-    struct vfs_inode *inode = mapping->host;
-    if (!inode || !file || !file->f_op || !file->f_op->read)
-        return -EINVAL;
-
-    uint64_t page_base = index * PAGE_SIZE;
-    size_t valid = (size_t)PAGE_SIZE;
-    if (page_base >= inode->i_size)
-        valid = 0;
-    else
-        valid = MIN((size_t)PAGE_SIZE, (size_t)(inode->i_size - page_base));
-
-    memset(page, 0, PAGE_SIZE);
-    if (valid == 0)
-        return 0;
-
-    loff_t pos = (loff_t)page_base;
-    ssize_t ret = file->f_op->read(file, page, valid, &pos);
-    if (ret < 0)
-        return (int)ret;
-    return 0;
-}
-
 static unsigned int vfs_open_lookup_flags(const struct vfs_open_how *how) {
     unsigned int flags = 0;
 
@@ -501,7 +452,13 @@ int vfs_close_file(struct vfs_file *file) {
 
 static bool vfs_file_has_pagecache(struct vfs_file *file) {
     return file && file->f_inode && file->f_inode->i_mapping.a_ops &&
-           file->f_inode->i_mapping.a_ops->readpage;
+           file->f_inode->i_mapping.a_ops->readpage &&
+           S_ISREG(file->f_inode->i_mode) && !(file->f_flags & O_DIRECT);
+}
+
+static bool vfs_file_can_write_pagecache(struct vfs_file *file) {
+    return vfs_file_has_pagecache(file) &&
+           file->f_inode->i_mapping.a_ops->writepage;
 }
 
 static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
@@ -509,12 +466,13 @@ static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
     struct vfs_inode *inode = file->f_inode;
     uint64_t i_size = inode->i_size;
 
+    if (pos < 0)
+        return -EINVAL;
     if ((uint64_t)pos >= i_size)
         return 0;
 
     count = MIN(count, (size_t)(i_size - (uint64_t)pos));
     uint8_t *dst = (uint8_t *)buf;
-    bool dst_is_user = vfs_buffer_is_userspace(buf, count);
     size_t read_total = 0;
 
     while (read_total < count) {
@@ -536,7 +494,7 @@ static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
                 cache_entry_abort_fill(entry);
                 return read_total > 0 ? (ssize_t)read_total : ret;
             }
-            cache_entry_mark_ready(entry, PAGE_SIZE);
+            cache_entry_mark_ready(entry, (size_t)ret);
         }
 
         size_t valid = cache_entry_valid_bytes(entry);
@@ -547,7 +505,7 @@ static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
         chunk = MIN(chunk, valid - page_offset);
 
         void *src = (uint8_t *)cache_entry_data(entry) + page_offset;
-        if (!vfs_copy_to_user_or_kernel(dst, src, (size_t)chunk, dst_is_user)) {
+        if (!memcpy(dst, src, (size_t)chunk)) {
             cache_entry_put(entry);
             return read_total > 0 ? (ssize_t)read_total : -EFAULT;
         }
@@ -568,10 +526,13 @@ static ssize_t vfs_file_read_pagecache(struct vfs_file *file, void *buf,
                 prefetch_entry =
                     cache_page_get_or_create(inode, next_index, NULL);
                 if (prefetch_entry) {
-                    inode->i_mapping.a_ops->readpage(
+                    int ret = inode->i_mapping.a_ops->readpage(
                         file, &inode->i_mapping, next_index,
                         cache_entry_data(prefetch_entry));
-                    cache_entry_mark_ready(prefetch_entry, PAGE_SIZE);
+                    if (ret < 0)
+                        cache_entry_abort_fill(prefetch_entry);
+                    else
+                        cache_entry_mark_ready(prefetch_entry, (size_t)ret);
                     cache_entry_put(prefetch_entry);
                 }
             } else {
@@ -587,8 +548,10 @@ static ssize_t vfs_file_write_pagecache(struct vfs_file *file, const void *buf,
                                         size_t count, loff_t pos) {
     struct vfs_inode *inode = file->f_inode;
     const uint8_t *src = (const uint8_t *)buf;
-    bool src_is_user = vfs_buffer_is_userspace(buf, count);
     size_t write_total = 0;
+
+    if (pos < 0)
+        return -EINVAL;
 
     while (write_total < count) {
         uint64_t page_index = (uint64_t)pos / PAGE_SIZE;
@@ -603,24 +566,24 @@ static ssize_t vfs_file_write_pagecache(struct vfs_file *file, const void *buf,
             return write_total > 0 ? (ssize_t)write_total : -ENOMEM;
 
         if (created && chunk < PAGE_SIZE) {
-            if (inode->i_mapping.a_ops->readpage(file, &inode->i_mapping,
-                                                 page_index,
-                                                 cache_entry_data(entry)) < 0) {
+            int ret = inode->i_mapping.a_ops->readpage(
+                file, &inode->i_mapping, page_index, cache_entry_data(entry));
+            if (ret < 0) {
                 cache_entry_abort_fill(entry);
                 return write_total > 0 ? (ssize_t)write_total : -EIO;
             }
-            cache_entry_mark_ready(entry, PAGE_SIZE);
+            cache_entry_mark_ready(entry, (size_t)ret);
         } else if (created) {
             cache_entry_mark_ready(entry, PAGE_SIZE);
         }
 
         void *dst = (uint8_t *)cache_entry_data(entry) + page_offset;
-        if (!vfs_copy_from_user_or_kernel(dst, src, (size_t)chunk,
-                                          src_is_user)) {
+        if (!memcpy(dst, src, (size_t)chunk)) {
             cache_entry_put(entry);
             return write_total > 0 ? (ssize_t)write_total : -EFAULT;
         }
 
+        cache_entry_extend_valid(entry, (size_t)(page_offset + chunk));
         cache_page_mark_dirty(entry);
         cache_entry_put(entry);
 
@@ -639,36 +602,32 @@ ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
                       loff_t *ppos) {
     ssize_t ret;
     loff_t pos;
+    loff_t new_pos;
 
     if (!file || !file->f_op || !file->f_op->read)
         return -EINVAL;
 
-    if (ppos) {
-        pos = *ppos;
-        if (vfs_file_has_pagecache(file)) {
-            ret = vfs_file_read_pagecache(file, buf, count, pos);
-            if (ret >= 0)
-                *ppos = (loff_t)((uint64_t)pos + (uint64_t)ret);
-        } else {
-            ret = file->f_op->read(file, buf, count, &pos);
-            if (ret >= 0)
-                *ppos = pos;
-        }
-        return ret;
-    }
+    if (!ppos)
+        mutex_lock(&file->f_pos_lock);
+    pos = ppos ? *ppos : file->f_pos;
 
-    mutex_lock(&file->f_pos_lock);
-    pos = file->f_pos;
     if (vfs_file_has_pagecache(file)) {
         ret = vfs_file_read_pagecache(file, buf, count, pos);
-        if (ret >= 0)
-            file->f_pos = (loff_t)((uint64_t)pos + (uint64_t)ret);
+        new_pos = (ret >= 0) ? (loff_t)((uint64_t)pos + (uint64_t)ret) : pos;
     } else {
-        ret = file->f_op->read(file, buf, count, &pos);
-        if (ret >= 0)
-            file->f_pos = pos;
+        new_pos = pos;
+        ret = file->f_op->read(file, buf, count, &new_pos);
     }
-    mutex_unlock(&file->f_pos_lock);
+
+    if (ret >= 0) {
+        if (ppos)
+            *ppos = new_pos;
+        else
+            file->f_pos = new_pos;
+    }
+
+    if (!ppos)
+        mutex_unlock(&file->f_pos_lock);
     return ret;
 }
 
@@ -676,54 +635,40 @@ ssize_t vfs_write_file(struct vfs_file *file, const void *buf, size_t count,
                        loff_t *ppos) {
     ssize_t ret;
     loff_t pos;
+    loff_t new_pos;
 
     if (!file || !file->f_op || !file->f_op->write)
         return -EINVAL;
 
-    if (ppos) {
-        pos = *ppos;
-        if (vfs_file_has_pagecache(file)) {
-            ret = vfs_file_write_pagecache(file, buf, count, pos);
-            if (ret >= 0) {
-                *ppos = (loff_t)((uint64_t)pos + (uint64_t)ret);
-                if (ret > 0)
-                    notifyfs_queue_inode_event(file->f_inode, file->f_inode,
-                                               NULL, IN_MODIFY, 0);
-            }
-        } else {
-            ret = file->f_op->write(file, buf, count, &pos);
-            if (ret >= 0) {
-                *ppos = pos;
-                if (ret > 0)
-                    notifyfs_queue_inode_event(file->f_inode, file->f_inode,
-                                               NULL, IN_MODIFY, 0);
-            }
-        }
-        return ret;
+    if (!ppos)
+        mutex_lock(&file->f_pos_lock);
+    pos = ppos ? *ppos : file->f_pos;
+    if (!ppos && (file->f_flags & O_APPEND))
+        pos = (loff_t)file->f_inode->i_size;
+
+    if (vfs_file_can_write_pagecache(file)) {
+        ret = vfs_file_write_pagecache(file, buf, count, pos);
+        if (ret >= 0)
+            new_pos = (loff_t)((uint64_t)pos + (uint64_t)ret);
+        else
+            new_pos = pos;
+    } else {
+        new_pos = pos;
+        ret = file->f_op->write(file, buf, count, &new_pos);
     }
 
-    mutex_lock(&file->f_pos_lock);
-    pos = file->f_pos;
-    if (file->f_flags & O_APPEND)
-        pos = (loff_t)file->f_inode->i_size;
-    if (vfs_file_has_pagecache(file)) {
-        ret = vfs_file_write_pagecache(file, buf, count, pos);
-        if (ret >= 0) {
-            file->f_pos = (loff_t)((uint64_t)pos + (uint64_t)ret);
-            if (ret > 0)
-                notifyfs_queue_inode_event(file->f_inode, file->f_inode, NULL,
-                                           IN_MODIFY, 0);
-        }
-    } else {
-        ret = file->f_op->write(file, buf, count, &pos);
-        if (ret >= 0) {
-            file->f_pos = pos;
-            if (ret > 0)
-                notifyfs_queue_inode_event(file->f_inode, file->f_inode, NULL,
-                                           IN_MODIFY, 0);
-        }
+    if (ret >= 0) {
+        if (ppos)
+            *ppos = new_pos;
+        else
+            file->f_pos = new_pos;
+        if (ret > 0)
+            notifyfs_queue_inode_event(file->f_inode, file->f_inode, NULL,
+                                       IN_MODIFY, 0);
     }
-    mutex_unlock(&file->f_pos_lock);
+
+    if (!ppos)
+        mutex_unlock(&file->f_pos_lock);
     return ret;
 }
 

@@ -23,9 +23,11 @@ cache_entry_t *cache_page_get_or_create(vfs_node_t *node, uint64_t page_index,
                                         bool *created);
 
 void *cache_entry_data(cache_entry_t *entry);
+uint64_t cache_entry_phys(cache_entry_t *entry);
 size_t cache_entry_valid_bytes(const cache_entry_t *entry);
 
 void cache_entry_mark_ready(cache_entry_t *entry, size_t valid_bytes);
+void cache_entry_extend_valid(cache_entry_t *entry, size_t valid_bytes);
 void cache_entry_abort_fill(cache_entry_t *entry);
 void cache_entry_put(cache_entry_t *entry);
 

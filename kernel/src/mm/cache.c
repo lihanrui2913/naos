@@ -199,20 +199,19 @@ static int cache_writeback_entry(cache_entry_t *entry) {
         return -EINVAL;
 
     vfs_node_t *node = (vfs_node_t *)(uintptr_t)entry->key0;
-    if (!node || !node->i_fop || !node->i_fop->write)
+    if (!node || !node->i_mapping.a_ops || !node->i_mapping.a_ops->writepage)
         return -EINVAL;
 
-    uint64_t page_base = entry->key1 * PAGE_SIZE;
     size_t write_len = 0;
     uint64_t writeback_seq = 0;
-    void *bounce = malloc(PAGE_SIZE);
+    void *bounce = alloc_frames_bytes(PAGE_SIZE);
     if (!bounce)
         return -ENOMEM;
 
     spin_lock(&cache_lock);
     if (entry->detached || !entry->dirty) {
         spin_unlock(&cache_lock);
-        free(bounce);
+        free_frames_bytes(bounce, PAGE_SIZE);
         return 0;
     }
 
@@ -225,26 +224,20 @@ static int cache_writeback_entry(cache_entry_t *entry) {
     spin_unlock(&cache_lock);
 
     if (write_len != 0) {
-        size_t written = 0;
         fd_t fd = {
             .f_op = node->i_fop,
             .f_inode = node,
             .node = node,
             .f_flags = O_WRONLY,
         };
-        loff_t pos = (loff_t)page_base;
-
-        while (written < write_len) {
-            ssize_t ret = vfs_write_file(&fd, (uint8_t *)bounce + written,
-                                         write_len - written, &pos);
-            if (ret <= 0) {
-                spin_lock(&cache_lock);
-                entry->writeback = false;
-                spin_unlock(&cache_lock);
-                free(bounce);
-                return ret < 0 ? (int)ret : -EIO;
-            }
-            written += (size_t)ret;
+        int ret = node->i_mapping.a_ops->writepage(&fd, &node->i_mapping,
+                                                   entry->key1, bounce);
+        if (ret < 0) {
+            spin_lock(&cache_lock);
+            entry->writeback = false;
+            spin_unlock(&cache_lock);
+            free_frames_bytes(bounce, PAGE_SIZE);
+            return ret;
         }
     }
 
@@ -265,7 +258,7 @@ static int cache_writeback_entry(cache_entry_t *entry) {
             cache_touch_locked(entry);
     }
     spin_unlock(&cache_lock);
-    free(bounce);
+    free_frames_bytes(bounce, PAGE_SIZE);
     return sync_ret;
 }
 
@@ -301,6 +294,10 @@ void *cache_entry_data(cache_entry_t *entry) {
     return entry ? entry->data : NULL;
 }
 
+uint64_t cache_entry_phys(cache_entry_t *entry) {
+    return entry ? entry->page_phys : 0;
+}
+
 size_t cache_entry_valid_bytes(const cache_entry_t *entry) {
     return entry ? entry->valid_bytes : 0;
 }
@@ -312,6 +309,18 @@ void cache_entry_mark_ready(cache_entry_t *entry, size_t valid_bytes) {
     spin_lock(&cache_lock);
     entry->valid_bytes = MIN(valid_bytes, (size_t)PAGE_SIZE);
     entry->loading = false;
+    if (!entry->detached)
+        cache_touch_locked(entry);
+    spin_unlock(&cache_lock);
+}
+
+void cache_entry_extend_valid(cache_entry_t *entry, size_t valid_bytes) {
+    if (!entry)
+        return;
+
+    spin_lock(&cache_lock);
+    if (valid_bytes > entry->valid_bytes)
+        entry->valid_bytes = MIN(valid_bytes, (size_t)PAGE_SIZE);
     if (!entry->detached)
         cache_touch_locked(entry);
     spin_unlock(&cache_lock);

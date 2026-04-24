@@ -47,6 +47,9 @@ uint64_t get_arch_page_table_flags(uint64_t flags) {
     if (flags & PT_FLAG_DEVICE)
         attr |= (0x02 << 2);
 
+    if (flags & PT_FLAG_COW)
+        attr |= ARCH_PT_FLAG_COW;
+
     return attr;
 }
 

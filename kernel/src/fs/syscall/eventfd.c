@@ -280,7 +280,8 @@ static ssize_t eventfdfs_write(struct vfs_file *file, const void *buf,
             break;
     }
 
-    vfs_poll_notify(efd->node, EPOLLIN | EPOLLOUT);
+    vfs_poll_notify(file->f_inode, EPOLLIN | EPOLLOUT);
+
     return sizeof(uint64_t);
 }
 
