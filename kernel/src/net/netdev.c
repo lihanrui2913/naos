@@ -79,13 +79,23 @@ void regist_netdev(void *desc, uint8_t *mac, uint32_t mtu, netdev_send_t send,
 
 netdev_t *get_default_netdev() {
     netdev_t *dev = NULL;
+    netdev_t *fallback = NULL;
 
     spin_lock(&netdevs_lock);
     for (uint32_t i = 0; i < MAX_NETDEV_NUM; i++) {
         if (netdevs[i] && !netdevs[i]->unregistering) {
-            dev = netdevs[i];
-            break;
+            if (!fallback) {
+                fallback = netdevs[i];
+            }
+
+            if (netdevs[i]->admin_up && netdevs[i]->link_up) {
+                dev = netdevs[i];
+                break;
+            }
         }
+    }
+    if (!dev) {
+        dev = fallback;
     }
     spin_unlock(&netdevs_lock);
 

@@ -494,17 +494,6 @@ static uint64_t blkdev_backend_write(blkdev_t *dev, uint64_t offset,
     return total;
 }
 
-static uint64_t blkdev_read_cached_page(blkdev_t *dev, uint64_t page_index,
-                                        void *dst) {
-    cache_entry_t *entry = cache_block_try_get(dev->id, page_index);
-    if (!entry)
-        return 0;
-
-    memcpy(dst, cache_entry_data(entry), PAGE_SIZE);
-    cache_entry_put(entry);
-    return PAGE_SIZE;
-}
-
 static int blkdev_fill_cache_page(blkdev_t *dev, uint64_t page_index,
                                   cache_entry_t *entry) {
     uint64_t page_offset = page_index * PAGE_SIZE;
@@ -525,6 +514,24 @@ static int blkdev_fill_cache_page(blkdev_t *dev, uint64_t page_index,
     return 0;
 }
 
+static uint64_t blkdev_read_cache_and_populate(blkdev_t *dev,
+                                               uint64_t page_index, void *dst) {
+    bool created = false;
+    cache_entry_t *entry =
+        cache_block_get_or_create(dev->id, page_index, &created);
+    if (!entry)
+        return 0;
+
+    if (created && blkdev_fill_cache_page(dev, page_index, entry) < 0) {
+        cache_entry_put(entry);
+        return 0;
+    }
+
+    memcpy(dst, cache_entry_data(entry), PAGE_SIZE);
+    cache_entry_put(entry);
+    return PAGE_SIZE;
+}
+
 uint64_t blkdev_read(uint64_t drive, uint64_t offset, void *buf, uint64_t len) {
     blkdev_t *dev = find_blkdev_by_id(drive);
     if (!dev || !dev->ptr || !dev->read)
@@ -542,9 +549,8 @@ uint64_t blkdev_read(uint64_t drive, uint64_t offset, void *buf, uint64_t len) {
         uint64_t pages = len / PAGE_SIZE;
 
         while (pages > 0) {
-            if (!blkdev_read_cached_page(dev, page_index, dst) &&
-                blkdev_backend_read(dev, page_index * PAGE_SIZE, dst,
-                                    PAGE_SIZE) != PAGE_SIZE) {
+            if (blkdev_read_cache_and_populate(dev, page_index, dst) !=
+                PAGE_SIZE) {
                 return (uint64_t)-1;
             }
 

@@ -1,2 +1,2 @@
 all:
-	$(MAKE) -C ext
+	$(Q)$(MAKE) -C ext

@@ -1,2 +1,2 @@
 all:
-	$(MAKE) -C netserver
+	$(Q)$(MAKE) -C netserver

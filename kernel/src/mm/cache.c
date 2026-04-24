@@ -385,6 +385,87 @@ void cache_block_drop_drive(uint64_t drive) {
     }
 }
 
+cache_entry_t *cache_page_try_get(vfs_node_t *node, uint64_t page_index) {
+    return cache_get_common(CACHE_KIND_PAGE, (uintptr_t)node, page_index, false,
+                            NULL);
+}
+
+cache_entry_t *cache_page_get_or_create(vfs_node_t *node, uint64_t page_index,
+                                        bool *created) {
+    return cache_get_common(CACHE_KIND_PAGE, (uintptr_t)node, page_index, true,
+                            created);
+}
+
+void cache_page_mark_dirty(cache_entry_t *entry) {
+    if (!entry)
+        return;
+
+    spin_lock(&cache_lock);
+    entry->dirty = true;
+    entry->dirty_seq++;
+    if (!entry->detached)
+        cache_touch_locked(entry);
+    spin_unlock(&cache_lock);
+}
+
+void cache_page_clear_dirty(cache_entry_t *entry) {
+    if (!entry)
+        return;
+
+    spin_lock(&cache_lock);
+    entry->dirty = false;
+    spin_unlock(&cache_lock);
+}
+
+int cache_page_start_writeback(cache_entry_t *entry) {
+    return cache_writeback_entry(entry);
+}
+
+void cache_page_end_writeback(cache_entry_t *entry, int error) {
+    if (!entry)
+        return;
+
+    spin_lock(&cache_lock);
+    if (error == 0)
+        entry->dirty = false;
+    entry->writeback = false;
+    spin_unlock(&cache_lock);
+}
+
+void cache_page_invalidate_range(vfs_node_t *node, uint64_t start_offset,
+                                 uint64_t len) {
+    cache_invalidate_range(CACHE_KIND_PAGE, (uintptr_t)node, start_offset, len);
+}
+
+void cache_page_drop_inode(vfs_node_t *node) {
+    while (true) {
+        cache_entry_t *target = NULL;
+        bool found = false;
+
+        spin_lock(&cache_lock);
+
+        struct llist_header *pos;
+        for (pos = cache_lru.next; pos != &cache_lru; pos = pos->next) {
+            cache_entry_t *entry = container_of(pos, cache_entry_t, lru_node);
+            if (!entry->detached && entry->kind == CACHE_KIND_PAGE &&
+                entry->key0 == (uintptr_t)node) {
+                cache_detach_locked(entry);
+                if (entry->refs == 0 && !entry->loading)
+                    target = entry;
+                found = true;
+                break;
+            }
+        }
+
+        spin_unlock(&cache_lock);
+
+        if (target)
+            cache_entry_destroy(target);
+        if (!found)
+            break;
+    }
+}
+
 static bool cache_buffer_is_userspace(const void *buf, size_t len) {
     return buf && !check_user_overflow((uint64_t)buf, len);
 }

@@ -773,6 +773,9 @@ ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
                       loff_t *ppos);
 ssize_t vfs_write_file(struct vfs_file *file, const void *buf, size_t count,
                        loff_t *ppos);
+int vfs_generic_file_readpage(struct vfs_file *file,
+                              struct vfs_address_space *mapping, uint64_t index,
+                              void *page);
 loff_t vfs_llseek_file(struct vfs_file *file, loff_t offset, int whence);
 int vfs_iterate_dir(struct vfs_file *file, struct vfs_dir_context *ctx);
 long vfs_ioctl_file(struct vfs_file *file, unsigned long cmd,
