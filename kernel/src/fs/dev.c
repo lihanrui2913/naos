@@ -7,6 +7,7 @@
 #include <drivers/tty.h>
 #include <drivers/pty.h>
 #include <net/netlink.h>
+#include <net/netdev.h>
 #include <boot/boot.h>
 #include <arch/arch.h>
 #include <fs/vfs/paged_store.h>
@@ -1461,6 +1462,77 @@ ssize_t kmsg_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
     return -ENOTTY;
 }
 
+enum {
+    RFKILL_TYPE_WLAN = 1,
+    RFKILL_OP_ADD = 0,
+};
+
+typedef struct rfkill_event {
+    uint32_t idx;
+    uint8_t type;
+    uint8_t op;
+    uint8_t soft;
+    uint8_t hard;
+} rfkill_event_t;
+
+ssize_t rfkill_read(void *data, void *buf, uint64_t offset, uint64_t len,
+                    uint64_t flags) {
+    netdev_t *devs[MAX_NETDEV_NUM] = {0};
+    uint64_t want_event = offset / sizeof(rfkill_event_t);
+    uint64_t event_index = 0;
+    fd_t *fd = (fd_t *)flags;
+    size_t count;
+
+    (void)data;
+
+    if (!buf)
+        return -EINVAL;
+    if (len < sizeof(rfkill_event_t))
+        return -EINVAL;
+
+    count = netdev_snapshot(devs, sizeof(devs) / sizeof(devs[0]));
+    for (size_t i = 0; i < count; i++) {
+        netdev_t *dev = devs[i];
+
+        if (!dev || dev->type != NETDEV_TYPE_WIFI)
+            continue;
+
+        if (event_index == want_event) {
+            rfkill_event_t event = {
+                .idx = dev->id,
+                .type = RFKILL_TYPE_WLAN,
+                .op = RFKILL_OP_ADD,
+                .soft = 0,
+                .hard = 0,
+            };
+
+            if (copy_to_user(buf, &event, sizeof(event))) {
+                for (size_t j = 0; j < count; j++)
+                    netdev_put(devs[j]);
+                return -EFAULT;
+            }
+            for (size_t j = 0; j < count; j++)
+                netdev_put(devs[j]);
+            return sizeof(event);
+        }
+
+        event_index++;
+    }
+
+    for (size_t i = 0; i < count; i++)
+        netdev_put(devs[i]);
+
+    if (fd && (fd_get_flags(fd) & O_NONBLOCK))
+        return -EAGAIN;
+    return 0;
+}
+
+ssize_t rfkill_poll(void *data, int events) {
+    (void)data;
+    (void)events;
+    return 0;
+}
+
 void devfs_nodes_init() {
     vfs_mkdirat(AT_FDCWD, "/dev/shm", 0755);
     vfs_mkdirat(AT_FDCWD, "/dev/bus", 0755);
@@ -1474,6 +1546,8 @@ void devfs_nodes_init() {
                    urandom_ioctl, NULL, urandom_read, urandom_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, kernel_session, "kmsg", 0, NULL, NULL,
                    kmsg_ioctl, kmsg_poll, kmsg_read, kmsg_write, NULL);
+    device_install(DEV_CHAR, DEV_SYSDEV, NULL, "rfkill", 0, NULL, NULL, NULL,
+                   rfkill_poll, rfkill_read, NULL, NULL);
 
     setup_console_symlinks();
 

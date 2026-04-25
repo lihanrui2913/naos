@@ -362,8 +362,11 @@ static int rtnetlink_handle_setlink(struct netlink_sock *sender_sock,
         return -EINVAL;
 
     dev = netdev_get_by_index((uint32_t)ifi_req->ifi_index);
-    if (!dev)
+    if (!dev) {
+        printk("netlink: setlink ifindex=%d not found (REQUEST)\n",
+               ifi_req->ifi_index);
         return -ENODEV;
+    }
 
     if (ifi_req->ifi_change & IFF_UP)
         ret = netdev_set_admin_state(dev, !!(ifi_req->ifi_flags & IFF_UP));
@@ -771,6 +774,10 @@ static int rtnetlink_handle_request(struct netlink_sock *sender_sock,
         return rtnetlink_handle_getrule(sender_sock, req);
     case RTM_SETLINK:
         return rtnetlink_handle_setlink(sender_sock, req, ifi_req);
+    case RTM_NEWLINK:
+        if (!ifi_req || ifi_req->ifi_index <= 0)
+            return rtnetlink_handle_getlink(sender_sock, req, ifi_req);
+        return rtnetlink_handle_setlink(sender_sock, req, ifi_req);
     default:
         printk("Unsupported req->nlmsg_type = %d\n", req->nlmsg_type);
         return -EOPNOTSUPP;
@@ -804,7 +811,7 @@ static const struct rtattr *netlink_find_attr(const void *data, size_t len,
     int remaining = (int)len;
 
     while (RTA_OK(rta, remaining)) {
-        if (rta->rta_type == type)
+        if ((rta->rta_type & RTA_TYPE_MASK) == type)
             return rta;
         rta = RTA_NEXT(rta, remaining);
     }
@@ -1064,6 +1071,88 @@ static int genl_append_nl80211_wiphy_msg(char *buf, size_t *offset,
                               sizeof(max_scan_ssids));
     if (ret < 0)
         return ret;
+
+    /* NL80211_ATTR_SUPPORTED_COMMANDS — tell NM what ops the driver supports.
+     * Each entry: nla_type = cmd number, nla_data = cmd number (u32).
+     * This matches Linux kernel's nl80211 encoding exactly.                 */
+    {
+        static const uint32_t cmds[] = {
+            NL80211_CMD_GET_WIPHY,      NL80211_CMD_GET_INTERFACE,
+            NL80211_CMD_SET_INTERFACE,  NL80211_CMD_TRIGGER_SCAN,
+            NL80211_CMD_GET_SCAN,       NL80211_CMD_CONNECT,
+            NL80211_CMD_DISCONNECT,     NL80211_CMD_GET_STATION,
+            NL80211_CMD_SET_POWER_SAVE, NL80211_CMD_GET_POWER_SAVE,
+        };
+        size_t sc_start;
+        ret = netlink_start_nested_attr(
+            buf, &cur, capacity, NL80211_ATTR_SUPPORTED_COMMANDS, &sc_start);
+        if (ret < 0)
+            return ret;
+        for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+            ret = netlink_append_attr(buf, &cur, capacity, (uint16_t)cmds[i],
+                                      &cmds[i], sizeof(cmds[i]));
+            if (ret < 0)
+                return ret;
+        }
+        netlink_end_nested_attr(buf, cur, sc_start);
+    }
+
+    /* NL80211_ATTR_CIPHER_SUITES */
+    {
+        static const uint32_t ciphers[] = {
+            WLAN_CIPHER_SUITE_WEP40,
+            WLAN_CIPHER_SUITE_TKIP,
+            WLAN_CIPHER_SUITE_CCMP,
+            WLAN_CIPHER_SUITE_WEP104,
+        };
+        ret =
+            netlink_append_attr(buf, &cur, capacity, NL80211_ATTR_CIPHER_SUITES,
+                                ciphers, sizeof(ciphers));
+        if (ret < 0)
+            return ret;
+    }
+
+    /* NL80211_ATTR_WIPHY_BANDS — 2.4 GHz band with common channels */
+    {
+        static const uint32_t freq_24ghz[] = {
+            2412, 2417, 2422, 2427, 2432, 2437,
+            2442, 2447, 2452, 2457, 2462, 2472,
+        };
+        size_t bands_start, band_start, freqs_start, freq_start;
+
+        ret = netlink_start_nested_attr(buf, &cur, capacity,
+                                        NL80211_ATTR_WIPHY_BANDS, &bands_start);
+        if (ret < 0)
+            return ret;
+
+        ret = netlink_start_nested_attr(buf, &cur, capacity, NL80211_BAND_2GHZ,
+                                        &band_start);
+        if (ret < 0)
+            return ret;
+
+        ret = netlink_start_nested_attr(buf, &cur, capacity,
+                                        NL80211_BAND_ATTR_FREQS, &freqs_start);
+        if (ret < 0)
+            return ret;
+
+        for (size_t i = 0; i < sizeof(freq_24ghz) / sizeof(freq_24ghz[0]);
+             i++) {
+            ret = netlink_start_nested_attr(buf, &cur, capacity,
+                                            (uint16_t)(i + 1), &freq_start);
+            if (ret < 0)
+                return ret;
+            ret = netlink_append_attr(buf, &cur, capacity,
+                                      NL80211_FREQUENCY_ATTR_FREQ,
+                                      &freq_24ghz[i], sizeof(freq_24ghz[i]));
+            if (ret < 0)
+                return ret;
+            netlink_end_nested_attr(buf, cur, freq_start);
+        }
+
+        netlink_end_nested_attr(buf, cur, freqs_start);
+        netlink_end_nested_attr(buf, cur, band_start);
+        netlink_end_nested_attr(buf, cur, bands_start);
+    }
 
     nlh->nlmsg_len = (uint32_t)(cur - start);
     *offset = cur;
@@ -1716,6 +1805,47 @@ static int genl_handle_nl80211_get_interface(struct netlink_sock *sender_sock,
     return 0;
 }
 
+static int genl_handle_nl80211_set_interface(struct netlink_sock *sender_sock,
+                                             const struct nlmsghdr *req,
+                                             const void *attrs,
+                                             size_t attr_len) {
+    const struct rtattr *ifindex_attr;
+    const struct rtattr *iftype_attr;
+    netdev_wireless_info_t wireless;
+    uint32_t ifindex;
+    uint32_t iftype;
+    netdev_t *dev;
+    int ret = 0;
+
+    (void)sender_sock;
+    (void)req;
+
+    ifindex_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFINDEX);
+    if (!ifindex_attr || ifindex_attr->rta_len < RTA_LENGTH(sizeof(uint32_t)))
+        return -EINVAL;
+
+    ifindex = *(const uint32_t *)RTA_DATA(ifindex_attr);
+    dev = netdev_get_by_index(ifindex);
+    if (!dev)
+        return -ENODEV;
+
+    iftype_attr = netlink_find_attr(attrs, attr_len, NL80211_ATTR_IFTYPE);
+    if (iftype_attr && iftype_attr->rta_len >= RTA_LENGTH(sizeof(uint32_t))) {
+        iftype = *(const uint32_t *)RTA_DATA(iftype_attr);
+        if (!netdev_get_wireless_info(dev, &wireless)) {
+            ret = -EOPNOTSUPP;
+        } else if (iftype < 32 && (wireless.interface_modes & (1U << iftype))) {
+            wireless.iftype = iftype;
+            ret = netdev_set_wireless_info(dev, &wireless);
+        } else {
+            ret = -EOPNOTSUPP;
+        }
+    }
+
+    netdev_put(dev);
+    return ret;
+}
+
 static int genl_handle_nl80211_trigger_scan(struct netlink_sock *sender_sock,
                                             const struct nlmsghdr *req,
                                             const void *attrs,
@@ -1830,6 +1960,66 @@ static int genl_handle_nl80211_get_scan(struct netlink_sock *sender_sock,
     ret = netlink_flush_reply_to_socket(sender_sock, reply, &offset);
     if (ret < 0)
         return ret;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_get_station(struct netlink_sock *sender_sock,
+                                           const struct nlmsghdr *req) {
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+    ret = netlink_append_done(reply, &offset, sizeof(reply), req);
+    if (ret < 0)
+        return ret;
+
+    if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0, 0))
+        return -ENOBUFS;
+
+    return 0;
+}
+
+static int genl_handle_nl80211_get_power_save(struct netlink_sock *sender_sock,
+                                              const struct nlmsghdr *req) {
+    char reply[NETLINK_BUFFER_SIZE];
+    size_t offset = 0;
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    uint32_t ps_state = NL80211_PS_DISABLED;
+    size_t cur;
+    int ret;
+
+    if (!sender_sock || !req)
+        return -EINVAL;
+
+    memset(reply, 0, sizeof(reply));
+    ret = netlink_append_raw_message(reply, &offset, sizeof(reply),
+                                     NAOS_GENL_ID_NL80211, 0, req->nlmsg_seq,
+                                     NULL, sizeof(struct genlmsghdr));
+    if (ret < 0)
+        return ret;
+
+    nlh = (struct nlmsghdr *)reply;
+    genlh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    memset(genlh, 0, sizeof(*genlh));
+    genlh->cmd = NL80211_CMD_GET_POWER_SAVE;
+    genlh->version = NL80211_GENL_VERSION;
+
+    cur = NLMSG_ALIGN(nlh->nlmsg_len);
+    ret = netlink_append_attr(reply, &cur, sizeof(reply), NL80211_ATTR_PS_STATE,
+                              &ps_state, sizeof(ps_state));
+    if (ret < 0)
+        return ret;
+
+    nlh->nlmsg_len = (uint32_t)cur;
+
+    if (!netlink_deliver_to_socket(sender_sock, reply, cur, 0, 0))
+        return -ENOBUFS;
 
     return 0;
 }
@@ -1976,9 +2166,22 @@ static int genl_handle_request(struct netlink_sock *sender_sock,
         case NL80211_CMD_GET_WIPHY:
             return genl_handle_nl80211_get_wiphy(sender_sock, req, attrs,
                                                  attr_len);
+        case NL80211_CMD_SET_WIPHY:
+            return 0;
         case NL80211_CMD_GET_INTERFACE:
             return genl_handle_nl80211_get_interface(sender_sock, req, attrs,
                                                      attr_len);
+        case NL80211_CMD_SET_INTERFACE:
+            return genl_handle_nl80211_set_interface(sender_sock, req, attrs,
+                                                     attr_len);
+        case NL80211_CMD_SET_KEY:
+        case NL80211_CMD_NEW_KEY:
+        case NL80211_CMD_DEL_KEY:
+        case NL80211_CMD_SET_BSS:
+        case NL80211_CMD_REGISTER_FRAME:
+            return 0;
+        case NL80211_CMD_GET_STATION:
+            return genl_handle_nl80211_get_station(sender_sock, req);
         case NL80211_CMD_TRIGGER_SCAN:
             return genl_handle_nl80211_trigger_scan(sender_sock, req, attrs,
                                                     attr_len);
@@ -1993,6 +2196,13 @@ static int genl_handle_request(struct netlink_sock *sender_sock,
                                                   attr_len);
         case NL80211_CMD_GET_PROTOCOL_FEATURES:
             return genl_handle_nl80211_get_protocol_features(sender_sock, req);
+        case NL80211_CMD_SET_POWER_SAVE:
+        case NL80211_CMD_SET_WOWLAN:
+            return 0;
+        case NL80211_CMD_GET_POWER_SAVE:
+            return genl_handle_nl80211_get_power_save(sender_sock, req);
+        case NL80211_CMD_GET_WOWLAN:
+            return -EOPNOTSUPP;
         default:
             printk("Unsupported NAOS_GENL_ID_NL80211 genlh->cmd = %d\n",
                    genlh->cmd);

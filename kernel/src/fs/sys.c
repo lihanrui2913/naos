@@ -904,6 +904,7 @@ void sysfs_init(void) {
     sysfs_ensure_dir("/sys/class/graphics");
     sysfs_ensure_dir("/sys/class/input");
     sysfs_ensure_dir("/sys/class/drm");
+    sysfs_ensure_dir("/sys/class/net");
 }
 
 void sysfs_init_umount(void) {

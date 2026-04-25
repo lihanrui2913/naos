@@ -848,6 +848,58 @@ static void task_execve_free_string_array(char **strings, int count) {
     free(strings);
 }
 
+typedef struct task_execve_creds {
+    int64_t uid;
+    int64_t gid;
+    int64_t euid;
+    int64_t egid;
+    int64_t suid;
+    int64_t sgid;
+    bool secure_exec;
+} task_execve_creds_t;
+
+static task_execve_creds_t task_execve_prepare_creds(task_t *task,
+                                                     struct vfs_file *file) {
+    task_execve_creds_t creds = {
+        .uid = task->uid,
+        .gid = task->gid,
+        .euid = task->euid,
+        .egid = task->egid,
+        .suid = task->suid,
+        .sgid = task->sgid,
+        .secure_exec = false,
+    };
+    struct vfs_inode *inode = file ? file->f_inode : NULL;
+    bool nosuid = file && file->f_path.mnt &&
+                  (file->f_path.mnt->mnt_flags & VFS_MNT_NOSUID);
+
+    if (inode && !nosuid && S_ISREG(inode->i_mode)) {
+        if (inode->i_mode & S_ISUID)
+            creds.euid = inode->i_uid;
+
+        if (inode->i_mode & S_ISGID)
+            creds.egid = inode->i_gid;
+    }
+
+    creds.suid = creds.euid;
+    creds.sgid = creds.egid;
+    creds.secure_exec = creds.euid != task->euid || creds.egid != task->egid;
+    return creds;
+}
+
+static void task_execve_commit_creds(task_t *task,
+                                     const task_execve_creds_t *creds) {
+    if (!task || !creds)
+        return;
+
+    task->uid = creds->uid;
+    task->gid = creds->gid;
+    task->euid = creds->euid;
+    task->egid = creds->egid;
+    task->suid = creds->suid;
+    task->sgid = creds->sgid;
+}
+
 static uint64_t simple_rand() {
     uint32_t seed = boot_get_boottime() * 100 + nano_time() / 10;
     seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
@@ -870,7 +922,8 @@ static uint64_t simple_rand() {
 uint64_t push_infos(task_t *task, uint64_t current_stack, char *argv[],
                     int argv_count, char *envp[], int envp_count,
                     uint64_t e_entry, uint64_t phdr, uint64_t phnum,
-                    uint64_t at_base, const char *execfn) {
+                    uint64_t at_base, const char *execfn,
+                    const task_execve_creds_t *creds) {
     uint64_t tmp_stack = current_stack;
     uint64_t arg_low = UINT64_MAX;
     uint64_t arg_high = 0;
@@ -949,16 +1002,16 @@ uint64_t push_infos(task_t *task, uint64_t current_stack, char *argv[],
     PUSH_TO_STACK(tmp_stack, uint64_t, random_ptr);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_RANDOM);
 
-    PUSH_TO_STACK(tmp_stack, uint64_t, task->egid);
+    PUSH_TO_STACK(tmp_stack, uint64_t, creds ? creds->egid : task->egid);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_EGID);
 
-    PUSH_TO_STACK(tmp_stack, uint64_t, task->gid);
+    PUSH_TO_STACK(tmp_stack, uint64_t, creds ? creds->gid : task->gid);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_GID);
 
-    PUSH_TO_STACK(tmp_stack, uint64_t, task->euid);
+    PUSH_TO_STACK(tmp_stack, uint64_t, creds ? creds->euid : task->euid);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_EUID);
 
-    PUSH_TO_STACK(tmp_stack, uint64_t, task->uid);
+    PUSH_TO_STACK(tmp_stack, uint64_t, creds ? creds->uid : task->uid);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_UID);
 
     PUSH_TO_STACK(tmp_stack, uint64_t, e_entry);
@@ -967,7 +1020,7 @@ uint64_t push_infos(task_t *task, uint64_t current_stack, char *argv[],
     PUSH_TO_STACK(tmp_stack, uint64_t, 0);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_FLAGS);
 
-    PUSH_TO_STACK(tmp_stack, uint64_t, 0);
+    PUSH_TO_STACK(tmp_stack, uint64_t, creds && creds->secure_exec ? 1 : 0);
     PUSH_TO_STACK(tmp_stack, uint64_t, AT_SECURE);
 
     PUSH_TO_STACK(tmp_stack, uint64_t, phnum);
@@ -1524,6 +1577,8 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
         return (uint64_t)-ENOEXEC;
     }
 
+    task_execve_creds_t exec_creds = task_execve_prepare_creds(self, exec_file);
+
     Elf64_Phdr *phdr;
     size_t phdr_size = ehdr->e_phnum * sizeof(Elf64_Phdr);
     bool phdr_allocated = false;
@@ -1688,7 +1743,7 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
     uint64_t stack = push_infos(
         self, USER_STACK_END, (char **)new_argv, argv_count, (char **)new_envp,
         envp_count, e_entry, phdr_vaddr, ehdr->e_phnum,
-        interpreter_entry ? INTERPRETER_BASE_ADDR : 0, path);
+        interpreter_entry ? INTERPRETER_BASE_ADDR : 0, path, &exec_creds);
 
     if (self->clone_flags & CLONE_FILES) {
         fd_info_t *old = self->fd_info;
@@ -1787,6 +1842,7 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
     if (self->exec_file)
         vfs_close_file(self->exec_file);
     self->exec_file = exec_file;
+    task_execve_commit_creds(self, &exec_creds);
     ptrace_stop_for_exec(self);
 
     arch_to_user_mode(self->arch_context,

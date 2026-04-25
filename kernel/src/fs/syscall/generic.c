@@ -560,6 +560,18 @@ static int generic_setattr_path(const struct vfs_path *path, bool set_mode,
     return inode->i_op->setattr(path->dentry, &stat);
 }
 
+static int generic_chown_path(const struct vfs_path *path, uint64_t uid,
+                              uint64_t gid) {
+    bool set_uid = uid != (uint64_t)-1;
+    bool set_gid = gid != (uint64_t)-1;
+
+    if (!set_uid && !set_gid)
+        return 0;
+
+    return generic_setattr_path(path, false, 0, set_uid, (uid32_t)uid, set_gid,
+                                (gid32_t)gid, false, 0);
+}
+
 static int generic_link_pathat(const struct vfs_path *old_path, int newdfd,
                                const char *newname) {
     struct vfs_path new_parent = {0};
@@ -1240,7 +1252,7 @@ uint64_t sys_close(uint64_t fd) {
     fd_t *entry = NULL;
     uint64_t ret = (uint64_t)-EBADF;
     with_fd_info_lock(self->fd_info, {
-        entry = self->fd_info->fds[fd];
+        entry = vfs_file_get(self->fd_info->fds[fd]);
         if (!entry)
             break;
 
@@ -1249,6 +1261,8 @@ uint64_t sys_close(uint64_t fd) {
         self->fd_info->fds[fd] = NULL;
         self->fd_info->fd_flags[fd] = 0;
         ret = 0;
+
+        vfs_file_put(entry);
     });
 
     if (ret)
@@ -1322,8 +1336,7 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
     if (flags & CLOSE_RANGE_CLOEXEC) {
         with_fd_info_lock(self->fd_info, {
             for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-                fd_t *entry = self->fd_info->fds[fd_];
-                if (!entry)
+                if (!self->fd_info->fds[fd_])
                     continue;
                 self->fd_info->fd_flags[fd_] |= FD_CLOEXEC;
             }
@@ -1335,7 +1348,7 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
 
     with_fd_info_lock(self->fd_info, {
         for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-            fd_t *entry = self->fd_info->fds[fd_];
+            fd_t *entry = vfs_file_get(self->fd_info->fds[fd_]);
             if (!entry)
                 continue;
 
@@ -1351,6 +1364,7 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
         fd_t *entry = to_close[fd_];
         if (!entry)
             continue;
+        vfs_file_put(entry);
         on_close_file_call(self, fd_, entry);
         vfs_close_file(entry);
     }
@@ -1700,36 +1714,38 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         break;
     }
 
-    if (ret == -ENOTTY) {
-        const char *sb_type =
-            (f->f_inode && f->f_inode->i_sb && f->f_inode->i_sb->s_type &&
-             f->f_inode->i_sb->s_type->name)
-                ? f->f_inode->i_sb->s_type->name
-                : "<unknown>";
-        const char *dentry_name =
-            (f->f_path.dentry && f->f_path.dentry->d_name.name &&
-             f->f_path.dentry->d_name.name[0])
-                ? f->f_path.dentry->d_name.name
-                : "<anonymous>";
-        const char *inode_type =
-            f->f_inode ? generic_file_type_name(f->f_inode->type) : "<none>";
-        char *full_path = NULL;
+    // if (ret == -ENOTTY) {
+    //     const char *sb_type =
+    //         (f->f_inode && f->f_inode->i_sb && f->f_inode->i_sb->s_type &&
+    //          f->f_inode->i_sb->s_type->name)
+    //             ? f->f_inode->i_sb->s_type->name
+    //             : "<unknown>";
+    //     const char *dentry_name =
+    //         (f->f_path.dentry && f->f_path.dentry->d_name.name &&
+    //          f->f_path.dentry->d_name.name[0])
+    //             ? f->f_path.dentry->d_name.name
+    //             : "<anonymous>";
+    //     const char *inode_type =
+    //         f->f_inode ? generic_file_type_name(f->f_inode->type) : "<none>";
+    //     char *full_path = NULL;
 
-        if (current_task && f->f_path.dentry)
-            full_path =
-                vfs_path_to_string(&f->f_path, task_fs_root_path(current_task));
+    //     if (current_task && f->f_path.dentry)
+    //         full_path =
+    //             vfs_path_to_string(&f->f_path,
+    //             task_fs_root_path(current_task));
 
-        printk("Ioctl not implemented: fd=%d sb_type=%s inode_type=%s "
-               "ino=%llu dentry=%s path=%s cmd=%#010x "
-               "[dir=%u size=%u type=%#x nr=%#x]\n",
-               fd, sb_type, inode_type,
-               (unsigned long long)(f->f_inode ? f->f_inode->i_ino : 0),
-               dentry_name, full_path ? full_path : "<unresolved>", cmd,
-               (unsigned int)((cmd >> 30) & 0x3),
-               (unsigned int)((cmd >> 16) & 0x3fff),
-               (unsigned int)((cmd >> 8) & 0xff), (unsigned int)(cmd & 0xff));
-        free(full_path);
-    }
+    //     printk("Ioctl not implemented: fd=%d sb_type=%s inode_type=%s "
+    //            "ino=%llu dentry=%s path=%s cmd=%#010x "
+    //            "[dir=%u size=%u type=%#x nr=%#x]\n",
+    //            fd, sb_type, inode_type,
+    //            (unsigned long long)(f->f_inode ? f->f_inode->i_ino : 0),
+    //            dentry_name, full_path ? full_path : "<unresolved>", cmd,
+    //            (unsigned int)((cmd >> 30) & 0x3),
+    //            (unsigned int)((cmd >> 16) & 0x3fff),
+    //            (unsigned int)((cmd >> 8) & 0xff), (unsigned int)(cmd &
+    //            0xff));
+    //     free(full_path);
+    // }
 
     return ret;
 }
@@ -3093,8 +3109,7 @@ uint64_t sys_chown(const char *filename_user, uint64_t uid, uint64_t gid) {
     ret = vfs_filename_lookup(AT_FDCWD, filename, LOOKUP_FOLLOW, &path);
     if (ret < 0)
         return (uint64_t)ret;
-    ret = generic_setattr_path(&path, false, 0, true, (uid32_t)uid, true,
-                               (gid32_t)gid, false, 0);
+    ret = generic_chown_path(&path, uid, gid);
     vfs_path_put(&path);
     return (uint64_t)ret;
 }
@@ -3104,8 +3119,7 @@ uint64_t sys_fchown(int fd, uint64_t uid, uint64_t gid) {
     int ret = generic_get_fd_path(fd, &path);
     if (ret < 0)
         return ret;
-    ret = generic_setattr_path(&path, false, 0, true, (uid32_t)uid, true,
-                               (gid32_t)gid, false, 0);
+    ret = generic_chown_path(&path, uid, gid);
     vfs_path_put(&path);
     return (uint64_t)ret;
 }
@@ -3122,8 +3136,7 @@ uint64_t sys_fchownat(int dfd, const char *name_user, uint64_t uid,
         (flags & AT_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW, &path);
     if (ret < 0)
         return (uint64_t)ret;
-    ret = generic_setattr_path(&path, false, 0, true, (uid32_t)uid, true,
-                               (gid32_t)gid, false, 0);
+    ret = generic_chown_path(&path, uid, gid);
     vfs_path_put(&path);
     return (uint64_t)ret;
 }

@@ -2,6 +2,7 @@
 #include <net/netlink.h>
 #include <mm/mm.h>
 #include <task/task.h>
+#include <fs/sys.h>
 
 netdev_t *netdevs[MAX_NETDEV_NUM] = {NULL};
 static spinlock_t netdevs_lock = SPIN_INIT;
@@ -17,6 +18,140 @@ static void netdev_default_name(char *name, uint32_t type, uint32_t id) {
     }
 
     snprintf(name, NETDEV_NAME_LEN, "net%u", id);
+}
+
+static void netdev_create_sysfs(netdev_t *dev) {
+    char path[256];
+    char buf[512];
+    vfs_node_t *net_dir;
+    vfs_node_t *node;
+    int len;
+
+    if (!dev)
+        return;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s", dev->name);
+    net_dir = sysfs_ensure_dir(path);
+    if (!net_dir)
+        return;
+
+    node = sysfs_child_append(net_dir, "ifindex", false);
+    if (node) {
+        snprintf(buf, sizeof(buf), "%u\n", dev->id + 1);
+        sysfs_write_node(node, buf, strlen(buf), 0);
+        vfs_iput(node);
+    }
+
+    node = sysfs_child_append(net_dir, "uevent", false);
+    if (node) {
+        if (dev->type == NETDEV_TYPE_WIFI) {
+            len = snprintf(buf, sizeof(buf),
+                           "DEVTYPE=wlan\nINTERFACE=%s\nIFINDEX=%u\n",
+                           dev->name, dev->id + 1);
+        } else {
+            len = snprintf(buf, sizeof(buf), "INTERFACE=%s\nIFINDEX=%u\n",
+                           dev->name, dev->id + 1);
+        }
+        sysfs_write_node(node, buf, (size_t)len, 0);
+        vfs_iput(node);
+    }
+
+    if (dev->type == NETDEV_TYPE_WIFI) {
+        node = sysfs_child_append(net_dir, "phy80211", true);
+        if (node)
+            vfs_iput(node);
+
+        snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%u", dev->id);
+        node = sysfs_ensure_dir(path);
+        if (node) {
+            vfs_node_t *child;
+            char phy_path[256];
+
+            snprintf(phy_path, sizeof(phy_path), "/sys/class/net/%s/phy80211",
+                     dev->name);
+
+            child = sysfs_child_append(node, "name", false);
+            if (child) {
+                snprintf(buf, sizeof(buf), "%s\n",
+                         dev->wireless.wiphy_name[0] ? dev->wireless.wiphy_name
+                                                     : "phy0");
+                sysfs_write_node(child, buf, strlen(buf), 0);
+                vfs_iput(child);
+            }
+
+            child = sysfs_child_append(node, "type", false);
+            if (child) {
+                sysfs_write_node(child, "wlan\n", 5, 0);
+                vfs_iput(child);
+            }
+
+            child = sysfs_child_append(node, "state", false);
+            if (child) {
+                sysfs_write_node(child, "1\n", 2, 0);
+                vfs_iput(child);
+            }
+
+            child = sysfs_child_append(node, "soft", false);
+            if (child) {
+                sysfs_write_node(child, "0\n", 2, 0);
+                vfs_iput(child);
+            }
+
+            child = sysfs_child_append(node, "hard", false);
+            if (child) {
+                sysfs_write_node(child, "0\n", 2, 0);
+                vfs_iput(child);
+            }
+
+            child = sysfs_child_append_symlink(node, "device", phy_path);
+            if (child)
+                vfs_iput(child);
+            vfs_iput(node);
+        }
+    }
+
+    vfs_iput(net_dir);
+
+    {
+        char uevent_nl[512];
+        size_t nl_len = 0;
+        bool last_was_nul = false;
+        int seqnum = alloc_seq_num();
+        const char *devpath = path + 4;
+
+        len = snprintf(buf, sizeof(buf),
+                       "add@%s\nACTION=add\nDEVPATH=%s\nSUBSYSTEM=net\n"
+                       "INTERFACE=%s\nIFINDEX=%u\nSEQNUM=%d\n",
+                       devpath, devpath, dev->name, dev->id + 1, seqnum);
+
+        if (dev->type == NETDEV_TYPE_WIFI && (size_t)len < sizeof(buf)) {
+            int extra = snprintf(buf + len, sizeof(buf) - (size_t)len,
+                                 "DEVTYPE=wlan\n");
+            if (extra > 0)
+                len += extra;
+        }
+        if ((size_t)len >= sizeof(buf))
+            len = (int)(sizeof(buf) - 1);
+
+        for (size_t i = 0; i < (size_t)len && nl_len < sizeof(uevent_nl) - 1;
+             i++) {
+            char c = buf[i];
+            if (c == '\n')
+                c = '\0';
+            if (c == '\0') {
+                if (last_was_nul)
+                    continue;
+                last_was_nul = true;
+            } else {
+                last_was_nul = false;
+            }
+            uevent_nl[nl_len++] = c;
+        }
+        if (nl_len == 0 || uevent_nl[nl_len - 1] != '\0')
+            uevent_nl[nl_len++] = '\0';
+
+        netlink_kernel_uevent_send(uevent_nl, (int)nl_len);
+    }
 }
 
 netdev_t *netdev_register(const char *name, uint32_t type, void *desc,
@@ -64,6 +199,7 @@ netdev_t *netdev_register(const char *name, uint32_t type, void *desc,
 
         netdevs[i] = dev;
         spin_unlock(&netdevs_lock);
+        netdev_create_sysfs(dev);
         netdev_notify(dev, NETDEV_EVENT_REGISTERED);
         return dev;
     }

@@ -44,10 +44,21 @@ typedef struct unix_socket_bind_bucket {
 } unix_socket_bind_bucket_t;
 
 #define SIOCGIFINDEX 0x8933
+#define SIOCGIFNAME 0x8910
+#define SIOCGIFFLAGS 0x8913
+#define SIOCSIFFLAGS 0x8914
+#define SIOCGIFHWADDR 0x8927
+#define SIOCGIFMTU 0x8921
+
+typedef struct naos_sockaddr {
+    uint16_t sa_family;
+    char sa_data[14];
+} naos_sockaddr_t;
 
 typedef struct naos_ifreq {
     char ifr_name[IFNAMSIZ];
     union {
+        naos_sockaddr_t ifru_hwaddr;
         short ifru_flags;
         int ifru_ifindex;
         int ifru_metric;
@@ -58,6 +69,18 @@ typedef struct naos_ifreq {
         void *ifru_data;
     } ifr_ifru;
 } naos_ifreq_t;
+
+static uint16_t socket_netdev_flags(const netdev_t *dev) {
+    uint32_t flags = IFF_BROADCAST | IFF_MULTICAST;
+
+    if (!dev)
+        return (uint16_t)flags;
+    if (dev->admin_up)
+        flags |= IFF_UP;
+    if (dev->link_up)
+        flags |= IFF_RUNNING | IFF_LOWER_UP;
+    return (uint16_t)flags;
+}
 
 static inline void socket_notify_sock(socket_t *sock, uint32_t events);
 static inline void unix_socket_snapshot_peer_cred(socket_t *sock,
@@ -2568,6 +2591,97 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
     socket_t *sock = handler->sock;
 
     switch (cmd & 0xFFFFFFFF) {
+    case SIOCGIFFLAGS:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            req.ifr_name[IFNAMSIZ - 1] = '\0';
+            dev = netdev_get_by_name(req.ifr_name);
+            if (!dev)
+                return -ENODEV;
+
+            req.ifr_ifru.ifru_flags = (short)socket_netdev_flags(dev);
+            netdev_put(dev);
+
+            if (copy_to_user((void *)arg, &req, sizeof(req)))
+                return -EFAULT;
+            return 0;
+        }
+    case SIOCSIFFLAGS:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+            int ret;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            req.ifr_name[IFNAMSIZ - 1] = '\0';
+            dev = netdev_get_by_name(req.ifr_name);
+            if (!dev)
+                return -ENODEV;
+
+            ret = netdev_set_admin_state(dev,
+                                         !!(req.ifr_ifru.ifru_flags & IFF_UP));
+            netdev_put(dev);
+            return ret;
+        }
+    case SIOCGIFHWADDR:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            req.ifr_name[IFNAMSIZ - 1] = '\0';
+            dev = netdev_get_by_name(req.ifr_name);
+            if (!dev)
+                return -ENODEV;
+
+            memset(&req.ifr_ifru.ifru_hwaddr, 0,
+                   sizeof(req.ifr_ifru.ifru_hwaddr));
+            req.ifr_ifru.ifru_hwaddr.sa_family = ARPHRD_ETHER;
+            memcpy(req.ifr_ifru.ifru_hwaddr.sa_data, dev->mac,
+                   sizeof(dev->mac));
+            netdev_put(dev);
+
+            if (copy_to_user((void *)arg, &req, sizeof(req)))
+                return -EFAULT;
+            return 0;
+        }
+    case SIOCGIFMTU:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            req.ifr_name[IFNAMSIZ - 1] = '\0';
+            dev = netdev_get_by_name(req.ifr_name);
+            if (!dev)
+                return -ENODEV;
+
+            req.ifr_ifru.ifru_mtu = (int)dev->mtu;
+            netdev_put(dev);
+
+            if (copy_to_user((void *)arg, &req, sizeof(req)))
+                return -EFAULT;
+            return 0;
+        }
     case SIOCGIFINDEX:
         if (!arg)
             return -EFAULT;
@@ -2584,6 +2698,28 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
                 return -ENODEV;
 
             req.ifr_ifru.ifru_ifindex = (int)(dev->id + 1);
+            netdev_put(dev);
+
+            if (copy_to_user((void *)arg, &req, sizeof(req)))
+                return -EFAULT;
+            return 0;
+        }
+    case SIOCGIFNAME:
+        if (!arg)
+            return -EFAULT;
+        {
+            naos_ifreq_t req;
+            netdev_t *dev;
+
+            if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+                return -EFAULT;
+
+            dev = netdev_get_by_index((uint32_t)(req.ifr_ifru.ifru_ifindex));
+            if (!dev)
+                return -ENODEV;
+
+            memset(req.ifr_name, 0, IFNAMSIZ);
+            strncpy(req.ifr_name, dev->name, IFNAMSIZ - 1);
             netdev_put(dev);
 
             if (copy_to_user((void *)arg, &req, sizeof(req)))
