@@ -396,33 +396,47 @@ static int socket_store_mmsg_len(struct mmsghdr *msgvec, unsigned int idx,
 }
 
 uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
-    if (fd >= MAX_FD_NUM || !current_task->fd_info->fds[fd])
+    fd_t *node = task_get_file(current_task, (int)fd);
+    uint64_t ret;
+
+    if (fd >= MAX_FD_NUM || !node)
         return -EBADF;
 
-    fd_t *node = current_task->fd_info->fds[fd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
-    if (!handle || !handle->op || !handle->op->shutdown)
+    if (!handle || !handle->op || !handle->op->shutdown) {
+        vfs_file_put(node);
         return -ENOSYS;
+    }
 
-    return handle->op->shutdown(fd, how);
+    ret = handle->op->shutdown(fd, how);
+    vfs_file_put(node);
+    return ret;
 }
 
 uint64_t sys_getpeername(int fd, struct sockaddr_un *addr, socklen_t *addrlen) {
-    if (fd < 0 || fd >= MAX_FD_NUM || !current_task->fd_info->fds[fd])
+    fd_t *node = task_get_file(current_task, fd);
+    if (fd < 0 || fd >= MAX_FD_NUM || !node)
         return -EBADF;
-    if (!addrlen)
+    if (!addrlen) {
+        vfs_file_put(node);
         return -EFAULT;
+    }
 
     uint32_t user_len32 = 0;
-    if (copy_from_user(&user_len32, addrlen, sizeof(user_len32)))
+    if (copy_from_user(&user_len32, addrlen, sizeof(user_len32))) {
+        vfs_file_put(node);
         return (uint64_t)-EFAULT;
+    }
     socklen_t user_len = (socklen_t)user_len32;
-    fd_t *node = current_task->fd_info->fds[fd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     void *kaddr = calloc(1, PAGE_SIZE);
     socklen_t kaddrlen = user_len;
@@ -432,44 +446,55 @@ uint64_t sys_getpeername(int fd, struct sockaddr_un *addr, socklen_t *addrlen) {
         uint64_t ret = handle->op->getpeername(fd, kaddr, &kaddrlen);
         if ((int64_t)ret < 0) {
             free(kaddr);
+            vfs_file_put(node);
             return ret;
         }
 
         size_t copy_len = MIN((size_t)user_len, (size_t)kaddrlen);
         if (copy_len && addr && copy_to_user(addr, kaddr, copy_len)) {
             free(kaddr);
+            vfs_file_put(node);
             return (uint64_t)-EFAULT;
         }
 
         free(kaddr);
 
         uint32_t out_len32 = (uint32_t)kaddrlen;
-        if (copy_to_user(addrlen, &out_len32, sizeof(out_len32)))
+        if (copy_to_user(addrlen, &out_len32, sizeof(out_len32))) {
+            vfs_file_put(node);
             return (uint64_t)-EFAULT;
+        }
 
+        vfs_file_put(node);
         return ret;
     }
 
     free(kaddr);
+    vfs_file_put(node);
 
     return -ENOSYS;
 }
 
 uint64_t sys_getsockname(int sockfd, struct sockaddr_un *addr,
                          socklen_t *addrlen) {
-    if (sockfd < 0 || sockfd >= MAX_FD_NUM ||
-        !current_task->fd_info->fds[sockfd])
+    fd_t *node = task_get_file(current_task, sockfd);
+    if (sockfd < 0 || sockfd >= MAX_FD_NUM || !node)
         return -EBADF;
-    if (!addrlen)
+    if (!addrlen) {
+        vfs_file_put(node);
         return -EFAULT;
+    }
 
     uint32_t user_len32 = 0;
-    if (copy_from_user(&user_len32, addrlen, sizeof(user_len32)))
+    if (copy_from_user(&user_len32, addrlen, sizeof(user_len32))) {
+        vfs_file_put(node);
         return (uint64_t)-EFAULT;
+    }
     socklen_t user_len = (socklen_t)user_len32;
-    fd_t *node = current_task->fd_info->fds[sockfd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     void *kaddr = calloc(1, PAGE_SIZE);
     socklen_t kaddrlen = user_len;
@@ -479,75 +504,97 @@ uint64_t sys_getsockname(int sockfd, struct sockaddr_un *addr,
         uint64_t ret = handle->op->getsockname(sockfd, kaddr, &kaddrlen);
         if ((int64_t)ret < 0) {
             free(kaddr);
+            vfs_file_put(node);
             return ret;
         }
 
         size_t copy_len = MIN((size_t)user_len, (size_t)kaddrlen);
         if (copy_len && addr && copy_to_user(addr, kaddr, copy_len)) {
             free(kaddr);
+            vfs_file_put(node);
             return (uint64_t)-EFAULT;
         }
 
         free(kaddr);
 
         uint32_t out_len32 = (uint32_t)kaddrlen;
-        if (copy_to_user(addrlen, &out_len32, sizeof(out_len32)))
+        if (copy_to_user(addrlen, &out_len32, sizeof(out_len32))) {
+            vfs_file_put(node);
             return (uint64_t)-EFAULT;
+        }
 
+        vfs_file_put(node);
         return ret;
     }
 
     free(kaddr);
+    vfs_file_put(node);
 
     return -ENOSYS;
 }
 
 uint64_t sys_setsockopt(int fd, int level, int optname, const void *optval,
                         socklen_t optlen) {
-    if (fd < 0 || fd >= MAX_FD_NUM || !current_task->fd_info->fds[fd])
+    fd_t *node = task_get_file(current_task, fd);
+    if (fd < 0 || fd >= MAX_FD_NUM || !node)
         return -EBADF;
-    fd_t *node = current_task->fd_info->fds[fd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->setsockopt) {
         void *koptval = NULL;
         int ret = socket_alloc_copy_from_user(optval, optlen, &koptval);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
 
         uint64_t out =
             handle->op->setsockopt(fd, level, optname, koptval, optlen);
         free(koptval);
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return -ENOSYS;
 }
 
 uint64_t sys_getsockopt(int fd, int level, int optname, void *optval,
                         socklen_t *optlen) {
-    if (fd < 0 || fd >= MAX_FD_NUM || !current_task->fd_info->fds[fd])
+    fd_t *node = task_get_file(current_task, fd);
+    if (fd < 0 || fd >= MAX_FD_NUM || !node)
         return -EBADF;
-    if (!optlen)
+    if (!optlen) {
+        vfs_file_put(node);
         return -EFAULT;
-    fd_t *node = current_task->fd_info->fds[fd];
-    if (!is_socket(node))
+    }
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->getsockopt) {
         socklen_t user_len = 0;
-        if (copy_from_user(&user_len, optlen, sizeof(user_len)))
+        if (copy_from_user(&user_len, optlen, sizeof(user_len))) {
+            vfs_file_put(node);
             return -EFAULT;
-        if (user_len && !optval)
+        }
+        if (user_len && !optval) {
+            vfs_file_put(node);
             return -EFAULT;
+        }
 
         void *koptval = NULL;
         if (user_len) {
             koptval = calloc(1, user_len);
-            if (!koptval)
+            if (!koptval) {
+                vfs_file_put(node);
                 return -ENOMEM;
+            }
         }
 
         socklen_t koptlen = user_len;
@@ -555,20 +602,26 @@ uint64_t sys_getsockopt(int fd, int level, int optname, void *optval,
             handle->op->getsockopt(fd, level, optname, koptval, &koptlen);
         if ((int64_t)ret < 0) {
             free(koptval);
+            vfs_file_put(node);
             return ret;
         }
 
         size_t copy_len = MIN((size_t)user_len, (size_t)koptlen);
         if (copy_len && copy_to_user(optval, koptval, copy_len)) {
             free(koptval);
+            vfs_file_put(node);
             return -EFAULT;
         }
         free(koptval);
 
-        if (copy_to_user(optlen, &koptlen, sizeof(koptlen)))
+        if (copy_to_user(optlen, &koptlen, sizeof(koptlen))) {
+            vfs_file_put(node);
             return -EFAULT;
+        }
+        vfs_file_put(node);
         return ret;
     }
+    vfs_file_put(node);
     return -ENOSYS;
 }
 
@@ -615,37 +668,47 @@ uint64_t sys_socketpair(int domain, int type, int protocol, int *sv) {
 
 uint64_t sys_bind(int sockfd, const struct sockaddr_un *addr,
                   socklen_t addrlen) {
-    if (sockfd < 0 || sockfd >= MAX_FD_NUM ||
-        !current_task->fd_info->fds[sockfd])
+    fd_t *node = task_get_file(current_task, sockfd);
+    if (sockfd < 0 || sockfd >= MAX_FD_NUM || !node)
         return -EBADF;
-    fd_t *node = current_task->fd_info->fds[sockfd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->bind) {
         struct sockaddr_un *kaddr = NULL;
         int ret = socket_copy_sockaddr_from_user(addr, addrlen, &kaddr);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
         uint64_t out = handle->op->bind(sockfd, kaddr, addrlen);
         free(kaddr);
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return 0;
 }
 
 uint64_t sys_listen(int sockfd, int backlog) {
-    if (sockfd < 0 || sockfd >= MAX_FD_NUM ||
-        !current_task->fd_info->fds[sockfd])
+    fd_t *node = task_get_file(current_task, sockfd);
+    if (sockfd < 0 || sockfd >= MAX_FD_NUM || !node)
         return -EBADF;
-    fd_t *node = current_task->fd_info->fds[sockfd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
-    if (handle && handle->op && handle->op->listen)
-        return handle->op->listen(sockfd, backlog);
+    if (handle && handle->op && handle->op->listen) {
+        uint64_t out = handle->op->listen(sockfd, backlog);
+        vfs_file_put(node);
+        return out;
+    }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -654,12 +717,7 @@ uint64_t sys_accept(int sockfd, struct sockaddr_un *addr, socklen_t *addrlen,
     if (!current_task || sockfd < 0 || sockfd >= MAX_FD_NUM)
         return -EBADF;
 
-    fd_t *node = NULL;
-    with_fd_info_lock(current_task->fd_info, {
-        if (current_task->fd_info->fds[sockfd]) {
-            node = vfs_file_get(current_task->fd_info->fds[sockfd]);
-        }
-    });
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
     if (!is_socket(node)) {
@@ -712,23 +770,28 @@ uint64_t sys_accept(int sockfd, struct sockaddr_un *addr, socklen_t *addrlen,
 
 uint64_t sys_connect(int sockfd, const struct sockaddr_un *addr,
                      socklen_t addrlen) {
-    if (sockfd < 0 || sockfd >= MAX_FD_NUM ||
-        !current_task->fd_info->fds[sockfd])
+    fd_t *node = task_get_file(current_task, sockfd);
+    if (sockfd < 0 || sockfd >= MAX_FD_NUM || !node)
         return -EBADF;
-    fd_t *node = current_task->fd_info->fds[sockfd];
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->connect) {
         struct sockaddr_un *kaddr = NULL;
         int ret = socket_copy_sockaddr_from_user(addr, addrlen, &kaddr);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
         uint64_t out = handle->op->connect(sockfd, kaddr, addrlen);
         free(kaddr);
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -739,24 +802,29 @@ int64_t sys_send(int sockfd, void *buff, size_t len, int flags,
     if (socket_validate_user_mapped_buffer(buff, len) < 0)
         return -EFAULT;
 
-    fd_t *node = current_task->fd_info->fds[sockfd];
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->sendto) {
         void *kbuf = NULL;
         int ret = socket_alloc_copy_from_user(buff, len, &kbuf);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
 
         struct sockaddr_un *kaddr = NULL;
         if (dest_addr && addrlen) {
             ret = socket_copy_sockaddr_from_user(dest_addr, addrlen, &kaddr);
             if (ret < 0) {
                 free(kbuf);
+                vfs_file_put(node);
                 return ret;
             }
         }
@@ -765,8 +833,10 @@ int64_t sys_send(int sockfd, void *buff, size_t len, int flags,
             handle->op->sendto(sockfd, kbuf, len, flags, kaddr, addrlen);
         free(kbuf);
         free(kaddr);
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -777,19 +847,23 @@ int64_t sys_recv(int sockfd, void *buf, size_t len, int flags,
     if (socket_validate_user_mapped_buffer(buf, len) < 0)
         return -EFAULT;
 
-    fd_t *node = current_task->fd_info->fds[sockfd];
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->recvfrom) {
         uint8_t *kbuf = NULL;
         if (len > 0) {
             kbuf = malloc(len);
-            if (!kbuf)
+            if (!kbuf) {
+                vfs_file_put(node);
                 return -ENOMEM;
+            }
         }
 
         struct sockaddr_un *kaddr = NULL;
@@ -799,16 +873,19 @@ int64_t sys_recv(int sockfd, void *buf, size_t len, int flags,
         if (dest_addr) {
             if (!addrlen) {
                 free(kbuf);
+                vfs_file_put(node);
                 return -EFAULT;
             }
             if (copy_from_user(&user_addrlen, addrlen, sizeof(user_addrlen))) {
                 free(kbuf);
+                vfs_file_put(node);
                 return -EFAULT;
             }
             if (user_addrlen) {
                 kaddr = calloc(1, user_addrlen);
                 if (!kaddr) {
                     free(kbuf);
+                    vfs_file_put(node);
                     return -ENOMEM;
                 }
             }
@@ -833,8 +910,10 @@ int64_t sys_recv(int sockfd, void *buf, size_t len, int flags,
 
         free(kbuf);
         free(kaddr);
+        vfs_file_put(node);
         return ret;
     }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -842,23 +921,29 @@ int64_t sys_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     if (sockfd < 0 || sockfd >= MAX_FD_NUM)
         return -EBADF;
 
-    fd_t *node = current_task->fd_info->fds[sockfd];
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->sendmsg) {
         socket_msghdr_copy_t msg_copy;
         int ret = socket_prepare_msghdr_from_user(msg, &msg_copy, true);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
 
         int64_t out = handle->op->sendmsg(sockfd, &msg_copy.kernel_msg, flags);
         socket_release_msghdr_copy(&msg_copy);
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -866,18 +951,22 @@ int64_t sys_recvmsg(int sockfd, struct msghdr *msg, int flags) {
     if (sockfd < 0 || sockfd >= MAX_FD_NUM)
         return -EBADF;
 
-    fd_t *node = current_task->fd_info->fds[sockfd];
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     socket_handle_t *handle = (socket_handle_t *)node->node->i_private;
     if (handle && handle->op && handle->op->recvmsg) {
         socket_msghdr_copy_t msg_copy;
         int ret = socket_prepare_msghdr_from_user(msg, &msg_copy, false);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
 
         int64_t out = handle->op->recvmsg(sockfd, &msg_copy.kernel_msg, flags);
         int copy_back_ret = 0;
@@ -889,10 +978,14 @@ int64_t sys_recvmsg(int sockfd, struct msghdr *msg, int flags) {
                                          msg_copy.user_shadow.msg_iovlen)));
 
         socket_release_msghdr_copy(&msg_copy);
-        if (copy_back_ret < 0)
+        if (copy_back_ret < 0) {
+            vfs_file_put(node);
             return copy_back_ret;
+        }
+        vfs_file_put(node);
         return out;
     }
+    vfs_file_put(node);
     return 0;
 }
 
@@ -930,11 +1023,13 @@ int64_t sys_recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
     if (sockfd < 0 || sockfd >= MAX_FD_NUM)
         return -EBADF;
 
-    fd_t *node = current_task->fd_info->fds[sockfd];
+    fd_t *node = task_get_file(current_task, sockfd);
     if (!node)
         return -EBADF;
-    if (!is_socket(node))
+    if (!is_socket(node)) {
+        vfs_file_put(node);
         return -ENOTSOCK;
+    }
 
     uint64_t deadline = socket_timeout_deadline(timeout_ns);
     unsigned int received = 0;
@@ -950,8 +1045,10 @@ int64_t sys_recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
             ret = socket_wait_fd_event(node, EPOLLIN, remaining_ns, "recvmmsg");
             if (ret == -ETIMEDOUT)
                 break;
-            if (ret < 0)
+            if (ret < 0) {
+                vfs_file_put(node);
                 return received ? (int64_t)received : ret;
+            }
         }
 
         int call_flags = (recv_flags & ~MSG_WAITFORONE) | MSG_DONTWAIT;
@@ -960,21 +1057,28 @@ int64_t sys_recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
         if (out == -(EWOULDBLOCK))
             out = -EAGAIN;
         if (out == -EAGAIN) {
-            if (!should_wait)
+            if (!should_wait) {
+                vfs_file_put(node);
                 return received ? (int64_t)received : out;
+            }
             continue;
         }
-        if (out < 0)
+        if (out < 0) {
+            vfs_file_put(node);
             return received ? (int64_t)received : out;
+        }
 
         ret = socket_store_mmsg_len(msgvec, received, out);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_file_put(node);
             return ret;
+        }
 
         received++;
         if ((flags & MSG_WAITFORONE) && received == 1)
             recv_flags |= MSG_DONTWAIT;
     }
 
+    vfs_file_put(node);
     return received;
 }

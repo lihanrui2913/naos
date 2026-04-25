@@ -2837,27 +2837,40 @@ void netlink_broadcast_to_group(const char *buf, size_t len,
     spin_unlock(&netlink_sockets_lock);
 }
 
+static fd_t *netlink_file_from_fd(uint64_t fd, struct netlink_sock **sock_out) {
+    fd_t *file = task_get_file(current_task, (int)fd);
+    if (!file || !file->node) {
+        vfs_file_put(file);
+        return NULL;
+    }
+
+    socket_handle_t *handle = sockfs_file_handle(file);
+    if (handle == NULL || handle->sock == NULL) {
+        vfs_file_put(file);
+        return NULL;
+    }
+
+    if (sock_out)
+        *sock_out = handle->sock;
+    return file;
+}
+
 int netlink_bind(uint64_t fd, const struct sockaddr_un *addr,
                  socklen_t addrlen) {
     if (addr == NULL || addrlen < sizeof(struct sockaddr_nl)) {
         return -EINVAL;
     }
 
-    if (current_task->fd_info->fds[fd] == NULL ||
-        current_task->fd_info->fds[fd]->node == NULL) {
+    struct netlink_sock *sock = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &sock);
+    if (!file) {
         return -EBADF;
     }
 
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    if (handle == NULL || handle->sock == NULL) {
-        return -EBADF;
-    }
-
-    struct netlink_sock *sock = handle->sock;
     struct sockaddr_nl *nl_addr = (struct sockaddr_nl *)addr;
 
     if (nl_addr->nl_family != AF_NETLINK) {
+        vfs_file_put(file);
         return -EAFNOSUPPORT;
     }
 
@@ -2865,6 +2878,7 @@ int netlink_bind(uint64_t fd, const struct sockaddr_un *addr,
     uint32_t portid = netlink_resolve_portid_locked(sock, nl_addr->nl_pid);
     if (!portid) {
         spin_unlock(&netlink_sockets_lock);
+        vfs_file_put(file);
         return -EADDRINUSE;
     }
 
@@ -2879,6 +2893,7 @@ int netlink_bind(uint64_t fd, const struct sockaddr_un *addr,
         if (sock->bind_addr == NULL) {
             spin_unlock(&sock->lock);
             spin_unlock(&netlink_sockets_lock);
+            vfs_file_put(file);
             return -ENOMEM;
         }
     }
@@ -2888,18 +2903,22 @@ int netlink_bind(uint64_t fd, const struct sockaddr_un *addr,
 
     netlink_deliver_historical_messages(sock);
 
+    vfs_file_put(file);
     return 0;
 }
 
 size_t netlink_getsockopt(uint64_t fd, int level, int optname, void *optval,
                           socklen_t *optlen) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
+#define NETLINK_GETSOCKOPT_RETURN(value)                                       \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (level == SOL_SOCKET) {
         switch (optname) {
@@ -2915,7 +2934,7 @@ size_t netlink_getsockopt(uint64_t fd, int level, int optname, void *optval,
             break;
         case SO_PASSCRED:
             if (!optval || !optlen || *optlen < sizeof(int))
-                return -EINVAL;
+                NETLINK_GETSOCKOPT_RETURN(-EINVAL);
             *(int *)optval = nl_sk->passcred ? 1 : 0;
             *optlen = sizeof(int);
             break;
@@ -2924,42 +2943,47 @@ size_t netlink_getsockopt(uint64_t fd, int level, int optname, void *optval,
         case SO_RCVBUF:
         case SO_RCVBUFFORCE:
             if (!optval || !optlen || *optlen < sizeof(int))
-                return -EINVAL;
+                NETLINK_GETSOCKOPT_RETURN(-EINVAL);
             *(int *)optval = (int)nl_sk->buffer->size;
             *optlen = sizeof(int);
             break;
         default:
             printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                    __LINE__, level, optname);
-            return -ENOPROTOOPT;
+            NETLINK_GETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else if (level == SOL_NETLINK) {
-        return 0;
+        NETLINK_GETSOCKOPT_RETURN(0);
     } else {
         printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                __LINE__, level, optname);
-        return -ENOPROTOOPT;
+        NETLINK_GETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 
+    vfs_file_put(file);
+#undef NETLINK_GETSOCKOPT_RETURN
     return 0;
 }
 
 size_t netlink_setsockopt(uint64_t fd, int level, int optname,
                           const void *optval, socklen_t optlen) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
+#define NETLINK_SETSOCKOPT_RETURN(value)                                       \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (level == SOL_SOCKET) {
         switch (optname) {
         case SO_ATTACH_FILTER:
             const struct sock_fprog *fprog = optval;
             if (!fprog->len) {
-                return (size_t)-EINVAL;
+                NETLINK_SETSOCKOPT_RETURN((size_t)-EINVAL);
             }
             nl_sk->filter = malloc(sizeof(struct sock_fprog));
             nl_sk->filter->len = fprog->len;
@@ -2972,7 +2996,7 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
                                    sizeof(struct sock_filter))) {
                 free(nl_sk->filter->filter);
                 free(nl_sk->filter);
-                return (size_t)-EFAULT;
+                NETLINK_SETSOCKOPT_RETURN((size_t)-EFAULT);
             }
             break;
         case SO_DETACH_FILTER:
@@ -2986,7 +3010,7 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
             break;
         case SO_PASSCRED:
             if (!optval || optlen < sizeof(int))
-                return -EINVAL;
+                NETLINK_SETSOCKOPT_RETURN(-EINVAL);
             spin_lock(&nl_sk->lock);
             nl_sk->passcred = (*(const int *)optval) != 0;
             spin_unlock(&nl_sk->lock);
@@ -2996,7 +3020,7 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
         case SO_RCVBUF:
         case SO_RCVBUFFORCE:
             if (!optval || optlen < sizeof(int))
-                return -EINVAL;
+                NETLINK_SETSOCKOPT_RETURN(-EINVAL);
             if (nl_sk->buffer) {
                 int req_size = *(const int *)optval;
                 size_t new_size = req_size > 0 ? (size_t)req_size
@@ -3024,18 +3048,18 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
         default:
             printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                    __LINE__, level, optname);
-            return -ENOPROTOOPT;
+            NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else if (level == SOL_NETLINK) {
         switch (optname) {
         case NETLINK_ADD_MEMBERSHIP:
         case NETLINK_DROP_MEMBERSHIP: {
             if (!optval || optlen < sizeof(uint32_t))
-                return -EINVAL;
+                NETLINK_SETSOCKOPT_RETURN(-EINVAL);
 
             uint32_t group = *(const uint32_t *)optval;
             if (group == 0 || group > 32)
-                return -EINVAL;
+                NETLINK_SETSOCKOPT_RETURN(-EINVAL);
 
             uint32_t bit = 1U << (group - 1);
             spin_lock(&nl_sk->lock);
@@ -3046,36 +3070,36 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
             if (nl_sk->bind_addr)
                 nl_sk->bind_addr->nl_groups = nl_sk->groups;
             spin_unlock(&nl_sk->lock);
-            return 0;
+            NETLINK_SETSOCKOPT_RETURN(0);
         }
         case 3:
         case 11:
         case 12:
             // TODO
-            return -ENOPROTOOPT;
+            NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         default:
             printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                    __LINE__, level, optname);
-            return -ENOPROTOOPT;
+            NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else {
         printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
                __LINE__, level, optname);
-        return -ENOPROTOOPT;
+        NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 
+    vfs_file_put(file);
+#undef NETLINK_SETSOCKOPT_RETURN
     return 0;
 }
 
 int netlink_getsockname(uint64_t fd, struct sockaddr_un *addr,
                         socklen_t *addrlen) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
 
     spin_lock(&nl_sk->lock);
     netlink_fill_sockaddr((struct sockaddr_nl *)addr, nl_sk->portid,
@@ -3083,20 +3107,24 @@ int netlink_getsockname(uint64_t fd, struct sockaddr_un *addr,
     *addrlen = sizeof(struct sockaddr_nl);
 
     spin_unlock(&nl_sk->lock);
+    vfs_file_put(file);
     return 0;
 }
 
 size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    fd_t *file = current_task->fd_info->fds[fd];
-    socket_handle_t *handle = sockfs_file_handle(file);
-    struct netlink_sock *nl_sk = handle->sock;
+#define NETLINK_RECVMSG_RETURN(value)                                          \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (nl_sk->buffer == NULL) {
-        return -EINVAL;
+        NETLINK_RECVMSG_RETURN(-EINVAL);
     }
 
     bool peek = !!(flags & MSG_PEEK);
@@ -3113,21 +3141,21 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
     int wait_ret =
         netlink_wait_for_message(nl_sk, file, flags, "netlink_recvmsg");
     if (wait_ret < 0)
-        return (size_t)wait_ret;
+        NETLINK_RECVMSG_RETURN((size_t)wait_ret);
 
     packet_len = netlink_buffer_peek_msg_len(nl_sk);
     if (packet_len == 0)
-        return -EAGAIN;
+        NETLINK_RECVMSG_RETURN(-EAGAIN);
 
     temp_buf = malloc(packet_len);
     if (!temp_buf)
-        return -ENOMEM;
+        NETLINK_RECVMSG_RETURN(-ENOMEM);
 
     bytes_read = netlink_buffer_read_packet(nl_sk, temp_buf, packet_len,
                                             &sender_pid, &sender_groups, peek);
     if (bytes_read == 0) {
         free(temp_buf);
-        return -EAGAIN;
+        NETLINK_RECVMSG_RETURN(-EAGAIN);
     }
 
     bytes_copied = netlink_copy_to_iov(msg->msg_iov, msg->msg_iovlen, temp_buf,
@@ -3168,34 +3196,40 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
         msg->msg_flags |= MSG_TRUNC;
 
     free(temp_buf);
-    return (flags & MSG_TRUNC) ? packet_len : bytes_copied;
+    size_t ret = (flags & MSG_TRUNC) ? packet_len : bytes_copied;
+    vfs_file_put(file);
+#undef NETLINK_RECVMSG_RETURN
+    return ret;
 }
 
 size_t netlink_sendmsg(uint64_t fd, const struct msghdr *msg, int flags) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
     struct sockaddr_nl *addr = (struct sockaddr_nl *)msg->msg_name;
+#define NETLINK_SENDMSG_RETURN(value)                                          \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (!msg || !addr)
-        return -EDESTADDRREQ;
+        NETLINK_SENDMSG_RETURN(-EDESTADDRREQ);
     if (msg->msg_namelen < sizeof(struct sockaddr_nl))
-        return -EINVAL;
+        NETLINK_SENDMSG_RETURN(-EINVAL);
     if (addr->nl_family != AF_NETLINK)
-        return -EAFNOSUPPORT;
+        NETLINK_SENDMSG_RETURN(-EAFNOSUPPORT);
 
     size_t total_len = netlink_iov_total_len(msg->msg_iov, msg->msg_iovlen);
     if (total_len == 0) {
-        return 0;
+        NETLINK_SENDMSG_RETURN(0);
     }
 
     if (total_len == SIZE_MAX ||
         total_len > NETLINK_BUFFER_SIZE - sizeof(struct netlink_packet_hdr)) {
-        return -EMSGSIZE;
+        NETLINK_SENDMSG_RETURN(-EMSGSIZE);
     }
 
     char buffer[NETLINK_BUFFER_SIZE];
@@ -3224,33 +3258,38 @@ size_t netlink_sendmsg(uint64_t fd, const struct msghdr *msg, int flags) {
             spin_unlock(&sock->lock);
         }
         spin_unlock(&netlink_sockets_lock);
-        return delivered ? (size_t)total_len : (size_t)-ECONNREFUSED;
+        NETLINK_SENDMSG_RETURN(delivered ? (size_t)total_len
+                                         : (size_t)-ECONNREFUSED);
     } else if (addr->nl_groups != 0) {
         netlink_broadcast_to_group(buffer, total_len, sender_pid,
                                    addr->nl_groups, nl_sk->protocol, 0, NULL);
-        return total_len;
+        NETLINK_SENDMSG_RETURN(total_len);
     } else {
         int ret = netlink_send_to_kernel(nl_sk, buffer, total_len, sender_pid);
-        return ret < 0 ? (size_t)ret : total_len;
+        NETLINK_SENDMSG_RETURN(ret < 0 ? (size_t)ret : total_len);
     }
+#undef NETLINK_SENDMSG_RETURN
 }
 
 size_t netlink_sendto(uint64_t fd, uint8_t *in, size_t limit, int flags,
                       struct sockaddr_un *addr, uint32_t len) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
+#define NETLINK_SENDTO_RETURN(value)                                           \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (limit == 0) {
-        return 0;
+        NETLINK_SENDTO_RETURN(0);
     }
 
     if (limit > NETLINK_BUFFER_SIZE - sizeof(struct netlink_packet_hdr)) {
-        return -EMSGSIZE;
+        NETLINK_SENDTO_RETURN(-EMSGSIZE);
     }
 
     uint32_t sender_pid = nl_sk->portid;
@@ -3259,13 +3298,13 @@ size_t netlink_sendto(uint64_t fd, uint8_t *in, size_t limit, int flags,
     struct sockaddr_nl *nl_addr = (struct sockaddr_nl *)addr;
 
     if (nl_addr == NULL) {
-        return -EDESTADDRREQ;
+        NETLINK_SENDTO_RETURN(-EDESTADDRREQ);
     }
 
     if (len < sizeof(struct sockaddr_nl))
-        return -EINVAL;
+        NETLINK_SENDTO_RETURN(-EINVAL);
     if (nl_addr->nl_family != AF_NETLINK) {
-        return -EAFNOSUPPORT;
+        NETLINK_SENDTO_RETURN(-EAFNOSUPPORT);
     }
     if (sender_pid == 0)
         sender_pid = (uint32_t)current_task->pid;
@@ -3282,30 +3321,34 @@ size_t netlink_sendto(uint64_t fd, uint8_t *in, size_t limit, int flags,
             spin_unlock(&sock->lock);
         }
         spin_unlock(&netlink_sockets_lock);
-        return delivered ? limit : (size_t)-ECONNREFUSED;
+        NETLINK_SENDTO_RETURN(delivered ? limit : (size_t)-ECONNREFUSED);
     } else if (nl_addr->nl_groups != 0) {
         netlink_broadcast_to_group((char *)in, limit, sender_pid,
                                    nl_addr->nl_groups, nl_sk->protocol, 0,
                                    NULL);
-        return limit;
+        NETLINK_SENDTO_RETURN(limit);
     }
 
     int ret = netlink_send_to_kernel(nl_sk, (char *)in, limit, sender_pid);
-    return ret < 0 ? (size_t)ret : limit;
+    NETLINK_SENDTO_RETURN(ret < 0 ? (size_t)ret : limit);
+#undef NETLINK_SENDTO_RETURN
 }
 
 size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
                         struct sockaddr_un *addr, uint32_t *len) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
-
-    fd_t *file = current_task->fd_info->fds[fd];
-    socket_handle_t *handle = sockfs_file_handle(file);
-    struct netlink_sock *nl_sk = handle->sock;
+#define NETLINK_RECVFROM_RETURN(value)                                         \
+    do {                                                                       \
+        vfs_file_put(file);                                                    \
+        return (value);                                                        \
+    } while (0)
 
     if (nl_sk->buffer == NULL) {
-        return -EINVAL;
+        NETLINK_RECVFROM_RETURN(-EINVAL);
     }
 
     bool peek = !!(flags & MSG_PEEK);
@@ -3318,21 +3361,21 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
     size_t bytes_read;
 
     if (wait_ret < 0)
-        return (size_t)wait_ret;
+        NETLINK_RECVFROM_RETURN((size_t)wait_ret);
 
     msg_len = netlink_buffer_peek_msg_len(nl_sk);
     if (msg_len == 0)
-        return -EAGAIN;
+        NETLINK_RECVFROM_RETURN(-EAGAIN);
 
     temp_buf = malloc(msg_len);
     if (!temp_buf)
-        return -ENOMEM;
+        NETLINK_RECVFROM_RETURN(-ENOMEM);
 
     bytes_read = netlink_buffer_read_packet(nl_sk, temp_buf, msg_len,
                                             &sender_pid, &sender_groups, peek);
     if (bytes_read == 0) {
         free(temp_buf);
-        return -EAGAIN;
+        NETLINK_RECVFROM_RETURN(-EAGAIN);
     }
 
     if (out && limit > 0)
@@ -3352,7 +3395,10 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
         memcpy(len, &addr_len, sizeof(uint32_t));
     }
 
-    return (flags & MSG_TRUNC) ? msg_len : MIN(limit, bytes_read);
+    size_t ret = (flags & MSG_TRUNC) ? msg_len : MIN(limit, bytes_read);
+    vfs_file_put(file);
+#undef NETLINK_RECVFROM_RETURN
+    return ret;
 }
 
 socket_op_t netlink_ops = {
@@ -3500,18 +3546,18 @@ ssize_t netlink_read(uint64_t fd, char *buf, size_t count) {
 }
 
 ssize_t netlink_write(uint64_t fd, const char *buf, size_t count) {
-    if (current_task->fd_info->fds[fd] == NULL) {
+    struct netlink_sock *nl_sk = NULL;
+    fd_t *file = netlink_file_from_fd(fd, &nl_sk);
+    if (!file) {
         return -EBADF;
     }
 
-    socket_handle_t *handle =
-        sockfs_file_handle(current_task->fd_info->fds[fd]);
-    struct netlink_sock *nl_sk = handle->sock;
-
     if (nl_sk->protocol == NETLINK_KOBJECT_UEVENT) {
+        vfs_file_put(file);
         return count;
     }
 
+    vfs_file_put(file);
     return -EDESTADDRREQ;
 }
 

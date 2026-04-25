@@ -701,22 +701,11 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
         if (fd >= MAX_FD_NUM)
             return (uint64_t)-EBADF;
 
-        int map_fd_err = 0;
-        with_fd_info_lock(current_task->fd_info, {
-            fd_t *entry = current_task->fd_info->fds[fd];
-            if (!entry || !entry->node) {
-                map_fd_err = -EBADF;
-                break;
-            }
-
-            map_fd_ref = vfs_file_get(entry);
-            if (!map_fd_ref) {
-                map_fd_err = -ENOMEM;
-                break;
-            }
-        });
-        if (map_fd_err < 0)
-            return (uint64_t)map_fd_err;
+        map_fd_ref = task_get_file(current_task, fd);
+        if (!map_fd_ref || !map_fd_ref->node) {
+            vfs_file_put(map_fd_ref);
+            return (uint64_t)-EBADF;
+        }
 
         map_node = map_fd_ref->node;
         if (map_node->type & file_dir)

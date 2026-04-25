@@ -79,23 +79,29 @@ void signal_notify_signalfd(task_t *task, int sig, const siginfo_t *info) {
         return;
     }
 
-    bool irq_state = arch_interrupt_enabled();
-
-    arch_disable_interrupt();
-
     for (int i = 0; i < MAX_FD_NUM; i++) {
-        fd_t *fd = task->fd_info->fds[i];
+        fd_t *fd = task_get_file(task, i);
         if (!fd || !signalfd_is_file(fd)) {
+            vfs_file_put(fd);
             continue;
         }
 
+        bool irq_state = arch_interrupt_enabled();
+        arch_disable_interrupt();
+
         struct signalfd_ctx *ctx = signalfd_file_handle(fd);
         if (!ctx || !ctx->queue || ctx->queue_size == 0) {
+            if (irq_state)
+                arch_enable_interrupt();
+            vfs_file_put(fd);
             continue;
         }
 
         sigset_t signalfd_mask = sigset_user_to_kernel(ctx->sigmask);
         if (signal_sig_maskable(sig) && !(signalfd_mask & signal_sigbit(sig))) {
+            if (irq_state)
+                arch_enable_interrupt();
+            vfs_file_put(fd);
             continue;
         }
 
@@ -110,10 +116,11 @@ void signal_notify_signalfd(task_t *task, int sig, const siginfo_t *info) {
         if (ctx->node) {
             vfs_poll_notify(ctx->node, EPOLLIN);
         }
-    }
 
-    if (irq_state)
-        arch_enable_interrupt();
+        if (irq_state)
+            arch_enable_interrupt();
+        vfs_file_put(fd);
+    }
 }
 
 int on_send_signal(task_t *task, int sig, const siginfo_t *info) {

@@ -1469,11 +1469,22 @@ static lwip_socket_state_t *lwip_socket_state_from_file(fd_t *file) {
     return handle ? (lwip_socket_state_t *)handle->sock : NULL;
 }
 
-static lwip_socket_state_t *lwip_socket_from_fd(uint64_t fd) {
-    if (fd >= MAX_FD_NUM || !current_task->fd_info->fds[fd]) {
+static fd_t *lwip_socket_file_from_fd(uint64_t fd,
+                                      lwip_socket_state_t **sock_out) {
+    fd_t *file = task_get_file(current_task, (int)fd);
+    if (!file) {
         return NULL;
     }
-    return lwip_socket_state_from_file(current_task->fd_info->fds[fd]);
+
+    lwip_socket_state_t *sock = lwip_socket_state_from_file(file);
+    if (!sock) {
+        vfs_file_put(file);
+        return NULL;
+    }
+
+    if (sock_out)
+        *sock_out = sock;
+    return file;
 }
 
 static int lwip_socket_socket(int domain, int type, int protocol) {
@@ -1504,30 +1515,36 @@ static int lwip_socket_socketpair(int family, int type, int protocol, int *sv) {
 
 static int lwip_socket_bind(uint64_t fd, const struct sockaddr_un *addr,
                             socklen_t addrlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     ip_addr_t ipaddr;
     u16_t port = 0;
     int ret = 0;
 
-    if (!sock) {
+    if (!file) {
         return -EBADF;
     }
 
     ret = lwip_sockaddr_to_ip(addr, addrlen, sock->domain, &ipaddr, &port);
     if (ret < 0) {
+        vfs_file_put(file);
         return ret;
     }
 
-    return lwip_errno_from_err(netconn_bind(sock->conn, &ipaddr, port));
+    ret = lwip_errno_from_err(netconn_bind(sock->conn, &ipaddr, port));
+    vfs_file_put(file);
+    return ret;
 }
 
 static int lwip_socket_listen(uint64_t fd, int backlog) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
 
-    if (!sock) {
+    if (!file) {
         return -EBADF;
     }
     if (!lwip_socket_is_tcp(sock)) {
+        vfs_file_put(file);
         return -EOPNOTSUPP;
     }
 
@@ -1537,31 +1554,34 @@ static int lwip_socket_listen(uint64_t fd, int backlog) {
 
     if (netconn_listen_with_backlog(sock->conn, (u8_t)MIN(backlog, 255)) !=
         ERR_OK) {
+        vfs_file_put(file);
         return -EIO;
     }
     sock->listening = true;
+    vfs_file_put(file);
     return 0;
 }
 
 static int lwip_socket_accept(uint64_t fd, struct sockaddr_un *addr,
                               socklen_t *addrlen, uint64_t flags) {
-    lwip_socket_state_t *listener = lwip_socket_from_fd(fd);
-    fd_t *listener_fd =
-        (fd < MAX_FD_NUM) ? current_task->fd_info->fds[fd] : NULL;
+    lwip_socket_state_t *listener = NULL;
+    fd_t *listener_fd = lwip_socket_file_from_fd(fd, &listener);
     struct netconn *accepted = NULL;
     lwip_socket_state_t *sock = NULL;
     int newfd = 0;
 
-    if (!listener) {
+    if (!listener_fd) {
         return -EBADF;
     }
 
     if (flags & ~(O_CLOEXEC | O_NONBLOCK)) {
+        vfs_file_put(listener_fd);
         return -EINVAL;
     }
 
     err_t accept_err = netconn_accept(listener->conn, &accepted);
     if (accept_err != ERR_OK) {
+        vfs_file_put(listener_fd);
         return lwip_errno_from_err(accept_err);
     }
 
@@ -1569,6 +1589,7 @@ static int lwip_socket_accept(uint64_t fd, struct sockaddr_un *addr,
                              listener->protocol);
     if (!sock) {
         netconn_delete(accepted);
+        vfs_file_put(listener_fd);
         return -ENOMEM;
     }
 
@@ -1581,6 +1602,7 @@ static int lwip_socket_accept(uint64_t fd, struct sockaddr_un *addr,
     newfd = lwip_socket_install_fd(
         sock, listener_fd ? (int)fd_get_flags(listener_fd) : O_RDWR, flags);
     if (newfd < 0) {
+        vfs_file_put(listener_fd);
         return newfd;
     }
 
@@ -1597,23 +1619,26 @@ static int lwip_socket_accept(uint64_t fd, struct sockaddr_un *addr,
         }
     }
 
+    vfs_file_put(listener_fd);
     return newfd;
 }
 
 static int lwip_socket_connect(uint64_t fd, const struct sockaddr_un *addr,
                                socklen_t addrlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     ip_addr_t ipaddr;
     u16_t port = 0;
     int ret = 0;
     enum tcp_state state = CLOSED;
 
-    if (!sock) {
+    if (!file) {
         return -EBADF;
     }
 
     ret = lwip_sockaddr_to_ip(addr, addrlen, sock->domain, &ipaddr, &port);
     if (ret < 0) {
+        vfs_file_put(file);
         return ret;
     }
 
@@ -1626,24 +1651,28 @@ static int lwip_socket_connect(uint64_t fd, const struct sockaddr_un *addr,
 
         if (state != CLOSED) {
             if (state == SYN_SENT || state == SYN_RCVD) {
+                vfs_file_put(file);
                 return -EALREADY;
             }
+            vfs_file_put(file);
             return -EISCONN;
         }
     }
 
-    return lwip_errno_from_err(netconn_connect(sock->conn, &ipaddr, port));
+    ret = lwip_errno_from_err(netconn_connect(sock->conn, &ipaddr, port));
+    vfs_file_put(file);
+    return ret;
 }
 
 static size_t lwip_socket_sendto(uint64_t fd, uint8_t *in, size_t limit,
                                  int flags, struct sockaddr_un *addr,
                                  uint32_t len) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    fd_t *file = (fd < MAX_FD_NUM) ? current_task->fd_info->fds[fd] : NULL;
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     struct iovec iov = {.iov_base = in, .len = limit};
     struct msghdr msg = {0};
 
-    if (!sock) {
+    if (!file) {
         return (size_t)-EBADF;
     }
 
@@ -1652,20 +1681,22 @@ static size_t lwip_socket_sendto(uint64_t fd, uint8_t *in, size_t limit,
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
-    return (size_t)lwip_socket_sendmsg_common(sock, file, &msg, flags);
+    size_t ret = (size_t)lwip_socket_sendmsg_common(sock, file, &msg, flags);
+    vfs_file_put(file);
+    return ret;
 }
 
 static size_t lwip_socket_recvfrom(uint64_t fd, uint8_t *out, size_t limit,
                                    int flags, struct sockaddr_un *addr,
                                    uint32_t *len) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    fd_t *file = (fd < MAX_FD_NUM) ? current_task->fd_info->fds[fd] : NULL;
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     struct iovec iov = {.iov_base = out, .len = limit};
     struct msghdr msg = {0};
     socklen_t namelen = len ? *len : 0;
     ssize_t ret = 0;
 
-    if (!sock) {
+    if (!file) {
         return (size_t)-EBADF;
     }
 
@@ -1678,83 +1709,101 @@ static size_t lwip_socket_recvfrom(uint64_t fd, uint8_t *out, size_t limit,
     if (ret >= 0 && len) {
         *len = (uint32_t)msg.msg_namelen;
     }
+    vfs_file_put(file);
     return (size_t)ret;
 }
 
 static size_t lwip_socket_sendmsg(uint64_t fd, const struct msghdr *msg,
                                   int flags) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    fd_t *file = (fd < MAX_FD_NUM) ? current_task->fd_info->fds[fd] : NULL;
-    if (!sock) {
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
+    if (!file) {
         return (size_t)-EBADF;
     }
-    return (size_t)lwip_socket_sendmsg_common(sock, file, msg, flags);
+    size_t ret = (size_t)lwip_socket_sendmsg_common(sock, file, msg, flags);
+    vfs_file_put(file);
+    return ret;
 }
 
 static size_t lwip_socket_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    fd_t *file = (fd < MAX_FD_NUM) ? current_task->fd_info->fds[fd] : NULL;
-    if (!sock) {
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
+    if (!file) {
         return (size_t)-EBADF;
     }
-    return (size_t)lwip_socket_recvmsg_common(sock, file, msg, flags);
+    size_t ret = (size_t)lwip_socket_recvmsg_common(sock, file, msg, flags);
+    vfs_file_put(file);
+    return ret;
 }
 
 static int lwip_socket_getsockname(uint64_t fd, struct sockaddr_un *addr,
                                    socklen_t *addrlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     ip_addr_t ipaddr;
     u16_t port = 0;
 
-    if (!sock) {
+    if (!file) {
         return -EBADF;
     }
     if (!addrlen) {
+        vfs_file_put(file);
         return -EFAULT;
     }
 
     if (netconn_addr(sock->conn, &ipaddr, &port) != ERR_OK) {
+        vfs_file_put(file);
         return -ENOTCONN;
     }
 
-    return lwip_ip_to_sockaddr(&ipaddr, port, addr, addrlen, sock->domain);
+    int ret = lwip_ip_to_sockaddr(&ipaddr, port, addr, addrlen, sock->domain);
+    vfs_file_put(file);
+    return ret;
 }
 
 static size_t lwip_socket_getpeername(uint64_t fd, struct sockaddr_un *addr,
                                       socklen_t *addrlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     ip_addr_t ipaddr;
     u16_t port = 0;
 
-    if (!sock) {
+    if (!file) {
         return (size_t)-EBADF;
     }
     if (!addrlen) {
+        vfs_file_put(file);
         return (size_t)-EFAULT;
     }
 
     if (netconn_peer(sock->conn, &ipaddr, &port) != ERR_OK) {
+        vfs_file_put(file);
         return (size_t)-ENOTCONN;
     }
 
-    return (size_t)lwip_ip_to_sockaddr(&ipaddr, port, addr, addrlen,
-                                       sock->domain);
+    size_t ret =
+        (size_t)lwip_ip_to_sockaddr(&ipaddr, port, addr, addrlen, sock->domain);
+    vfs_file_put(file);
+    return ret;
 }
 
 static uint64_t lwip_socket_shutdown(uint64_t fd, uint64_t how) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
     u8_t shut_rx = 0;
     u8_t shut_tx = 0;
     uint32_t notify_events = 0;
     err_t err = ERR_OK;
 
-    if (!sock) {
+    if (!file) {
         return -EBADF;
     }
     if (!lwip_socket_is_tcp(sock)) {
+        vfs_file_put(file);
         return -EOPNOTSUPP;
     }
     if (how > SHUT_RDWR) {
+        vfs_file_put(file);
         return -EINVAL;
     }
 
@@ -1762,6 +1811,7 @@ static uint64_t lwip_socket_shutdown(uint64_t fd, uint64_t how) {
     shut_tx = (how == SHUT_WR || how == SHUT_RDWR) ? 1 : 0;
     err = netconn_shutdown(sock->conn, shut_rx, shut_tx);
     if (err != ERR_OK) {
+        vfs_file_put(file);
         return lwip_errno_from_err(err);
     }
 
@@ -1773,27 +1823,34 @@ static uint64_t lwip_socket_shutdown(uint64_t fd, uint64_t how) {
         notify_events |= EPOLLOUT;
     }
     lwip_socket_notify(sock, notify_events);
+    vfs_file_put(file);
     return 0;
 }
 
 static size_t lwip_socket_setsockopt(uint64_t fd, int level, int optname,
                                      const void *optval, socklen_t optlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    if (!sock) {
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
+    if (!file) {
         return (size_t)-EBADF;
     }
-    return (size_t)lwip_socket_setsockopt_impl(sock, level, optname, optval,
-                                               optlen);
+    size_t ret = (size_t)lwip_socket_setsockopt_impl(sock, level, optname,
+                                                     optval, optlen);
+    vfs_file_put(file);
+    return ret;
 }
 
 static size_t lwip_socket_getsockopt(uint64_t fd, int level, int optname,
                                      void *optval, socklen_t *optlen) {
-    lwip_socket_state_t *sock = lwip_socket_from_fd(fd);
-    if (!sock) {
+    lwip_socket_state_t *sock = NULL;
+    fd_t *file = lwip_socket_file_from_fd(fd, &sock);
+    if (!file) {
         return (size_t)-EBADF;
     }
-    return (size_t)lwip_socket_getsockopt_impl(sock, level, optname, optval,
-                                               optlen);
+    size_t ret = (size_t)lwip_socket_getsockopt_impl(sock, level, optname,
+                                                     optval, optlen);
+    vfs_file_put(file);
+    return ret;
 }
 
 static int lwip_socket_poll(vfs_node_t *node, size_t events) {

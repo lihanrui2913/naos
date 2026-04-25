@@ -861,27 +861,28 @@ static int procfs_iterate_shared(struct vfs_file *file,
     case PROCFS_INO_FDINFO_DIR:
         task = procfs_info_task(info);
         if (task && task->fd_info) {
-            with_fd_info_lock(task->fd_info, {
-                for (int fd_num = 0; fd_num < MAX_FD_NUM; ++fd_num) {
-                    char name[16];
+            for (int fd_num = 0; fd_num < MAX_FD_NUM; ++fd_num) {
+                char name[16];
 
-                    if (!task->fd_info->fds[fd_num])
-                        continue;
-                    snprintf(name, sizeof(name), "%d", fd_num);
-                    if (procfs_emit_entry(
-                            ctx, &index, name,
-                            info->kind == PROCFS_INO_FD_DIR ? DT_LNK : DT_REG,
-                            procfs_ino_for(info->kind == PROCFS_INO_FD_DIR
-                                               ? PROCFS_INO_SYMLINK
-                                               : PROCFS_INO_FILE,
-                                           task, fd_num,
-                                           info->kind == PROCFS_INO_FD_DIR
-                                               ? "proc_fd"
-                                               : "proc_fdinfo")) != 0) {
-                        break;
-                    }
+                fd_t *fd_file = task_get_file(task, fd_num);
+                if (!fd_file)
+                    continue;
+                snprintf(name, sizeof(name), "%d", fd_num);
+                if (procfs_emit_entry(
+                        ctx, &index, name,
+                        info->kind == PROCFS_INO_FD_DIR ? DT_LNK : DT_REG,
+                        procfs_ino_for(info->kind == PROCFS_INO_FD_DIR
+                                           ? PROCFS_INO_SYMLINK
+                                           : PROCFS_INO_FILE,
+                                       task, fd_num,
+                                       info->kind == PROCFS_INO_FD_DIR
+                                           ? "proc_fd"
+                                           : "proc_fdinfo")) != 0) {
+                    vfs_file_put(fd_file);
+                    break;
                 }
-            });
+                vfs_file_put(fd_file);
+            }
         }
         break;
     default:
@@ -1104,11 +1105,9 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         task = procfs_info_task(info);
         if (procfs_parse_decimal(dentry->d_name.name, &fd_num) == 0 && task &&
             task->fd_info) {
-            bool exists = false;
-            with_fd_info_lock(task->fd_info, {
-                exists =
-                    fd_num < MAX_FD_NUM && task->fd_info->fds[fd_num] != NULL;
-            });
+            fd_t *fd_file = task_get_file(task, fd_num);
+            bool exists = fd_file != NULL;
+            vfs_file_put(fd_file);
             if (exists) {
                 inode = procfs_new_inode(
                     dir->i_sb,

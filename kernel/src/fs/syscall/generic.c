@@ -1381,31 +1381,42 @@ uint64_t sys_copy_file_range(uint64_t fd_in, int *offset_in_user,
         return (uint64_t)-EBADF;
     }
 
-    task_t *self = current_task;
-
-    fd_t *in_fd = self->fd_info->fds[fd_in];
-    fd_t *out_fd = self->fd_info->fds[fd_out];
+    fd_t *in_fd = task_get_file(current_task, (int)fd_in);
+    fd_t *out_fd = task_get_file(current_task, (int)fd_out);
     if (!in_fd || !out_fd) {
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return (uint64_t)-EBADF;
     }
 
-    if (flags)
+    if (flags) {
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return (uint64_t)-EINVAL;
+    }
 
     if (fd_get_offset(out_fd) >= (uint64_t)out_fd->f_inode->i_size &&
         out_fd->f_inode->i_size > 0) {
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return 0;
     }
 
     int offset_in = 0;
     int offset_out = 0;
     if (offset_in_user) {
-        if (copy_from_user(&offset_in, offset_in_user, sizeof(int)))
+        if (copy_from_user(&offset_in, offset_in_user, sizeof(int))) {
+            vfs_file_put(in_fd);
+            vfs_file_put(out_fd);
             return (uint64_t)-EFAULT;
+        }
     }
     if (offset_out_user) {
-        if (copy_from_user(&offset_out, offset_out_user, sizeof(int)))
+        if (copy_from_user(&offset_out, offset_out_user, sizeof(int))) {
+            vfs_file_put(in_fd);
+            vfs_file_put(out_fd);
             return (uint64_t)-EFAULT;
+        }
     }
 
     uint64_t src_offset =
@@ -1415,8 +1426,11 @@ uint64_t sys_copy_file_range(uint64_t fd_in, int *offset_in_user,
     if (fd_get_flags(out_fd) & O_APPEND)
         dst_offset = out_fd->f_inode->i_size;
 
-    if (src_offset >= in_fd->f_inode->i_size)
+    if (src_offset >= in_fd->f_inode->i_size) {
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return 0;
+    }
 
     uint64_t length = MIN(len, in_fd->f_inode->i_size - src_offset);
     uint8_t *buffer = (uint8_t *)alloc_frames_bytes(length);
@@ -1428,12 +1442,16 @@ uint64_t sys_copy_file_range(uint64_t fd_in, int *offset_in_user,
     ssize_t ret = vfs_read_file(in_fd, buffer, length, &src_pos);
     if (ret < 0) {
         free_frames_bytes(buffer, length);
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return (uint64_t)ret;
     }
 
     ret = vfs_write_file(out_fd, buffer, (size_t)ret, &dst_pos);
     if (ret < 0) {
         free_frames_bytes(buffer, length);
+        vfs_file_put(in_fd);
+        vfs_file_put(out_fd);
         return (uint64_t)ret;
     }
     copy_total = (size_t)ret;
@@ -1443,6 +1461,8 @@ uint64_t sys_copy_file_range(uint64_t fd_in, int *offset_in_user,
     if (!offset_out_user && copy_total > 0)
         fd_add_offset(out_fd, (int64_t)copy_total);
 
+    vfs_file_put(in_fd);
+    vfs_file_put(out_fd);
     return copy_total;
 }
 
@@ -1544,13 +1564,14 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
     if (out_fd >= MAX_FD_NUM || in_fd >= MAX_FD_NUM)
         return -EBADF;
 
-    task_t *self = current_task;
-
-    fd_t *out_handle = self->fd_info->fds[out_fd];
-    fd_t *in_handle = self->fd_info->fds[in_fd];
+    fd_t *out_handle = task_get_file(current_task, (int)out_fd);
+    fd_t *in_handle = task_get_file(current_task, (int)in_fd);
     loff_t read_pos = 0;
-    if (out_handle == NULL || in_handle == NULL)
+    if (out_handle == NULL || in_handle == NULL) {
+        vfs_file_put(out_handle);
+        vfs_file_put(in_handle);
         return -EBADF;
+    }
 
     uint64_t current_offset = fd_get_offset(in_handle);
     size_t total_sent = 0;
@@ -1561,12 +1582,18 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
 
         if (check_user_overflow((uint64_t)offset_ptr, sizeof(user_offset)) ||
             check_unmapped((uint64_t)offset_ptr, sizeof(user_offset))) {
+            vfs_file_put(out_handle);
+            vfs_file_put(in_handle);
             return -EFAULT;
         }
         if (copy_from_user(&user_offset, offset_ptr, sizeof(user_offset))) {
+            vfs_file_put(out_handle);
+            vfs_file_put(in_handle);
             return -EFAULT;
         }
         if (user_offset < 0) {
+            vfs_file_put(out_handle);
+            vfs_file_put(in_handle);
             return -EINVAL;
         }
 
@@ -1575,6 +1602,8 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
 
     char *buffer = (char *)alloc_frames_bytes(PAGE_SIZE);
     if (buffer == NULL) {
+        vfs_file_put(out_handle);
+        vfs_file_put(in_handle);
         return -ENOMEM;
     }
 
@@ -1587,6 +1616,8 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
         if (bytes_read <= 0) {
             if (bytes_read < 0 && total_sent == 0) {
                 free_frames_bytes(buffer, PAGE_SIZE);
+                vfs_file_put(out_handle);
+                vfs_file_put(in_handle);
                 return (uint64_t)bytes_read;
             }
             break;
@@ -1595,6 +1626,8 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
         if (bytes_written <= 0) {
             if (total_sent == 0) {
                 free_frames_bytes(buffer, PAGE_SIZE);
+                vfs_file_put(out_handle);
+                vfs_file_put(in_handle);
                 return bytes_written < 0 ? (uint64_t)bytes_written : 0;
             }
             break;
@@ -1611,11 +1644,15 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
         int out_offset =
             current_offset > (uint64_t)INT_MAX ? INT_MAX : (int)current_offset;
         if (copy_to_user(offset_ptr, &out_offset, sizeof(out_offset))) {
+            vfs_file_put(out_handle);
+            vfs_file_put(in_handle);
             return -EFAULT;
         }
     } else {
         fd_set_offset(in_handle, current_offset);
     }
+    vfs_file_put(out_handle);
+    vfs_file_put(in_handle);
     return total_sent;
 }
 
@@ -1666,23 +1703,31 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     fd_t *f;
     int ret = -ENOSYS;
 
-    if (fd >= MAX_FD_NUM || self->fd_info->fds[fd] == NULL) {
+    if (fd >= MAX_FD_NUM) {
         return (uint64_t)-EBADF;
     }
 
-    f = self->fd_info->fds[fd];
+    f = task_get_file(self, (int)fd);
+    if (!f) {
+        return (uint64_t)-EBADF;
+    }
 
     if (fd_get_flags(f) & O_PATH) {
-        return (uint64_t)-EBADF;
+        ret = -EBADF;
+        goto ret;
     }
 
     switch (cmd) {
     case FIONBIO:
-        if (!arg)
-            return -EFAULT;
+        if (!arg) {
+            ret = -EFAULT;
+            goto ret;
+        }
         int value = 0;
-        if (copy_from_user(&value, (void *)arg, sizeof(value)))
-            return -EFAULT;
+        if (copy_from_user(&value, (void *)arg, sizeof(value))) {
+            ret = -EFAULT;
+            goto ret;
+        }
         uint64_t file_flags = fd_get_flags(f);
         if (value)
             file_flags |= O_NONBLOCK;
@@ -1747,6 +1792,8 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     //     free(full_path);
     // }
 
+ret:
+    vfs_file_put(f);
     return ret;
 }
 
@@ -2325,28 +2372,35 @@ uint64_t sys_dup(uint64_t fd) {
 
 uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t arg) {
     task_t *self = current_task;
-    fd_t *file;
-    if (fd >= MAX_FD_NUM || !self->fd_info->fds[fd])
+    fd_t *file = task_get_file(self, (int)fd);
+    uint64_t out = (uint64_t)-EINVAL;
+    if (fd >= MAX_FD_NUM || !file)
         return (uint64_t)-EBADF;
-    file = self->fd_info->fds[fd];
 
     switch (command) {
     case F_GETFD:
-        return (self->fd_info->fd_flags[fd] & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+        out = (self->fd_info->fd_flags[fd] & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+        break;
     case F_SETFD:
         self->fd_info->fd_flags[fd] =
             (self->fd_info->fd_flags[fd] & ~FD_CLOEXEC) |
             ((arg & FD_CLOEXEC) ? FD_CLOEXEC : 0);
-        return 0;
+        out = 0;
+        break;
     case F_DUPFD_CLOEXEC:
-        return dup_to_free_slot(self, fd, arg, true);
+        out = dup_to_free_slot(self, fd, arg, true);
+        break;
     case F_DUPFD:
-        return dup_to_free_slot(self, fd, arg, false);
+        out = dup_to_free_slot(self, fd, arg, false);
+        break;
     case F_GETFL:
-        return fd_get_flags(file);
+        out = fd_get_flags(file);
+        break;
     case F_SETFL:
-        if (fd_get_flags(file) & O_PATH)
-            return (uint64_t)-EBADF;
+        if (fd_get_flags(file) & O_PATH) {
+            out = (uint64_t)-EBADF;
+            break;
+        }
         uint64_t file_flags = fd_get_flags(file);
         uint64_t valid_flags = O_SETFL_FLAGS;
         file_flags = (file_flags & ~valid_flags) | (arg & valid_flags);
@@ -2360,86 +2414,116 @@ uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t arg) {
             if (ret == -ENOTTY || ret == -ENOSYS)
                 ret = 0;
         }
-        return ret;
+        out = ret;
+        break;
     case F_GETLK: {
         flock_t lock;
         if (check_user_overflow(arg, sizeof(lock))) {
-            return -EFAULT;
+            out = -EFAULT;
+            break;
         }
         memcpy(&lock, (void *)arg, sizeof(lock));
         int getlk_ret = file_lock_getlk(file, &lock, false);
-        if (getlk_ret < 0)
-            return getlk_ret;
-        if (copy_to_user((void *)arg, &lock, sizeof(lock)))
-            return -EFAULT;
-        return 0;
+        if (getlk_ret < 0) {
+            out = getlk_ret;
+            break;
+        }
+        if (copy_to_user((void *)arg, &lock, sizeof(lock))) {
+            out = -EFAULT;
+            break;
+        }
+        out = 0;
+        break;
     }
     case F_OFD_GETLK: {
         flock_t lock;
         if (check_user_overflow(arg, sizeof(lock))) {
-            return -EFAULT;
+            out = -EFAULT;
+            break;
         }
         memcpy(&lock, (void *)arg, sizeof(lock));
         int getlk_ret = file_lock_getlk(file, &lock, true);
-        if (getlk_ret < 0)
-            return getlk_ret;
-        if (copy_to_user((void *)arg, &lock, sizeof(lock)))
-            return -EFAULT;
-        return 0;
+        if (getlk_ret < 0) {
+            out = getlk_ret;
+            break;
+        }
+        if (copy_to_user((void *)arg, &lock, sizeof(lock))) {
+            out = -EFAULT;
+            break;
+        }
+        out = 0;
+        break;
     }
     case F_SETLKW:
     case F_SETLK: {
         flock_t lock;
         if (check_user_overflow(arg, sizeof(lock))) {
-            return -EFAULT;
+            out = -EFAULT;
+            break;
         }
         memcpy(&lock, (void *)arg, sizeof(lock));
 
         if (lock.l_type != F_RDLCK && lock.l_type != F_WRLCK &&
             lock.l_type != F_UNLCK) {
-            return -EINVAL;
+            out = -EINVAL;
+            break;
         }
 
-        return file_lock_setlk(file, &lock, command == F_SETLKW, false);
+        out = file_lock_setlk(file, &lock, command == F_SETLKW, false);
+        break;
     }
     case F_OFD_SETLKW:
     case F_OFD_SETLK: {
         flock_t lock;
         if (check_user_overflow(arg, sizeof(lock))) {
-            return -EFAULT;
+            out = -EFAULT;
+            break;
         }
         memcpy(&lock, (void *)arg, sizeof(lock));
 
         if (lock.l_type != F_RDLCK && lock.l_type != F_WRLCK &&
             lock.l_type != F_UNLCK) {
-            return -EINVAL;
+            out = -EINVAL;
+            break;
         }
 
-        return file_lock_setlk(file, &lock, command == F_OFD_SETLKW, true);
+        out = file_lock_setlk(file, &lock, command == F_OFD_SETLKW, true);
+        break;
     }
     case F_GETPIPE_SZ:
-        return 512 * 1024;
+        out = 512 * 1024;
+        break;
     case F_SETPIPE_SZ:
-        return 0;
+        out = 0;
+        break;
     case F_GET_SEALS:
     case F_ADD_SEALS:
-        return 0;
+        out = 0;
+        break;
     case F_GET_RW_HINT:
         if (!file->f_inode->rw_hint) {
-            return 0;
+            out = 0;
+            break;
         }
-        return file->f_inode->rw_hint;
+        out = file->f_inode->rw_hint;
+        break;
 
     case F_SET_RW_HINT:
         if (arg < RWH_WRITE_LIFE_NONE || arg > RWH_WRITE_LIFE_EXTREME) {
-            return -EINVAL;
+            out = -EINVAL;
+            break;
         }
         file->f_inode->rw_hint = arg;
-        return 0;
+        out = 0;
+        break;
     default:
         printk("Unsupported fcntl command %#010lx\n", command);
-        return (uint64_t)-EINVAL;
+        out = (uint64_t)-EINVAL;
+        break;
     }
+
+    vfs_file_put(file);
+    return out;
 }
 
 uint64_t do_stat_path(const char *path, struct stat *buf) {
@@ -2485,8 +2569,7 @@ uint64_t do_stat_fd(int fd, struct stat *buf) {
 }
 
 uint64_t sys_fstat(uint64_t fd, struct stat *user_buf) {
-    task_t *self = current_task;
-    if (fd >= MAX_FD_NUM || self->fd_info->fds[fd] == NULL) {
+    if (fd >= MAX_FD_NUM) {
         return (uint64_t)-EBADF;
     }
 
@@ -2916,25 +2999,27 @@ static int resolve_linkat_source_path(uint64_t olddirfd, const char *oldpath,
         return -EINVAL;
     memset(source_out, 0, sizeof(*source_out));
 
-    task_t *self = current_task;
-
     if ((flags & AT_EMPTY_PATH) && oldpath && oldpath[0] == '\0') {
-        if (olddirfd >= MAX_FD_NUM || !self->fd_info->fds[olddirfd])
+        fd_t *file = task_get_file(current_task, (int)olddirfd);
+        if (olddirfd >= MAX_FD_NUM || !file)
             return -EBADF;
-        source_out->mnt = self->fd_info->fds[olddirfd]->f_path.mnt;
-        source_out->dentry = self->fd_info->fds[olddirfd]->f_path.dentry;
+        source_out->mnt = file->f_path.mnt;
+        source_out->dentry = file->f_path.dentry;
         vfs_path_get(source_out);
+        vfs_file_put(file);
         return 1;
     }
 
     if (flags & AT_SYMLINK_FOLLOW) {
         int fd = -1;
         if (parse_proc_self_fd_path(oldpath, &fd)) {
-            if (fd < 0 || fd >= MAX_FD_NUM || !self->fd_info->fds[fd])
+            fd_t *file = task_get_file(current_task, fd);
+            if (fd < 0 || fd >= MAX_FD_NUM || !file)
                 return -ENOENT;
-            source_out->mnt = self->fd_info->fds[fd]->f_path.mnt;
-            source_out->dentry = self->fd_info->fds[fd]->f_path.dentry;
+            source_out->mnt = file->f_path.mnt;
+            source_out->dentry = file->f_path.dentry;
             vfs_path_get(source_out);
+            vfs_file_put(file);
             return 1;
         }
     }
@@ -3184,13 +3269,11 @@ uint64_t sys_ftruncate(int fd, uint64_t length) {
 }
 
 uint64_t sys_flock(int fd, uint64_t operation) {
-    task_t *self = current_task;
-    fd_t *file;
+    fd_t *file = task_get_file(current_task, fd);
 
-    if (fd < 0 || fd >= MAX_FD_NUM || !self->fd_info->fds[fd])
+    if (fd < 0 || fd >= MAX_FD_NUM || !file)
         return -EBADF;
 
-    file = self->fd_info->fds[fd];
     vfs_node_t *node = file->f_inode;
     vfs_bsd_lock_t *lock = &node->flock_lock;
     uintptr_t owner = (uintptr_t)file;
@@ -3201,6 +3284,7 @@ uint64_t sys_flock(int fd, uint64_t operation) {
     case LOCK_UN:
         break;
     default:
+        vfs_file_put(file);
         return -EINVAL;
     }
 
@@ -3220,8 +3304,10 @@ uint64_t sys_flock(int fd, uint64_t operation) {
             }
             spin_unlock(&lock->spin);
 
-            if (operation & LOCK_NB)
+            if (operation & LOCK_NB) {
+                vfs_file_put(file);
                 return -EWOULDBLOCK;
+            }
             arch_pause();
         }
         break;
@@ -3230,6 +3316,7 @@ uint64_t sys_flock(int fd, uint64_t operation) {
         spin_lock(&lock->spin);
         if (lock->owner != owner) {
             spin_unlock(&lock->spin);
+            vfs_file_put(file);
             return -EACCES;
         }
         lock->l_type = F_UNLCK;
@@ -3238,14 +3325,15 @@ uint64_t sys_flock(int fd, uint64_t operation) {
         break;
     }
 
+    vfs_file_put(file);
     return 0;
 }
 
 uint64_t sys_fadvise64(int fd, uint64_t offset, uint64_t len, int advice) {
-    task_t *self = current_task;
-
-    if (fd < 0 || fd >= MAX_FD_NUM || !self->fd_info->fds[fd])
+    fd_t *file = task_get_file(current_task, fd);
+    if (fd < 0 || fd >= MAX_FD_NUM || !file)
         return -EBADF;
+    vfs_file_put(file);
 
     (void)offset;
     (void)len;

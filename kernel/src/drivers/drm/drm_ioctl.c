@@ -539,11 +539,11 @@ static long drm_primefs_ioctl(struct vfs_file *fd, unsigned long cmd,
         }
 
         int ret = -EBADF;
-        with_fd_info_lock(current_task->fd_info, {
-            if (current_task->fd_info->fds[import_sync.fd]) {
-                ret = 0;
-            }
-        });
+        fd_t *fd_obj = task_get_file(current_task, import_sync.fd);
+        if (fd_obj) {
+            ret = 0;
+            vfs_file_put(fd_obj);
+        }
         return ret;
     }
     default:
@@ -792,16 +792,13 @@ static long drm_syncfdfs_ioctl(struct vfs_file *fd, unsigned long cmd,
         }
 
         drm_syncfd_ctx_t *other = NULL;
-        with_fd_info_lock(current_task->fd_info, {
-            fd_t *fd_obj = current_task->fd_info->fds[merge.fd2];
-            drm_syncfd_ctx_t *ctx2 = drm_syncfd_file_ctx(fd_obj);
-            if (ctx2) {
-                other = ctx2;
-                if (other) {
-                    drm_syncfd_ctx_get(other);
-                }
-            }
-        });
+        fd_t *fd_obj = task_get_file(current_task, merge.fd2);
+        drm_syncfd_ctx_t *ctx2 = drm_syncfd_file_ctx(fd_obj);
+        if (ctx2) {
+            other = ctx2;
+            drm_syncfd_ctx_get(other);
+        }
+        vfs_file_put(fd_obj);
         if (!other) {
             return -EINVAL;
         }
@@ -981,16 +978,13 @@ static drm_syncfd_ctx_t *drm_syncfd_ctx_from_fd(int fd) {
     if (fd < 0 || fd >= MAX_FD_NUM) {
         return NULL;
     }
-    with_fd_info_lock(current_task->fd_info, {
-        fd_t *fd_obj = current_task->fd_info->fds[fd];
-        drm_syncfd_ctx_t *sync_ctx = drm_syncfd_file_ctx(fd_obj);
-        if (sync_ctx) {
-            ctx = sync_ctx;
-            if (ctx) {
-                drm_syncfd_ctx_get(ctx);
-            }
-        }
-    });
+    fd_t *fd_obj = task_get_file(current_task, fd);
+    drm_syncfd_ctx_t *sync_ctx = drm_syncfd_file_ctx(fd_obj);
+    if (sync_ctx) {
+        ctx = sync_ctx;
+        drm_syncfd_ctx_get(ctx);
+    }
+    vfs_file_put(fd_obj);
     return ctx;
 }
 
@@ -1318,21 +1312,20 @@ static ssize_t drm_syncobj_fd_to_handle(drm_device_t *dev,
     }
 
     uint64_t imported_point = 1;
-    with_fd_info_lock(current_task->fd_info, {
-        fd_t *fd_obj = current_task->fd_info->fds[h->fd];
-        if (eventfd_is_file(fd_obj)) {
-            eventfd_t *efd = eventfd_file_handle(fd_obj);
-            if (efd) {
-                imported_point =
-                    __atomic_load_n(&efd->count, __ATOMIC_ACQUIRE) ? 1 : 0;
-            }
-        } else {
-            drm_syncfd_ctx_t *ctx = drm_syncfd_file_ctx(fd_obj);
-            if (ctx) {
-                imported_point = drm_syncfd_is_signaled(ctx) ? 1 : 0;
-            }
+    fd_t *fd_obj = task_get_file(current_task, h->fd);
+    if (eventfd_is_file(fd_obj)) {
+        eventfd_t *efd = eventfd_file_handle(fd_obj);
+        if (efd) {
+            imported_point =
+                __atomic_load_n(&efd->count, __ATOMIC_ACQUIRE) ? 1 : 0;
         }
-    });
+    } else {
+        drm_syncfd_ctx_t *ctx = drm_syncfd_file_ctx(fd_obj);
+        if (ctx) {
+            imported_point = drm_syncfd_is_signaled(ctx) ? 1 : 0;
+        }
+    }
+    vfs_file_put(fd_obj);
 
     struct drm_syncobj_create create = {
         .handle = 0,
@@ -1730,11 +1723,10 @@ static ssize_t drm_syncobj_eventfd_ioctl(drm_device_t *dev,
             return -EBADF;
         }
 
-        with_fd_info_lock(current_task->fd_info, {
-            fd_t *fd_obj = current_task->fd_info->fds[e->fd];
-            if (eventfd_is_file(fd_obj))
-                new_node = vfs_file_get(fd_obj);
-        });
+        fd_t *fd_obj = task_get_file(current_task, e->fd);
+        if (eventfd_is_file(fd_obj))
+            new_node = vfs_file_get(fd_obj);
+        vfs_file_put(fd_obj);
 
         if (!new_node) {
             return -EINVAL;
@@ -1771,13 +1763,12 @@ static ssize_t drm_prime_get_fd_inode(int fd, uint64_t *inode) {
     }
 
     int ret = -EBADF;
-    with_fd_info_lock(current_task->fd_info, {
-        if (current_task->fd_info->fds[fd] &&
-            current_task->fd_info->fds[fd]->node) {
-            *inode = current_task->fd_info->fds[fd]->node->inode;
-            ret = 0;
-        }
-    });
+    fd_t *fd_obj = task_get_file(current_task, fd);
+    if (fd_obj && fd_obj->node) {
+        *inode = fd_obj->node->inode;
+        ret = 0;
+    }
+    vfs_file_put(fd_obj);
 
     return ret;
 }
@@ -2362,20 +2353,13 @@ ssize_t drm_ioctl_prime_fd_to_handle(drm_device_t *dev, void *arg, fd_t *fd) {
     }
 
     int direct_ret = -EBADF;
-    with_fd_info_lock(current_task->fd_info, {
-        fd_t *fd_obj = current_task->fd_info->fds[prime->fd];
-        drm_prime_fd_ctx_t *ctx = drm_primefd_file_ctx(fd_obj);
-        if (!ctx) {
-            direct_ret = -EBADF;
-        } else {
-            if (ctx->dev != dev || ctx->handle == 0) {
-                direct_ret = -EBADF;
-            } else {
-                prime->handle = ctx->handle;
-                direct_ret = 0;
-            }
-        }
-    });
+    fd_t *fd_obj = task_get_file(current_task, prime->fd);
+    drm_prime_fd_ctx_t *ctx = drm_primefd_file_ctx(fd_obj);
+    if (ctx && ctx->dev == dev && ctx->handle != 0) {
+        prime->handle = ctx->handle;
+        direct_ret = 0;
+    }
+    vfs_file_put(fd_obj);
 
     if (direct_ret == 0) {
         if (dev->op && dev->op->driver_ioctl) {

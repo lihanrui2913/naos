@@ -3347,13 +3347,12 @@ static int virtio_gpu_wait_fence_fd_in(int fence_fd) {
     }
 
     vfs_node_t *node = NULL;
-    with_fd_info_lock(current_task->fd_info, {
-        fd_t *fd = current_task->fd_info->fds[fence_fd];
-        if (fd && fd->node) {
-            node = fd->node;
-            vfs_igrab(node);
-        }
-    });
+    fd_t *fd = task_get_file(current_task, fence_fd);
+    if (fd && fd->node) {
+        node = fd->node;
+        vfs_igrab(node);
+    }
+    vfs_file_put(fd);
 
     if (!node) {
         return -EBADF;
@@ -3434,13 +3433,12 @@ static int virtio_gpu_create_fence_fd_out(vfs_node_t **node_out) {
     }
 
     int fence_fd = (int)fd;
-    with_fd_info_lock(current_task->fd_info, {
-        fd_t *fd_obj = current_task->fd_info->fds[fence_fd];
-        if (fd_obj && fd_obj->node) {
-            *node_out = fd_obj->node;
-            vfs_igrab(*node_out);
-        }
-    });
+    fd_t *fd_obj = task_get_file(current_task, fence_fd);
+    if (fd_obj && fd_obj->node) {
+        *node_out = fd_obj->node;
+        vfs_igrab(*node_out);
+    }
+    vfs_file_put(fd_obj);
 
     if (!*node_out) {
         sys_close((uint64_t)fence_fd);

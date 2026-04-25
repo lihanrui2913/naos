@@ -44,18 +44,10 @@ struct vfs_process_fs *task_current_vfs_fs(void) {
 }
 
 struct vfs_file *task_get_file(task_t *task, int fd) {
-    struct vfs_file *file = NULL;
-
     if (!task || !task->fd_info || fd < 0 || fd >= MAX_FD_NUM)
         return NULL;
 
-    with_fd_info_lock(task->fd_info, {
-        if (task->fd_info->fds[fd]) {
-            file = vfs_file_get(task->fd_info->fds[fd]);
-        }
-    });
-
-    return file;
+    return vfs_file_get(task->fd_info->fds[fd]);
 }
 
 int task_install_file(task_t *task, struct vfs_file *file,
