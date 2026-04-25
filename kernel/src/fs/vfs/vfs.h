@@ -518,7 +518,6 @@ struct vfs_file {
     spinlock_t f_lock;
     vfs_ref_t f_ref;
     struct vfs_inode *node;
-    bool close_on_exec;
 };
 
 typedef struct vfs_inode vfs_node_t;

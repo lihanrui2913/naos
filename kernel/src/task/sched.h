@@ -4,9 +4,12 @@
 #include <libs/llist_queue.h>
 #include <task/task.h>
 
+struct sched_rq;
+
 struct sched_entity {
     task_t *task;
     list_node_t *node;
+    struct sched_rq *rq;
     bool on_rq;
 };
 

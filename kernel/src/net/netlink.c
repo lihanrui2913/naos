@@ -849,11 +849,41 @@ static void netlink_end_nested_attr(char *buf, size_t end_offset,
     rta->rta_len = (uint16_t)(end_offset - nested_start);
 }
 
+static int genl_append_ctrl_mcast_group(char *buf, size_t *offset,
+                                        size_t capacity, uint16_t index,
+                                        const char *name, uint32_t id) {
+    size_t group_start;
+    int ret;
+
+    ret = netlink_start_nested_attr(buf, offset, capacity, index, &group_start);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_NAME,
+                              name, strlen(name) + 1);
+    if (ret < 0)
+        return ret;
+
+    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_ID,
+                              &id, sizeof(id));
+    if (ret < 0)
+        return ret;
+
+    netlink_end_nested_attr(buf, *offset, group_start);
+    return 0;
+}
+
 static int genl_append_ctrl_mcast_groups(char *buf, size_t *offset,
                                          size_t capacity) {
+    static const struct {
+        const char *name;
+        uint32_t id;
+    } groups[] = {
+        {NL80211_MCGRP_CONFIG_NAME, NL80211_MCGRP_CONFIG_ID},
+        {NL80211_MCGRP_SCAN_NAME, NL80211_MCGRP_SCAN_ID},
+        {NL80211_MCGRP_MLME_NAME, NL80211_MCGRP_MLME_ID},
+    };
     size_t groups_start;
-    size_t group_start;
-    uint32_t group_id;
     int ret;
 
     ret = netlink_start_nested_attr(buf, offset, capacity,
@@ -861,41 +891,14 @@ static int genl_append_ctrl_mcast_groups(char *buf, size_t *offset,
     if (ret < 0)
         return ret;
 
-    group_id = NL80211_MCGRP_SCAN_ID;
-    ret = netlink_start_nested_attr(buf, offset, capacity, 1, &group_start);
-    if (ret < 0)
-        return ret;
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+        ret = genl_append_ctrl_mcast_group(buf, offset, capacity,
+                                           (uint16_t)(i + 1), groups[i].name,
+                                           groups[i].id);
+        if (ret < 0)
+            return ret;
+    }
 
-    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_NAME,
-                              NL80211_MCGRP_SCAN_NAME,
-                              strlen(NL80211_MCGRP_SCAN_NAME) + 1);
-    if (ret < 0)
-        return ret;
-
-    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_ID,
-                              &group_id, sizeof(group_id));
-    if (ret < 0)
-        return ret;
-
-    netlink_end_nested_attr(buf, *offset, group_start);
-
-    group_id = NL80211_MCGRP_MLME_ID;
-    ret = netlink_start_nested_attr(buf, offset, capacity, 2, &group_start);
-    if (ret < 0)
-        return ret;
-
-    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_NAME,
-                              NL80211_MCGRP_MLME_NAME,
-                              strlen(NL80211_MCGRP_MLME_NAME) + 1);
-    if (ret < 0)
-        return ret;
-
-    ret = netlink_append_attr(buf, offset, capacity, CTRL_ATTR_MCAST_GRP_ID,
-                              &group_id, sizeof(group_id));
-    if (ret < 0)
-        return ret;
-
-    netlink_end_nested_attr(buf, *offset, group_start);
     netlink_end_nested_attr(buf, *offset, groups_start);
     return 0;
 }
@@ -2647,6 +2650,92 @@ size_t netlink_buffer_write_packet(struct netlink_sock *sock, const char *data,
     return len;
 }
 
+static size_t netlink_defer_to_socket(struct netlink_sock *target,
+                                      const char *data, size_t len,
+                                      uint32_t sender_pid,
+                                      uint32_t sender_groups) {
+    skb_buff_t *skb;
+
+    if (!target || !data || len == 0 || len > NETLINK_BUFFER_MAX_SIZE)
+        return 0;
+
+    if (target->filter) {
+        uint32_t accept_bytes =
+            bpf_run(target->filter->filter, target->filter->len,
+                    (const uint8_t *)data, (uint32_t)len);
+        if (!accept_bytes)
+            return 0;
+        len = MIN(len, accept_bytes);
+    }
+
+    skb = netlink_packet_build_skb(data, len, sender_pid, sender_groups);
+    if (!skb)
+        return 0;
+
+    spin_lock(&target->lock);
+    while (skb_queue_space(&target->deferred_queue) < len &&
+           skb_queue_packets(&target->deferred_queue) > 0)
+        skb_queue_drop_head(&target->deferred_queue);
+    if (!skb_queue_push(&target->deferred_queue, skb)) {
+        spin_unlock(&target->lock);
+        skb_free(skb, netlink_packet_meta_destroy);
+        return 0;
+    }
+    spin_unlock(&target->lock);
+
+    netlink_notify_sock(target, EPOLLIN);
+    return len;
+}
+
+static bool netlink_has_deferred_msg(struct netlink_sock *sock) {
+    bool has_msg;
+
+    if (!sock)
+        return false;
+
+    spin_lock(&sock->lock);
+    has_msg = skb_queue_packets(&sock->deferred_queue) > 0;
+    spin_unlock(&sock->lock);
+    return has_msg;
+}
+
+static void netlink_promote_deferred_if_idle(struct netlink_sock *sock) {
+    struct netlink_buffer *buf;
+    bool has_queued;
+
+    if (!sock || !sock->buffer)
+        return;
+
+    buf = sock->buffer;
+    spin_lock(&buf->lock);
+    has_queued = skb_queue_packets(&buf->queue) > 0;
+    spin_unlock(&buf->lock);
+    if (has_queued)
+        return;
+
+    for (;;) {
+        skb_buff_t *skb;
+        size_t len;
+
+        spin_lock(&sock->lock);
+        skb = skb_queue_pop(&sock->deferred_queue);
+        spin_unlock(&sock->lock);
+        if (!skb)
+            return;
+
+        len = skb_unread_len(skb);
+        spin_lock(&buf->lock);
+        if (!netlink_buffer_make_room_locked(buf, len) ||
+            !skb_queue_push(&buf->queue, skb)) {
+            spin_unlock(&buf->lock);
+            skb_free(skb, netlink_packet_meta_destroy);
+            return;
+        }
+        buf->used_bytes = skb_queue_bytes(&buf->queue);
+        spin_unlock(&buf->lock);
+    }
+}
+
 // Read data from buffer with sender info
 static size_t netlink_buffer_read_packet(struct netlink_sock *sock, char *out,
                                          size_t out_len, uint32_t *nl_pid,
@@ -2707,7 +2796,7 @@ static bool netlink_buffer_has_msg(struct netlink_sock *sock) {
     spin_lock(&buf->lock);
     has_complete_msg = skb_queue_packets(&buf->queue) > 0;
     spin_unlock(&buf->lock);
-    return has_complete_msg;
+    return has_complete_msg || netlink_has_deferred_msg(sock);
 }
 
 // Get the length of next message without consuming it
@@ -3143,6 +3232,7 @@ size_t netlink_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
     if (wait_ret < 0)
         NETLINK_RECVMSG_RETURN((size_t)wait_ret);
 
+    netlink_promote_deferred_if_idle(nl_sk);
     packet_len = netlink_buffer_peek_msg_len(nl_sk);
     if (packet_len == 0)
         NETLINK_RECVMSG_RETURN(-EAGAIN);
@@ -3363,6 +3453,7 @@ size_t netlink_recvfrom(uint64_t fd, uint8_t *out, size_t limit, int flags,
     if (wait_ret < 0)
         NETLINK_RECVFROM_RETURN((size_t)wait_ret);
 
+    netlink_promote_deferred_if_idle(nl_sk);
     msg_len = netlink_buffer_peek_msg_len(nl_sk);
     if (msg_len == 0)
         NETLINK_RECVFROM_RETURN(-EAGAIN);
@@ -3435,6 +3526,8 @@ int netlink_socket(int domain, int type, int protocol) {
     nl_sk->node = NULL;
     nl_sk->bind_addr = NULL;
     nl_sk->lock = SPIN_INIT;
+    skb_queue_init(&nl_sk->deferred_queue, NETLINK_BUFFER_MAX_SIZE,
+                   netlink_packet_meta_destroy);
 
     // Initialize buffer structure
     nl_sk->buffer = malloc(sizeof(struct netlink_buffer));
@@ -3575,6 +3668,7 @@ static ssize_t netlink_read_op(fd_t *fd, void *buf, size_t offset,
     if (wait_ret < 0)
         return wait_ret;
 
+    netlink_promote_deferred_if_idle(nl_sk);
     uint32_t sender_pid = 0;
     uint32_t sender_groups = 0;
     size_t bytes = netlink_buffer_read_packet(
@@ -3639,6 +3733,7 @@ static void netlink_handle_release(socket_handle_t *handle) {
         if (nl_sk->bind_addr != NULL) {
             free(nl_sk->bind_addr);
         }
+        skb_queue_purge(&nl_sk->deferred_queue);
         free(nl_sk);
     }
 
@@ -3759,9 +3854,13 @@ void netlink_publish_scan_event(netdev_t *dev, bool aborted) {
     sock = netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC,
                                                 scan.request_portid);
     if (sock) {
+        bool subscribed;
+
         spin_lock(&sock->lock);
-        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        subscribed = netlink_group_mask_matches(sock->groups, groups);
         spin_unlock(&sock->lock);
+        if (!subscribed)
+            netlink_defer_to_socket(sock, buffer, offset, 0, groups);
     }
     spin_unlock(&netlink_sockets_lock);
 }
@@ -3795,9 +3894,13 @@ void netlink_publish_connect_result(netdev_t *dev, uint32_t request_portid,
     sock =
         netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC, request_portid);
     if (sock) {
+        bool subscribed;
+
         spin_lock(&sock->lock);
-        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        subscribed = netlink_group_mask_matches(sock->groups, groups);
         spin_unlock(&sock->lock);
+        if (!subscribed)
+            netlink_defer_to_socket(sock, buffer, offset, 0, groups);
     }
     spin_unlock(&netlink_sockets_lock);
 }
@@ -3832,9 +3935,13 @@ void netlink_publish_disconnect_event(struct netdev *dev,
     sock =
         netlink_lookup_sock_by_portid_locked(NETLINK_GENERIC, request_portid);
     if (sock) {
+        bool subscribed;
+
         spin_lock(&sock->lock);
-        netlink_deliver_to_socket(sock, buffer, offset, 0, 0);
+        subscribed = netlink_group_mask_matches(sock->groups, groups);
         spin_unlock(&sock->lock);
+        if (!subscribed)
+            netlink_defer_to_socket(sock, buffer, offset, 0, groups);
     }
     spin_unlock(&netlink_sockets_lock);
 }

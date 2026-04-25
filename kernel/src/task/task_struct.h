@@ -112,9 +112,13 @@ typedef struct kernel_timer {
 #define MAX_FD_NUM 512
 #define MAX_SHM_NUM 32
 
+typedef struct fd_entry {
+    struct vfs_file *file;
+    unsigned int flags;
+} fd_entry_t;
+
 typedef struct fd_info {
-    struct vfs_file *fds[MAX_FD_NUM];
-    unsigned int fd_flags[MAX_FD_NUM];
+    fd_entry_t fds[MAX_FD_NUM];
     mutex_t fdt_lock;
     int ref_count;
 } fd_info_t;

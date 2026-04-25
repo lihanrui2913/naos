@@ -51,13 +51,14 @@ static int poll_scan_ready(struct pollfd *fds, int nfds) {
         fds[i].revents = 0;
         if (fds[i].fd < 0)
             continue;
-        if (fds[i].fd >= MAX_FD_NUM || !current_task->fd_info->fds[fds[i].fd]) {
+        if (fds[i].fd >= MAX_FD_NUM ||
+            !current_task->fd_info->fds[fds[i].fd].file) {
             fds[i].revents |= POLLNVAL;
             ready++;
             continue;
         }
 
-        struct vfs_file *file = current_task->fd_info->fds[fds[i].fd];
+        struct vfs_file *file = current_task->fd_info->fds[fds[i].fd].file;
         uint32_t query_events = poll_to_epoll_comp(fds[i].events) | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
         int polled = EPOLLNVAL;
@@ -81,9 +82,10 @@ static void poll_arm_waiters(struct pollfd *fds, int nfds,
     for (int i = 0; i < nfds; i++) {
         if (fds[i].fd < 0)
             continue;
-        if (fds[i].fd >= MAX_FD_NUM || !current_task->fd_info->fds[fds[i].fd])
+        if (fds[i].fd >= MAX_FD_NUM ||
+            !current_task->fd_info->fds[fds[i].fd].file)
             continue;
-        vfs_node_t *node = current_task->fd_info->fds[fds[i].fd]->node;
+        vfs_node_t *node = current_task->fd_info->fds[fds[i].fd].file->node;
         uint32_t query_events = poll_to_epoll_comp(fds[i].events) | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
         vfs_poll_wait_init(&waits[i], current_task, query_events);

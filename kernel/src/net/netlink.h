@@ -240,6 +240,8 @@ struct fib_rule_hdr {
 #define NL80211_MCGRP_SCAN_ID 1
 #define NL80211_MCGRP_MLME_NAME "mlme"
 #define NL80211_MCGRP_MLME_ID 2
+#define NL80211_MCGRP_CONFIG_NAME "config"
+#define NL80211_MCGRP_CONFIG_ID 3
 
 #define NL80211_CMD_UNSPEC 0
 #define NL80211_CMD_GET_WIPHY 1
@@ -397,6 +399,7 @@ struct netlink_sock {
     struct sockaddr_nl *bind_addr;
     struct netlink_buffer *buffer; // skb-backed receive queue
     struct sock_fprog *filter;
+    skb_queue_t deferred_queue;
     spinlock_t lock;
 };
 

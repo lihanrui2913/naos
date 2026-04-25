@@ -49,13 +49,22 @@ int signalfd_is_file(struct vfs_file *file) {
     return file->f_inode->i_sb->s_type == &signalfdfs_fs_type;
 }
 
-static inline void signalfd_apply_flags(fd_t *fd, int flags) {
+static inline void signalfd_apply_flags(int fd_num, fd_t *fd, int flags) {
     uint64_t file_flags = fd_get_flags(fd);
     file_flags &= ~O_NONBLOCK;
     if (flags & O_NONBLOCK)
         file_flags |= O_NONBLOCK;
     fd_set_flags(fd, file_flags);
-    fd->close_on_exec = !!(flags & O_CLOEXEC);
+
+    with_fd_info_lock(current_task->fd_info, {
+        if (fd_num >= 0 && fd_num < MAX_FD_NUM &&
+            current_task->fd_info->fds[fd_num].file) {
+            if (flags & O_CLOEXEC)
+                current_task->fd_info->fds[fd_num].flags |= FD_CLOEXEC;
+            else
+                current_task->fd_info->fds[fd_num].flags &= ~FD_CLOEXEC;
+        }
+    });
 }
 
 static struct vfs_inode *signalfdfs_alloc_inode(struct vfs_super_block *sb) {
@@ -418,7 +427,7 @@ uint64_t sys_signalfd4(int ufd, const sigset_t *mask, size_t sizemask,
             return (uint64_t)-EINVAL;
         }
         ctx->sigmask = sigmask;
-        signalfd_apply_flags(fd, flags);
+        signalfd_apply_flags(ufd, fd, flags);
         vfs_file_put(fd);
         return (uint64_t)ufd;
     }

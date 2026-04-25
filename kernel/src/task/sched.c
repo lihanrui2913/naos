@@ -14,6 +14,9 @@ static inline void sched_node_reset(list_node_t *node) {
 
 static inline void sched_queue_enqueue_locked(list_queue_t *queue,
                                               list_node_t *node) {
+    if (!queue || !node)
+        return;
+
     node->next = NULL;
     node->prev = queue->tail;
 
@@ -29,6 +32,9 @@ static inline void sched_queue_enqueue_locked(list_queue_t *queue,
 
 static inline void sched_queue_remove_locked(list_queue_t *queue,
                                              list_node_t *node) {
+    if (!queue || !node)
+        return;
+
     if (node->prev) {
         node->prev->next = node->next;
     } else {
@@ -45,6 +51,23 @@ static inline void sched_queue_remove_locked(list_queue_t *queue,
         queue->size--;
 
     sched_node_reset(node);
+}
+
+static bool sched_queue_contains_locked(list_queue_t *queue,
+                                        list_node_t *target) {
+    size_t limit;
+    list_node_t *node;
+
+    if (!queue || !target)
+        return false;
+
+    limit = queue->size + 1;
+    for (node = queue->head; node && limit--; node = node->next) {
+        if (node == target)
+            return true;
+    }
+
+    return false;
 }
 
 static list_node_t *
@@ -66,6 +89,7 @@ sched_entity_node_get_or_create(struct sched_entity *entity) {
 static task_t *sched_pick_next_task_internal(sched_rq_t *scheduler,
                                              task_t *excluded) {
     task_t *next_task = NULL;
+    size_t limit;
 
     spin_lock(&scheduler->lock);
 
@@ -79,14 +103,17 @@ static task_t *sched_pick_next_task_internal(sched_rq_t *scheduler,
     }
 
     list_node_t *next_node = head;
-    if (entity && entity != scheduler->idle && entity->on_rq && entity->node) {
+    if (entity && entity != scheduler->idle && entity->on_rq &&
+        entity->rq == scheduler && entity->node &&
+        sched_queue_contains_locked(scheduler->sched_queue, entity->node)) {
         next_node = entity->node->next ? entity->node->next : head;
     }
 
     list_node_t *start = next_node;
+    limit = scheduler->sched_queue ? scheduler->sched_queue->size + 1 : 0;
     do {
         struct sched_entity *next = next_node->data;
-        if (__builtin_expect(next && next->on_rq, 1)) {
+        if (__builtin_expect(next && next->on_rq && next->rq == scheduler, 1)) {
             task_t *candidate = next->task;
             if (candidate && candidate->state == TASK_READY &&
                 candidate != excluded) {
@@ -97,7 +124,7 @@ static task_t *sched_pick_next_task_internal(sched_rq_t *scheduler,
         }
 
         next_node = next_node->next ? next_node->next : head;
-    } while (next_node != start);
+    } while (next_node != start && limit--);
 
     scheduler->curr = scheduler->idle;
     next_task = scheduler->idle->task;
@@ -117,9 +144,19 @@ void add_sched_entity(task_t *task, sched_rq_t *scheduler) {
     spin_lock(&scheduler->lock);
 
     if (entity->on_rq) {
-        spin_unlock(&scheduler->lock);
-        return;
+        if (entity->rq == scheduler &&
+            sched_queue_contains_locked(scheduler->sched_queue, entity->node)) {
+            spin_unlock(&scheduler->lock);
+            return;
+        }
+        if (entity->rq && entity->rq != scheduler) {
+            spin_unlock(&scheduler->lock);
+            return;
+        }
     }
+
+    entity->on_rq = false;
+    entity->rq = NULL;
 
     list_node_t *node = sched_entity_node_get_or_create(entity);
     if (!node) {
@@ -129,6 +166,7 @@ void add_sched_entity(task_t *task, sched_rq_t *scheduler) {
 
     sched_queue_enqueue_locked(scheduler->sched_queue, node);
     entity->on_rq = true;
+    entity->rq = scheduler;
 
     spin_unlock(&scheduler->lock);
 }
@@ -141,15 +179,19 @@ void remove_sched_entity(task_t *thread, sched_rq_t *scheduler) {
 
     spin_lock(&scheduler->lock);
 
-    if (!entity->on_rq) {
+    if (!entity->on_rq || entity->rq != scheduler) {
         spin_unlock(&scheduler->lock);
         return;
     }
 
     entity->on_rq = false;
+    entity->rq = NULL;
 
-    if (entity->node) {
+    if (entity->node &&
+        sched_queue_contains_locked(scheduler->sched_queue, entity->node)) {
         sched_queue_remove_locked(scheduler->sched_queue, entity->node);
+    } else if (entity->node) {
+        sched_node_reset(entity->node);
     }
 
     if (scheduler->curr == entity) {

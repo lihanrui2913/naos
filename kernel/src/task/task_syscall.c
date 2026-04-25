@@ -649,12 +649,12 @@ static void task_fd_info_put(fd_info_t *fd_info, task_t *task) {
 
     with_fd_info_lock(fd_info, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            if (!fd_info->fds[i])
+            if (!fd_info->fds[i].file)
                 continue;
 
-            struct vfs_file *entry = fd_info->fds[i];
-            fd_info->fds[i] = NULL;
-            fd_info->fd_flags[i] = 0;
+            struct vfs_file *entry = fd_info->fds[i].file;
+            fd_info->fds[i].file = NULL;
+            fd_info->fds[i].flags = 0;
             on_close_file_call(task, i, entry);
             vfs_close_file(entry);
         }
@@ -732,6 +732,13 @@ void task_cleanup_partial(task_t *task, bool kernel_mm) {
     }
 
     if (task->sched_info) {
+        if (task->cpu_id < MAX_CPU_NUM)
+            remove_sched_entity(task, &schedulers[task->cpu_id]);
+        struct sched_entity *entity = task->sched_info;
+        if (!entity->on_rq && entity->node) {
+            free(entity->node);
+            entity->node = NULL;
+        }
         free(task->sched_info);
         task->sched_info = NULL;
     }
@@ -811,6 +818,12 @@ void free_task(task_t *ptr) {
 
     struct sched_entity *entity = ptr->sched_info;
     if (entity) {
+        if (ptr->cpu_id < MAX_CPU_NUM)
+            remove_sched_entity(ptr, &schedulers[ptr->cpu_id]);
+        if (!entity->on_rq && entity->node) {
+            free(entity->node);
+            entity->node = NULL;
+        }
         free(entity);
         ptr->sched_info = NULL;
     }
@@ -1753,14 +1766,14 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
         mutex_init(&new->fdt_lock);
         with_fd_info_lock(old, {
             for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-                struct vfs_file *fd = old->fds[i];
+                struct vfs_file *fd = old->fds[i].file;
 
                 if (fd) {
-                    new->fds[i] = vfs_file_get(fd);
-                    new->fd_flags[i] = old->fd_flags[i];
+                    new->fds[i].file = vfs_file_get(fd);
+                    new->fds[i].flags = old->fds[i].flags;
                 } else {
-                    new->fds[i] = NULL;
-                    new->fd_flags[i] = 0;
+                    new->fds[i].file = NULL;
+                    new->fds[i].flags = 0;
                 }
             }
         });
@@ -1795,13 +1808,13 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
 
     with_fd_info_lock(self->fd_info, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            if (!self->fd_info->fds[i])
+            if (!self->fd_info->fds[i].file)
                 continue;
 
-            if (self->fd_info->fd_flags[i] & FD_CLOEXEC) {
-                struct vfs_file *entry = self->fd_info->fds[i];
-                self->fd_info->fds[i] = NULL;
-                self->fd_info->fd_flags[i] = 0;
+            if (self->fd_info->fds[i].flags & FD_CLOEXEC) {
+                struct vfs_file *entry = self->fd_info->fds[i].file;
+                self->fd_info->fds[i].file = NULL;
+                self->fd_info->fds[i].flags = 0;
                 on_close_file_call(self, i, entry);
                 vfs_close_file(entry);
             }
@@ -2513,14 +2526,14 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     if (!(flags & CLONE_FILES)) {
         mutex_init(&child->fd_info->fdt_lock);
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            struct vfs_file *fd = self->fd_info->fds[i];
+            struct vfs_file *fd = self->fd_info->fds[i].file;
 
             if (fd) {
-                child->fd_info->fds[i] = vfs_file_get(fd);
-                child->fd_info->fd_flags[i] = self->fd_info->fd_flags[i];
+                child->fd_info->fds[i].file = vfs_file_get(fd);
+                child->fd_info->fds[i].flags = self->fd_info->fds[i].flags;
             } else {
-                child->fd_info->fds[i] = NULL;
-                child->fd_info->fd_flags[i] = 0;
+                child->fd_info->fds[i].file = NULL;
+                child->fd_info->fds[i].flags = 0;
             }
         }
     }
@@ -2607,7 +2620,7 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
 
     on_new_task_call(child);
     for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-        if (child->fd_info->fds[i]) {
+        if (child->fd_info->fds[i].file) {
             on_open_file_call(child, i);
         }
     }
@@ -2650,10 +2663,10 @@ static fd_info_t *task_fd_info_clone(fd_info_t *old) {
 
     with_fd_info_lock(old, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            if (!old->fds[i])
+            if (!old->fds[i].file)
                 continue;
-            new_info->fds[i] = vfs_file_get(old->fds[i]);
-            new_info->fd_flags[i] = old->fd_flags[i];
+            new_info->fds[i].file = vfs_file_get(old->fds[i].file);
+            new_info->fds[i].flags = old->fds[i].flags;
         }
     });
 

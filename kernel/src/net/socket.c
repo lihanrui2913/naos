@@ -1694,7 +1694,7 @@ static size_t unix_socket_install_pending_files(fd_t **pending_files,
         for (size_t i = 0; i < pending_count; i++) {
             int new_fd = -1;
             for (int fd_idx = 0; fd_idx < MAX_FD_NUM; fd_idx++) {
-                if (current_task->fd_info->fds[fd_idx] == NULL) {
+                if (current_task->fd_info->fds[fd_idx].file == NULL) {
                     new_fd = fd_idx;
                     break;
                 }
@@ -1706,8 +1706,9 @@ static size_t unix_socket_install_pending_files(fd_t **pending_files,
             fd_t *new_entry = vfs_file_get(pending_files[i]);
             if (!new_entry)
                 break;
-            new_entry->close_on_exec = !!(recv_flags & MSG_CMSG_CLOEXEC);
-            current_task->fd_info->fds[new_fd] = new_entry;
+            current_task->fd_info->fds[new_fd].file = new_entry;
+            current_task->fd_info->fds[new_fd].flags =
+                (recv_flags & MSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0;
             fds_out[installed++] = new_fd;
         }
     });

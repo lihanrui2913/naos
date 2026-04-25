@@ -1252,14 +1252,14 @@ uint64_t sys_close(uint64_t fd) {
     fd_t *entry = NULL;
     uint64_t ret = (uint64_t)-EBADF;
     with_fd_info_lock(self->fd_info, {
-        entry = vfs_file_get(self->fd_info->fds[fd]);
+        entry = vfs_file_get(self->fd_info->fds[fd].file);
         if (!entry)
             break;
 
         file_lock_release_pid(entry->f_inode, self->pid);
 
-        self->fd_info->fds[fd] = NULL;
-        self->fd_info->fd_flags[fd] = 0;
+        self->fd_info->fds[fd].file = NULL;
+        self->fd_info->fds[fd].flags = 0;
         ret = 0;
 
         vfs_file_put(entry);
@@ -1295,9 +1295,9 @@ static int close_range_unshare_fd_table(task_t *self) {
 
     with_fd_info_lock(old, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            if (old->fds[i]) {
-                new_info->fds[i] = vfs_file_get(old->fds[i]);
-                new_info->fd_flags[i] = old->fd_flags[i];
+            if (old->fds[i].file) {
+                new_info->fds[i].file = vfs_file_get(old->fds[i].file);
+                new_info->fds[i].flags = old->fds[i].flags;
             }
         }
         old->ref_count--;
@@ -1336,9 +1336,9 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
     if (flags & CLOSE_RANGE_CLOEXEC) {
         with_fd_info_lock(self->fd_info, {
             for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-                if (!self->fd_info->fds[fd_])
+                if (!self->fd_info->fds[fd_].file)
                     continue;
-                self->fd_info->fd_flags[fd_] |= FD_CLOEXEC;
+                self->fd_info->fds[fd_].flags |= FD_CLOEXEC;
             }
         });
         return 0;
@@ -1348,14 +1348,14 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
 
     with_fd_info_lock(self->fd_info, {
         for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-            fd_t *entry = vfs_file_get(self->fd_info->fds[fd_]);
+            fd_t *entry = vfs_file_get(self->fd_info->fds[fd_].file);
             if (!entry)
                 continue;
 
             file_lock_release_pid(entry->f_inode, self->pid);
 
-            self->fd_info->fds[fd_] = NULL;
-            self->fd_info->fd_flags[fd_] = 0;
+            self->fd_info->fds[fd_].file = NULL;
+            self->fd_info->fds[fd_].flags = 0;
             to_close[fd_] = entry;
         }
     });
@@ -1742,11 +1742,11 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         }
         break;
     case FIOCLEX:
-        self->fd_info->fd_flags[fd] |= FD_CLOEXEC;
+        self->fd_info->fds[fd].flags |= FD_CLOEXEC;
         ret = 0;
         break;
     case FIONCLEX:
-        self->fd_info->fd_flags[fd] &= ~FD_CLOEXEC;
+        self->fd_info->fds[fd].flags &= ~FD_CLOEXEC;
         ret = 0;
         break;
 
@@ -2260,7 +2260,7 @@ static uint64_t dup_to_exact(task_t *self, uint64_t fd, uint64_t newfd,
     fd_t *replaced_fd = NULL;
     unsigned int new_fd_flags = 0;
     with_fd_info_lock(self->fd_info, {
-        if (!self->fd_info->fds[fd]) {
+        if (!self->fd_info->fds[fd].file) {
             ret = (uint64_t)-EBADF;
             break;
         }
@@ -2274,22 +2274,22 @@ static uint64_t dup_to_exact(task_t *self, uint64_t fd, uint64_t newfd,
             break;
         }
 
-        fd_t *newf = vfs_file_get(self->fd_info->fds[fd]);
+        fd_t *newf = vfs_file_get(self->fd_info->fds[fd].file);
         if (!newf) {
             ret = (uint64_t)-ENOSPC;
             break;
         }
 
-        if (self->fd_info->fds[newfd]) {
-            replaced_fd = self->fd_info->fds[newfd];
-            self->fd_info->fds[newfd] = NULL;
-            self->fd_info->fd_flags[newfd] = 0;
+        if (self->fd_info->fds[newfd].file) {
+            replaced_fd = self->fd_info->fds[newfd].file;
+            self->fd_info->fds[newfd].file = NULL;
+            self->fd_info->fds[newfd].flags = 0;
             replaced_existing = true;
         }
 
         new_fd_flags = cloexec ? FD_CLOEXEC : 0;
-        self->fd_info->fds[newfd] = newf;
-        self->fd_info->fd_flags[newfd] = new_fd_flags;
+        self->fd_info->fds[newfd].file = newf;
+        self->fd_info->fds[newfd].flags = new_fd_flags;
         installed_new = true;
     });
 
@@ -2320,14 +2320,14 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
 
     uint64_t ret = (uint64_t)-EBADF;
     with_fd_info_lock(self->fd_info, {
-        if (!self->fd_info->fds[fd]) {
+        if (!self->fd_info->fds[fd].file) {
             ret = (uint64_t)-EBADF;
             break;
         }
 
         uint64_t i;
         for (i = start; i < MAX_FD_NUM; i++) {
-            if (!self->fd_info->fds[i])
+            if (!self->fd_info->fds[i].file)
                 break;
         }
 
@@ -2336,14 +2336,14 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
             break;
         }
 
-        fd_t *newf = vfs_file_get(self->fd_info->fds[fd]);
+        fd_t *newf = vfs_file_get(self->fd_info->fds[fd].file);
         if (!newf) {
             ret = (uint64_t)-ENOSPC;
             break;
         }
 
-        self->fd_info->fds[i] = newf;
-        self->fd_info->fd_flags[i] = cloexec ? FD_CLOEXEC : 0;
+        self->fd_info->fds[i].file = newf;
+        self->fd_info->fds[i].flags = cloexec ? FD_CLOEXEC : 0;
         on_open_file_call(self, i);
         ret = i;
     });
@@ -2379,11 +2379,11 @@ uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t arg) {
 
     switch (command) {
     case F_GETFD:
-        out = (self->fd_info->fd_flags[fd] & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+        out = (self->fd_info->fds[fd].flags & FD_CLOEXEC) ? FD_CLOEXEC : 0;
         break;
     case F_SETFD:
-        self->fd_info->fd_flags[fd] =
-            (self->fd_info->fd_flags[fd] & ~FD_CLOEXEC) |
+        self->fd_info->fds[fd].flags =
+            (self->fd_info->fds[fd].flags & ~FD_CLOEXEC) |
             ((arg & FD_CLOEXEC) ? FD_CLOEXEC : 0);
         out = 0;
         break;
