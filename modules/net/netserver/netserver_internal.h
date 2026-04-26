@@ -16,6 +16,7 @@
 #include <net/real_socket.h>
 #include <net/socket.h>
 
+#define AF_UNSPEC 0
 #define AF_UNIX 1
 #define AF_INET 2
 #define AF_INET6 10
@@ -25,6 +26,7 @@
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
 #define IPPROTO_IPV6 41
+#define IPPROTO_ICMPV6 58
 #define IPPROTO_RAW 255
 
 #define TCP_NODELAY 1
@@ -85,11 +87,13 @@ typedef struct lwip_socket_state {
     int type;
     int protocol;
     bool listening;
+    bool connected;
     bool closed;
     bool reuseaddr;
     bool reuseport;
     bool keepalive;
     bool broadcast;
+    bool dontroute;
     bool ip_pktinfo;
     bool ipv6_pktinfo;
     bool ip_recverr;
@@ -100,6 +104,12 @@ typedef struct lwip_socket_state {
     int ip_mtu_discover;
     int ipv6_mtu_discover;
     uint32_t ip_local_port_range;
+    uint32_t mark;
+    int priority;
+    int bind_to_ifindex;
+    char bind_to_dev[IFNAMSIZ];
+    ip_addr_t peer_addr;
+    uint16_t peer_port;
     int sndbuf;
     struct timeval sndtimeo;
     struct timeval rcvtimeo;

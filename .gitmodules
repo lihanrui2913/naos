@@ -1,0 +1,3 @@
+[submodule "modules/lcompat"]
+	path = modules/lcompat
+	url = https://github.com/aether-os-studio/lcompat

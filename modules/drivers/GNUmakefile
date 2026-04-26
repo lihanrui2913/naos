@@ -20,3 +20,8 @@ endif
 	$(Q)$(MAKE) -C hid
 	$(call PRINT_STEP,MAKE,modules/drivers/msc)
 	$(Q)$(MAKE) -C msc
+
+ifneq ($(BUILD_LINUX_DRIVERS), 0)
+	$(call PRINT_STEP,MAKE,modules/drivers/rtw88)
+	$(Q)$(MAKE) -C rtw88
+endif

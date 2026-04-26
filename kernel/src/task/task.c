@@ -1586,10 +1586,13 @@ int task_kill_process_group(int pgid, int sig) {
 
 void schedule(uint64_t sched_flags) {
     bool state = arch_interrupt_enabled();
+    task_t *prev = current_task;
+
+    if (prev && prev->arch_context)
+        arch_context_save_interrupt_state(prev->arch_context, state);
 
     arch_disable_interrupt();
 
-    task_t *prev = current_task;
     if (prev->preempt_count) {
         goto ret;
     }

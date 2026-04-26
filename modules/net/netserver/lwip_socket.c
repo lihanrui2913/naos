@@ -1,5 +1,7 @@
 #include "netserver_internal.h"
 #include <lwip/err.h>
+#include <lwip/raw.h>
+#include <lwip/udp.h>
 #include <init/callbacks.h>
 
 #define FIONBIO_INTERNAL_DISABLE ((ssize_t) - 1)
@@ -74,6 +76,15 @@ static inline bool lwip_socket_is_dgram(const lwip_socket_state_t *sock) {
 
 static inline bool lwip_socket_is_raw(const lwip_socket_state_t *sock) {
     return sock && ((sock->type & 0xF) == SOCK_RAW);
+}
+
+static inline bool lwip_socket_is_icmp_dgram(int domain, int type,
+                                             int protocol) {
+    int sock_type = type & 0xF;
+
+    return sock_type == SOCK_DGRAM &&
+           ((domain == AF_INET && protocol == IPPROTO_ICMP) ||
+            (domain == AF_INET6 && protocol == IPPROTO_ICMPV6));
 }
 
 static inline int lwip_socket_recv_avail(lwip_socket_state_t *sock) {
@@ -202,6 +213,34 @@ static inline int lwip_socket_apply_fd_flags(fd_t *fd, int flags) {
         flags |= MSG_DONTWAIT;
     }
     return flags;
+}
+
+static int lwip_socket_bind_netif(lwip_socket_state_t *sock,
+                                  struct netif *netif) {
+    int ret = 0;
+
+    if (!sock || !sock->conn) {
+        return -EBADF;
+    }
+
+    LOCK_TCPIP_CORE();
+    switch (NETCONNTYPE_GROUP(netconn_type(sock->conn))) {
+    case NETCONN_TCP:
+        tcp_bind_netif(sock->conn->pcb.tcp, netif);
+        break;
+    case NETCONN_UDP:
+        udp_bind_netif(sock->conn->pcb.udp, netif);
+        break;
+    case NETCONN_RAW:
+        raw_bind_netif(sock->conn->pcb.raw, netif);
+        break;
+    default:
+        ret = -EOPNOTSUPP;
+        break;
+    }
+    UNLOCK_TCPIP_CORE();
+
+    return ret;
 }
 
 static inline bool lwip_socket_buffer_is_userspace(const void *buf,
@@ -693,7 +732,10 @@ static enum netconn_type lwip_pick_netconn_type(int domain, int type) {
 
 static struct netconn *lwip_socket_new_conn(int domain, int type,
                                             int protocol) {
-    enum netconn_type conn_type = lwip_pick_netconn_type(domain, type);
+    enum netconn_type conn_type =
+        lwip_socket_is_icmp_dgram(domain, type, protocol)
+            ? (domain == AF_INET ? NETCONN_RAW : NETCONN_RAW_IPV6)
+            : lwip_pick_netconn_type(domain, type);
     int sock_type = type & 0xF;
 
     if (conn_type == NETCONN_INVALID) {
@@ -709,6 +751,10 @@ static struct netconn *lwip_socket_new_conn(int domain, int type,
     }
 
     if (sock_type == SOCK_DGRAM) {
+        if (lwip_socket_is_icmp_dgram(domain, type, protocol)) {
+            return netconn_new_with_proto_and_callback(
+                conn_type, (u8_t)protocol, lwip_socket_event_callback);
+        }
         if (protocol != 0 && protocol != IPPROTO_UDP) {
             return NULL;
         }
@@ -787,12 +833,75 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
             }
             UNLOCK_TCPIP_CORE();
             return 0;
+        case SO_DONTROUTE:
+            if (optlen < sizeof(int)) {
+                return -EINVAL;
+            }
+            sock->dontroute = value ? true : false;
+            return 0;
         case SO_OOBINLINE:
             if (optlen < sizeof(int)) {
                 return -EINVAL;
             }
             sock->oobinline = value ? true : false;
             return 0;
+        case SO_PRIORITY:
+            if (optlen < sizeof(int)) {
+                return -EINVAL;
+            }
+            sock->priority = value;
+            return 0;
+        case SO_MARK:
+            if (optlen < sizeof(int)) {
+                return -EINVAL;
+            }
+            sock->mark = (uint32_t)value;
+            return 0;
+        case SO_BINDTOIFINDEX:
+            if (optlen < sizeof(int)) {
+                return -EINVAL;
+            }
+            if (value) {
+                netdev_t *dev = netdev_get_by_index((uint32_t)value);
+                if (!dev) {
+                    return -ENODEV;
+                }
+                strncpy(sock->bind_to_dev, dev->name, IFNAMSIZ - 1);
+                sock->bind_to_dev[IFNAMSIZ - 1] = '\0';
+                netdev_put(dev);
+            } else {
+                sock->bind_to_dev[0] = '\0';
+            }
+            sock->bind_to_ifindex = value;
+            return lwip_socket_bind_netif(sock,
+                                          value ? &naos_lwip_netif : NULL);
+        case SO_BINDTODEVICE:
+            if (optlen > IFNAMSIZ) {
+                return -EINVAL;
+            }
+            if (!optval || optlen == 0 || !*(const char *)optval) {
+                sock->bind_to_dev[0] = '\0';
+                sock->bind_to_ifindex = 0;
+                return lwip_socket_bind_netif(sock, NULL);
+            }
+            {
+                char ifname[IFNAMSIZ];
+                netdev_t *dev = NULL;
+
+                memset(ifname, 0, sizeof(ifname));
+                memcpy(ifname, optval, optlen);
+                ifname[IFNAMSIZ - 1] = '\0';
+
+                dev = netdev_get_by_name(ifname);
+                if (!dev) {
+                    return -ENODEV;
+                }
+                strncpy(sock->bind_to_dev, dev->name, IFNAMSIZ - 1);
+                sock->bind_to_dev[IFNAMSIZ - 1] = '\0';
+                sock->bind_to_ifindex = (int)(dev->id + 1);
+                netdev_put(dev);
+            }
+            return lwip_socket_bind_netif(sock, &naos_lwip_netif);
         case SO_SNDBUF:
             if (optlen < sizeof(int)) {
                 return -EINVAL;
@@ -1029,6 +1138,27 @@ static int lwip_socket_getsockopt_impl(lwip_socket_state_t *sock, int level,
         case SO_BROADCAST:
             value = sock->broadcast ? 1 : 0;
             break;
+        case SO_DONTROUTE:
+            value = sock->dontroute ? 1 : 0;
+            break;
+        case SO_PRIORITY:
+            value = sock->priority;
+            break;
+        case SO_MARK:
+            value = (int)sock->mark;
+            break;
+        case SO_BINDTOIFINDEX:
+            value = sock->bind_to_ifindex;
+            break;
+        case SO_BINDTODEVICE: {
+            size_t len = strlen(sock->bind_to_dev) + 1;
+            if (*optlen < len) {
+                return -EINVAL;
+            }
+            memcpy(optval, sock->bind_to_dev, len);
+            *optlen = (socklen_t)len;
+            return 0;
+        }
         case SO_SNDBUF:
             value = sock->sndbuf;
             break;
@@ -1275,6 +1405,11 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
     size_t want = lwip_socket_iov_total(msg->msg_iov, msg->msg_iovlen);
 
     flags = lwip_socket_apply_fd_flags(fd, flags);
+    msg->msg_flags = 0;
+
+    if (flags & MSG_ERRQUEUE) {
+        return -EAGAIN;
+    }
 
     if (lwip_socket_is_tcp(sock)) {
         int ret = lwip_socket_fetch_tcp(sock, flags);
@@ -1357,6 +1492,9 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
                 return copied;
             }
         }
+        if (avail > want) {
+            msg->msg_flags |= MSG_TRUNC;
+        }
 
         if (msg->msg_name && msg->msg_namelen > 0) {
             socklen_t namelen = (socklen_t)msg->msg_namelen;
@@ -1373,7 +1511,7 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
             lwip_socket_publish_rx_avail(sock);
         }
 
-        return (ssize_t)total;
+        return (flags & MSG_TRUNC) ? (ssize_t)avail : (ssize_t)total;
     }
 }
 
@@ -1416,12 +1554,17 @@ static ssize_t lwip_socket_sendmsg_common(lwip_socket_state_t *sock, fd_t *fd,
     {
         ip_addr_t dst;
         u16_t port = 0;
+        bool has_dest = false;
         size_t total = lwip_socket_iov_total(msg->msg_iov, msg->msg_iovlen);
         struct netbuf *buf = netbuf_new();
         void *payload = NULL;
 
         if (!buf) {
             return -ENOMEM;
+        }
+        if (total > 0xFFFF) {
+            netbuf_delete(buf);
+            return -EMSGSIZE;
         }
 
         if (msg->msg_name && msg->msg_namelen) {
@@ -1432,9 +1575,13 @@ static ssize_t lwip_socket_sendmsg_common(lwip_socket_state_t *sock, fd_t *fd,
                 netbuf_delete(buf);
                 return ret;
             }
-        } else if (netconn_peer(sock->conn, &dst, &port) != ERR_OK) {
-            netbuf_delete(buf);
-            return -EDESTADDRREQ;
+            has_dest = true;
+        } else {
+            if (!sock->connected) {
+                netbuf_delete(buf);
+                return -EDESTADDRREQ;
+            }
+            ip_addr_set_any(NETCONNTYPE_ISIPV6(netconn_type(sock->conn)), &dst);
         }
 
         payload = netbuf_alloc(buf, (u16_t)total);
@@ -1445,12 +1592,20 @@ static ssize_t lwip_socket_sendmsg_common(lwip_socket_state_t *sock, fd_t *fd,
 
         written = 0;
         for (size_t i = 0; i < msg->msg_iovlen; i++) {
-            memcpy((uint8_t *)payload + written, msg->msg_iov[i].iov_base,
-                   msg->msg_iov[i].len);
+            if (msg->msg_iov[i].len) {
+                memcpy((uint8_t *)payload + written, msg->msg_iov[i].iov_base,
+                       msg->msg_iov[i].len);
+            }
             written += msg->msg_iov[i].len;
         }
 
-        err = netconn_sendto(sock->conn, buf, &dst, port);
+        if (has_dest) {
+            err = netconn_sendto(sock->conn, buf, &dst, port);
+        } else {
+            ip_addr_set(&buf->addr, &dst);
+            netbuf_fromport(buf) = 0;
+            err = netconn_send(sock->conn, buf);
+        }
         netbuf_delete(buf);
         if (err != ERR_OK) {
             return lwip_errno_from_err(err);
@@ -1636,6 +1791,22 @@ static int lwip_socket_connect(uint64_t fd, const struct sockaddr_un *addr,
         return -EBADF;
     }
 
+    if (addr && addrlen >= sizeof(uint16_t) &&
+        ((const struct sockaddr *)addr)->sa_family == AF_UNSPEC) {
+        if (lwip_socket_is_tcp(sock)) {
+            vfs_file_put(file);
+            return -EINVAL;
+        }
+        ret = lwip_errno_from_err(netconn_disconnect(sock->conn));
+        if (ret == 0) {
+            sock->connected = false;
+            sock->peer_port = 0;
+            ip_addr_set_zero(&sock->peer_addr);
+        }
+        vfs_file_put(file);
+        return ret;
+    }
+
     ret = lwip_sockaddr_to_ip(addr, addrlen, sock->domain, &ipaddr, &port);
     if (ret < 0) {
         vfs_file_put(file);
@@ -1660,6 +1831,11 @@ static int lwip_socket_connect(uint64_t fd, const struct sockaddr_un *addr,
     }
 
     ret = lwip_errno_from_err(netconn_connect(sock->conn, &ipaddr, port));
+    if (ret == 0) {
+        sock->connected = true;
+        ip_addr_set(&sock->peer_addr, &ipaddr);
+        sock->peer_port = port;
+    }
     vfs_file_put(file);
     return ret;
 }
@@ -1777,8 +1953,12 @@ static size_t lwip_socket_getpeername(uint64_t fd, struct sockaddr_un *addr,
     }
 
     if (netconn_peer(sock->conn, &ipaddr, &port) != ERR_OK) {
-        vfs_file_put(file);
-        return (size_t)-ENOTCONN;
+        if (!sock->connected) {
+            vfs_file_put(file);
+            return (size_t)-ENOTCONN;
+        }
+        ip_addr_set(&ipaddr, &sock->peer_addr);
+        port = sock->peer_port;
     }
 
     size_t ret =

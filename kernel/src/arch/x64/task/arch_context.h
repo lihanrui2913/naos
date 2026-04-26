@@ -77,11 +77,14 @@ typedef struct __ucontext {
 typedef struct arch_context {
     uint64_t rip;
     uint64_t rsp;
+    uint64_t kernel_interrupt_enabled;
     uint64_t fsbase;
     uint64_t gsbase;
     struct pt_regs *ctx;
     fpu_context_t *fpu_ctx;
 } arch_context_t;
+
+#define X64_RFLAGS_IF (1ULL << 9)
 
 #define X64_XSTATE_X87 (1ULL << 0)
 #define X64_XSTATE_SSE (1ULL << 1)
@@ -105,7 +108,8 @@ void x64_fpu_restore(fpu_context_t *fpu_ctx);
 
 #define switch_to(prev, next)                                                  \
     do {                                                                       \
-        asm volatile("pushq %%rax\n\t"                                         \
+        asm volatile("pushq %6\n\t"                                            \
+                     "pushq %%rax\n\t"                                         \
                      "pushq %%rbp\n\t"                                         \
                      "pushq %%rbx\n\t"                                         \
                      "pushq %%r12\n\t"                                         \
@@ -128,10 +132,19 @@ void x64_fpu_restore(fpu_context_t *fpu_ctx);
                      "popq %%rbx\n\t"                                          \
                      "popq %%rbp\n\t"                                          \
                      "popq %%rax\n\t"                                          \
+                     "popq %%rcx\n\t"                                          \
+                     "testq %%rcx, %%rcx\n\t"                                  \
+                     "jz 2f\n\t"                                               \
+                     "sti\n\t"                                                 \
+                     "jmp 3f\n\t"                                              \
+                     "2:\n\t"                                                  \
+                     "cli\n\t"                                                 \
+                     "3:\n\t"                                                  \
                      : "=m"(prev->arch_context->rsp),                          \
                        "=m"(prev->arch_context->rip)                           \
                      : "m"(next->arch_context->rsp),                           \
-                       "m"(next->arch_context->rip), "m"(prev), "m"(next)      \
+                       "m"(next->arch_context->rip), "m"(prev), "m"(next),     \
+                       "m"(prev->arch_context->kernel_interrupt_enabled)       \
                      : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",   \
                        "r11", "cc", "memory");                                 \
     } while (0)
@@ -142,6 +155,7 @@ void arch_context_init(arch_context_t *context, uint64_t page_table_dir,
 void arch_context_copy(arch_context_t *dst, arch_context_t *src, uint64_t stack,
                        uint64_t clone_flags);
 void arch_context_free(arch_context_t *context);
+void arch_context_save_interrupt_state(arch_context_t *context, bool enabled);
 task_t *arch_get_current();
 void arch_set_current(task_t *current);
 

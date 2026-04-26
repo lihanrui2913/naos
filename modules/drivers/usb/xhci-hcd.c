@@ -1058,11 +1058,9 @@ static void xhci_event_thread(uint64_t arg) {
 
     while (xhci->running) {
         xhci_process_events(xhci);
-        task_block(current_task, TASK_BLOCKING, (int64_t)XHCI_EVENT_POLL_NS,
-                   "xhci_event");
+        arch_enable_interrupt();
+        delay(10);
     }
-
-    task_exit(0);
 }
 
 static void xhci_irq_handler(uint64_t irq_num, void *data,
