@@ -508,10 +508,7 @@ static uint64_t do_epoll_wait(struct vfs_file *epoll_file,
         arch_disable_interrupt();
         epoll_disarm_waiters(waits, waits_count);
         if (block_reason == ETIMEDOUT) {
-            if (infinite_timeout) {
-                continue;
-            }
-            break;
+            continue;
         }
         if (block_reason != EOK) {
             ready = -EINTR;

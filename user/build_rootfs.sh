@@ -28,4 +28,6 @@ sudo XBPS_ARCH=$ARCH $XBPS_INSTALL_PATH/usr/bin/xbps-install -S -r $ROOTFS_SYSRO
 
 sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai $ROOTFS_SYSROOT/etc/localtime
 
+sudo chroot $ROOTFS_SYSROOT /bin/bash --login -c "xbps-reconfigure -f glibc-locales"
+
 sudo cp -r $SCRIPTPATH/base/* $ROOTFS_SYSROOT/

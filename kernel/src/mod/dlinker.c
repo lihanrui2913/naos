@@ -464,6 +464,10 @@ static bool elf_symbol_is_exported(const Elf64_Sym *sym) {
         return false;
     }
 
+    if (ELF64_ST_VISIBILITY(sym->st_other) != STV_DEFAULT) {
+        return false;
+    }
+
     uint8_t type = ELF64_ST_TYPE(sym->st_info);
     switch (type) {
     case STT_NOTYPE:

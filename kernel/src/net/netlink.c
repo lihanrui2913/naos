@@ -147,12 +147,28 @@ static int netlink_append_done(char *buf, size_t *offset, size_t capacity,
                                       req ? req->nlmsg_seq : 0, NULL, 0);
 }
 
+static void netlink_stamp_reply_portid(char *buf, size_t len, uint32_t portid) {
+    struct nlmsghdr *nlh;
+    size_t remaining;
+
+    if (!buf || !len)
+        return;
+
+    remaining = len;
+    nlh = (struct nlmsghdr *)buf;
+    while (NLMSG_OK(nlh, remaining)) {
+        nlh->nlmsg_pid = portid;
+        nlh = NLMSG_NEXT(nlh, remaining);
+    }
+}
+
 static int netlink_flush_reply_to_socket(struct netlink_sock *sock, char *buf,
                                          size_t *offset) {
     if (!sock || !buf || !offset)
         return -EINVAL;
     if (*offset == 0)
         return 0;
+    netlink_stamp_reply_portid(buf, *offset, sock->portid);
     if (!netlink_deliver_to_socket(sock, buf, *offset, 0, 0))
         return -ENOBUFS;
     memset(buf, 0, *offset);
@@ -2258,6 +2274,7 @@ static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
                 if (netlink_append_ack(reply, &offset, sizeof(reply), req,
                                        ret) < 0)
                     return ret;
+                netlink_stamp_reply_portid(reply, offset, sender_sock->portid);
                 if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0,
                                                0))
                     return -ENOBUFS;
@@ -2271,6 +2288,7 @@ static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
                 if (netlink_append_ack(reply, &offset, sizeof(reply), req, 0) <
                     0)
                     return -EMSGSIZE;
+                netlink_stamp_reply_portid(reply, offset, sender_sock->portid);
                 if (!netlink_deliver_to_socket(sender_sock, reply, offset, 0,
                                                0))
                     return -ENOBUFS;

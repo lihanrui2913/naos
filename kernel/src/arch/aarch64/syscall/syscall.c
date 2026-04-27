@@ -208,7 +208,7 @@ uint64_t sys_getrandom(uint64_t arg1, uint64_t arg2, uint64_t arg3) {
         return (uint64_t)-EFAULT;
     }
 
-    state = nano_time() ^ rdtsc_ordered();
+    state = nano_time();
     if (current_task)
         state ^= current_task->pid ^ ((uint64_t)current_task->cpu_id << 32);
     if (state == 0)
@@ -396,8 +396,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_PWRITE64, (syscall_handle_t)sys_pwrite64);
     regist_syscall_handler(SYS_READV, (syscall_handle_t)sys_readv);
     regist_syscall_handler(SYS_WRITEV, (syscall_handle_t)sys_writev);
-    regist_syscall_handler(SYS_SCHED_YIELD,
-                           (syscall_handle_t)sys_sched_yield_linux);
+    regist_syscall_handler(SYS_SCHED_YIELD, (syscall_handle_t)sys_sched_yield);
     regist_syscall_handler(SYS_MREMAP, (syscall_handle_t)sys_mremap);
     regist_syscall_handler(SYS_MSYNC, (syscall_handle_t)sys_msync);
     regist_syscall_handler(SYS_MINCORE, (syscall_handle_t)sys_mincore);

@@ -168,6 +168,8 @@ run-x86_64: assets/ovmf-code-$(ARCH).fd all
 		-device ahci,id=ahci \
 		-device ide-hd,drive=harddisk,bus=ahci.0 \
 		-device nvme,drive=rootdisk,serial=5678 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
 		-rtc base=utc \
 		-display sdl \
 		$(QEMUFLAGS)

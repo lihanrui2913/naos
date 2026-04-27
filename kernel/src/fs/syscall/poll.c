@@ -173,10 +173,7 @@ static size_t do_poll(struct pollfd *fds, int nfds, uint64_t timeout) {
             task_block(current_task, TASK_BLOCKING, block_ns, "poll_wait");
         poll_disarm_waiters(waits, nfds);
         if (block_reason == ETIMEDOUT) {
-            if (infinite_timeout) {
-                continue;
-            }
-            break;
+            continue;
         }
         if (block_reason != EOK) {
             ready = -EINTR;
