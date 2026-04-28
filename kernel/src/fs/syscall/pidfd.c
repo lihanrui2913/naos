@@ -205,11 +205,7 @@ static int pidfd_release(struct vfs_inode *inode, struct vfs_file *file) {
     pidfd_watch_detach_locked(ctx);
     spin_unlock(&pidfd_watch_lock);
 
-    free(ctx);
-
     file->private_data = NULL;
-    if (file->f_inode)
-        file->f_inode->i_private = NULL;
     return 0;
 }
 
@@ -343,8 +339,19 @@ static void pidfdfs_kill_sb(struct vfs_super_block *sb) {
     sb->s_fs_info = NULL;
 }
 
+static void pidfdfs_destroy_inode(struct vfs_inode *inode) {
+    if (!inode)
+        return;
+    if (inode->i_private) {
+        free(inode->i_private);
+        inode->i_private = NULL;
+    }
+    free(inode);
+}
+
 static const struct vfs_super_operations pidfdfs_super_ops = {
     .put_super = pidfdfs_kill_sb,
+    .destroy_inode = pidfdfs_destroy_inode,
 };
 
 static struct vfs_file_system_type pidfdfs_fs_type = {
@@ -396,6 +403,7 @@ static int pidfd_create_handle_file(pidfd_ctx_t *ctx, unsigned int open_flags,
     vfs_qstr_make(&name, namebuf);
     dentry = vfs_d_alloc(sb, sb->s_root, &name);
     if (!dentry) {
+        inode->i_private = NULL;
         vfs_iput(inode);
         vfs_mntput(mnt);
         return -ENOMEM;
@@ -405,6 +413,7 @@ static int pidfd_create_handle_file(pidfd_ctx_t *ctx, unsigned int open_flags,
     file = vfs_alloc_file(&(struct vfs_path){.mnt = mnt, .dentry = dentry},
                           O_RDWR | (open_flags & O_NONBLOCK));
     if (!file) {
+        inode->i_private = NULL;
         vfs_dput(dentry);
         vfs_iput(inode);
         vfs_mntput(mnt);
