@@ -137,15 +137,6 @@ static void sockfs_destroy_inode(struct vfs_inode *inode) {
     if (!inode)
         return;
 
-    handle = sockfs_inode_socket_handle(inode);
-    if (handle) {
-        if (handle->release)
-            handle->release(handle);
-        else
-            free(handle);
-        inode->i_private = NULL;
-    }
-
     free(container_of(inode, sockfs_inode_info_t, vfs_inode));
 }
 
@@ -287,10 +278,22 @@ static int sockfs_open(struct vfs_inode *inode, struct vfs_file *file) {
 }
 
 static int sockfs_release(struct vfs_inode *inode, struct vfs_file *file) {
-    (void)inode;
+    socket_handle_t *handle;
+
     if (!file)
         return 0;
+
+    handle = sockfs_file_handle(file);
     file->private_data = NULL;
+    if (inode && inode->i_private == handle)
+        inode->i_private = NULL;
+
+    if (handle) {
+        if (handle->release)
+            handle->release(handle);
+        else
+            free(handle);
+    }
     return 0;
 }
 
@@ -386,6 +389,27 @@ static int unix_socket_maybe_add_passcred(socket_t *peer,
         unix_socket_fill_cred_from_task(&(*ancillary)->cred, current_task);
         (*ancillary)->has_cred = true;
     }
+
+    return 0;
+}
+
+static int unix_socket_ensure_sender_cred(unix_socket_ancillary_t **ancillary,
+                                          bool explicit_cred) {
+    if (!ancillary)
+        return 0;
+
+    if (!*ancillary) {
+        *ancillary = calloc(1, sizeof(**ancillary));
+        if (!*ancillary)
+            return -ENOMEM;
+    }
+
+    if (!(*ancillary)->has_cred) {
+        unix_socket_fill_cred_from_task(&(*ancillary)->cred, current_task);
+        (*ancillary)->has_cred = true;
+    }
+    if (explicit_cred)
+        (*ancillary)->cred_explicit = true;
 
     return 0;
 }
@@ -681,6 +705,7 @@ unix_socket_ancillary_clone_one(const unix_socket_ancillary_t *src) {
     clone->file_count = src->file_count;
     clone->cred = src->cred;
     clone->has_cred = src->has_cred;
+    clone->cred_explicit = src->cred_explicit;
     clone->timestamp = src->timestamp;
     clone->has_timestamp = src->has_timestamp;
 
@@ -1054,6 +1079,7 @@ static int unix_socket_prepare_ancillary(const struct msghdr *msg,
 
             anc->cred = *cred;
             anc->has_cred = true;
+            anc->cred_explicit = true;
             have_cred = true;
         }
     }
@@ -1285,6 +1311,10 @@ void unix_socket_free(socket_t *sock) {
         free(sock->backlog);
     if (sock->filter)
         free(sock->filter);
+    if (sock->node) {
+        vfs_iput(sock->node);
+        sock->node = NULL;
+    }
 
     free(sock);
 }
@@ -1304,7 +1334,6 @@ static void unix_socket_handle_release(socket_handle_t *handle) {
 
     mutex_lock(&sock->lock);
     sock->closed = true;
-    sock->node = NULL;
     if (sock->connMax > 0 && sock->backlogCap > 0 && sock->connCurr > 0) {
         int pending = sock->connCurr;
         for (int i = 0; i < pending; i++) {
@@ -1511,6 +1540,10 @@ static size_t unix_socket_send_to_peer(socket_t *self, socket_t *peer,
     if (self && unix_socket_is_message_type(self->type)) {
         unix_socket_ancillary_t *skb_ancillary = NULL;
         skb_buff_t *skb = NULL;
+        int ret = unix_socket_ensure_sender_cred(ancillary, false);
+
+        if (ret < 0)
+            return ret;
 
         if (ancillary && *ancillary) {
             skb_ancillary = *ancillary;
@@ -1769,7 +1802,7 @@ int socket_socket(int domain, int type, int protocol) {
         unix_socket_free(sock);
         return ret;
     }
-    sock->node = file->f_inode;
+    sock->node = vfs_igrab(file->f_inode);
 
     ret = task_install_file(current_task, file,
                             (type & O_CLOEXEC) ? FD_CLOEXEC : 0, 0);
@@ -1994,7 +2027,7 @@ int socket_accept(uint64_t fd, struct sockaddr_un *addr, socklen_t *addrlen,
         unix_socket_free(server_sock);
         return -ENOMEM;
     }
-    server_sock->node = accept_file->f_inode;
+    server_sock->node = vfs_igrab(accept_file->f_inode);
 
     int ret = task_install_file(current_task, accept_file,
                                 (flags & O_CLOEXEC) ? FD_CLOEXEC : 0, 0);
@@ -2392,7 +2425,8 @@ done:
         return (size_t)ancillary_ret;
     }
 
-    if (ancillary && total_len == 0) {
+    if (ancillary && total_len == 0 &&
+        !unix_socket_is_message_type(sock->type)) {
         unix_socket_ancillary_free(ancillary);
         if (peer_needs_unref)
             unix_socket_release_lookup_ref(peer);
@@ -2401,6 +2435,16 @@ done:
     }
 
     if (unix_socket_is_message_type(sock->type)) {
+        ancillary_ret = unix_socket_ensure_sender_cred(&ancillary, false);
+        if (ancillary_ret < 0) {
+            if (ancillary)
+                unix_socket_ancillary_free(ancillary);
+            if (peer_needs_unref)
+                unix_socket_release_lookup_ref(peer);
+            vfs_file_put(caller_fd);
+            return (size_t)ancillary_ret;
+        }
+
         skb_buff_t *skb = unix_socket_build_skb_from_iov(
             msg->msg_iov, msg->msg_iovlen, total_len, ancillary);
         size_t ret = 0;
@@ -2487,7 +2531,18 @@ size_t unix_socket_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
         return cnt;
     }
 
-    if (ancillary_list && msg->msg_control &&
+    bool ancillary_deliverable = false;
+    for (unix_socket_ancillary_t *anc = ancillary_list; anc != NULL;
+         anc = anc->next) {
+        if (anc->file_count > 0 ||
+            (anc->has_cred && (sock->passcred || anc->cred_explicit)) ||
+            anc->has_timestamp) {
+            ancillary_deliverable = true;
+            break;
+        }
+    }
+
+    if (ancillary_deliverable && msg->msg_control &&
         msg->msg_controllen >= sizeof(struct cmsghdr)) {
         size_t controllen_used = 0;
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
@@ -2518,7 +2573,7 @@ size_t unix_socket_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
                 }
             }
 
-            if (anc->has_cred) {
+            if (anc->has_cred && (sock->passcred || anc->cred_explicit)) {
                 if (emitted_cred) {
                     continue;
                 }
@@ -2561,7 +2616,7 @@ size_t unix_socket_recvmsg(uint64_t fd, struct msghdr *msg, int flags) {
 
         msg->msg_controllen = controllen_used;
     } else {
-        if (ancillary_list)
+        if (ancillary_deliverable)
             msg->msg_flags |= MSG_CTRUNC;
         msg->msg_controllen = 0;
     }
@@ -2590,13 +2645,27 @@ int socket_poll(vfs_node_t *node, size_t events) {
         mutex_unlock(&sock->lock);
     } else if (unix_socket_is_dgram_type(sock->type)) {
         mutex_lock(&sock->lock);
+        socket_t *peer = sock->peer;
         if ((events & EPOLLOUT) && !sock->closed && !sock->shut_wr)
             revents |= EPOLLOUT;
 
         if ((events & EPOLLIN) && skb_queue_packets(&sock->recv_queue) > 0)
             revents |= EPOLLIN;
+
         if (sock->closed || sock->shut_rd)
             revents |= EPOLLERR | EPOLLHUP;
+        if (!peer && sock->established)
+            revents |= EPOLLHUP;
+        else if (peer && mutex_trylock(&peer->lock)) {
+            if (peer->closed || peer->shut_wr) {
+                if (events & EPOLLIN)
+                    revents |= EPOLLIN;
+                if (events & EPOLLRDHUP)
+                    revents |= EPOLLRDHUP;
+                revents |= EPOLLHUP;
+            }
+            mutex_unlock(&peer->lock);
+        }
 
         mutex_unlock(&sock->lock);
     } else {
@@ -2939,8 +3008,8 @@ int unix_socket_pair(int domain, int type, int protocol, int *sv) {
         unix_socket_free(sock2);
         return -ENOMEM;
     }
-    sock1->node = file1->f_inode;
-    sock2->node = file2->f_inode;
+    sock1->node = vfs_igrab(file1->f_inode);
+    sock2->node = vfs_igrab(file2->f_inode);
 
     int fd1 = -1, fd2 = -1;
     int ret = task_install_file(current_task, file1,
@@ -3008,8 +3077,8 @@ size_t unix_socket_getpeername(uint64_t fd, struct sockaddr_un *addr,
 size_t unix_socket_setsockopt(uint64_t fd, int level, int optname,
                               const void *optval, socklen_t optlen) {
     if (level != SOL_SOCKET) {
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         return -ENOPROTOOPT;
     }
 
@@ -3102,8 +3171,8 @@ size_t unix_socket_setsockopt(uint64_t fd, int level, int optname,
         UNIX_SOCKET_SETSOCKOPT_RETURN(-ENOPROTOOPT); // 只读
 
     default:
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         UNIX_SOCKET_SETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 
@@ -3115,8 +3184,8 @@ size_t unix_socket_setsockopt(uint64_t fd, int level, int optname,
 size_t unix_socket_getsockopt(uint64_t fd, int level, int optname, void *optval,
                               socklen_t *optlen) {
     if (level != SOL_SOCKET) {
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         return -ENOPROTOOPT;
     }
 
@@ -3247,8 +3316,8 @@ size_t unix_socket_getsockopt(uint64_t fd, int level, int optname, void *optval,
         break;
 
     default:
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         UNIX_SOCKET_GETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 

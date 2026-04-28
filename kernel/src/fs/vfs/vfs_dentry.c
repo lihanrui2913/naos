@@ -90,17 +90,34 @@ struct vfs_dentry *vfs_d_alloc(struct vfs_super_block *sb,
     dentry->d_op = sb ? sb->s_d_op : NULL;
 
     if (name && name->name) {
-        dentry->d_name.name = strdup(name->name);
-        dentry->d_name.len = name->len;
-        dentry->d_name.hash = name->hash;
-        if (!dentry->d_name.name) {
+        if (name->len > VFS_NAME_MAX) {
+            if (parent)
+                vfs_dput(dentry->d_parent);
             free(dentry);
             return NULL;
         }
+        char *copy = malloc((size_t)name->len + 1);
+        if (!copy) {
+            if (parent)
+                vfs_dput(dentry->d_parent);
+            free(dentry);
+            return NULL;
+        }
+        memcpy(copy, name->name, name->len);
+        copy[name->len] = '\0';
+        dentry->d_name.name = copy;
+        dentry->d_name.len = name->len;
+        dentry->d_name.hash = name->hash;
     } else {
         dentry->d_name.name = strdup("");
         dentry->d_name.len = 0;
         dentry->d_name.hash = 0;
+        if (!dentry->d_name.name) {
+            if (parent)
+                vfs_dput(dentry->d_parent);
+            free(dentry);
+            return NULL;
+        }
     }
 
     if (!parent)

@@ -59,6 +59,7 @@ typedef struct unix_socket_ancillary {
     uint32_t file_count;
     struct ucred cred;
     bool has_cred;
+    bool cred_explicit;
     struct timeval timestamp;
     bool has_timestamp;
 } unix_socket_ancillary_t;

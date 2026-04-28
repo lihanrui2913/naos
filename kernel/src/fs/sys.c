@@ -685,9 +685,8 @@ vfs_node_t *sysfs_ensure_symlink_at(vfs_node_t *start, const char *path,
     char output[256] = {0};
     calculate_relative_path(output, abs, target, sizeof(output));
 
-    free(abs);
-
     entry = sysfs_ensure_entry(abs, S_IFLNK | 0777, output);
+    free(abs);
     return sysfs_export_entry(entry);
 }
 

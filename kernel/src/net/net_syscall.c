@@ -64,12 +64,7 @@ static int socket_alloc_copy_from_user(const void *user_ptr, size_t len,
     if (ret < 0)
         return ret;
 
-    if (!len) {
-        *out_buf = NULL;
-        return 0;
-    }
-
-    void *buf = malloc(len);
+    void *buf = malloc(len ?: 1);
     if (!buf)
         return -ENOMEM;
     if (copy_from_user(buf, user_ptr, len)) {

@@ -18,6 +18,8 @@
 #include <task/keyring.h>
 #include <task/ns.h>
 
+volatile unsigned long jiffies;
+
 sched_rq_t schedulers[MAX_CPU_NUM];
 
 spinlock_t task_queue_lock = SPIN_INIT;
@@ -1585,6 +1587,8 @@ int task_kill_process_group(int pgid, int sig) {
 }
 
 void schedule(uint64_t sched_flags) {
+    jiffies = (unsigned long)(nano_time() / (1000000000ULL / SCHED_HZ));
+
     bool state = arch_interrupt_enabled();
     task_t *prev = current_task;
 

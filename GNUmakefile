@@ -65,15 +65,9 @@ all: $(IMAGE_NAME).img rootfs-$(ARCH).img
 .PHONY: all
 all-single: single-$(IMAGE_NAME).img
 
-prepare: libgcc_$(ARCH).a liballoc_$(ARCH).a
+prepare: libgcc_$(ARCH).a
 	$(call PRINT_STEP,PREPARE,kernel/get-deps)
 	$(Q)./kernel/get-deps
-
-liballoc_$(ARCH).a:
-	$(call PRINT_STEP,GET,liballoc_$(ARCH).a)
-	$(Q)wget https://github.com/plos-clan/liballoc/releases/download/release/liballoc-$(ARCH).a -O liballoc_$(ARCH)_norenamed.a
-	$(call PRINT_STEP,OBJCOPY,liballoc_$(ARCH).a)
-	$(Q)$(OBJCOPY) --redefine-sym malloc=liballoc_malloc --redefine-sym realloc=liballoc_realloc --redefine-sym calloc=liballoc_calloc --redefine-sym aligned_alloc=liballoc_aligned_alloc --redefine-sym free=liballoc_free liballoc_$(ARCH)_norenamed.a liballoc_$(ARCH).a
 
 libgcc_$(ARCH).a:
 	$(call PRINT_STEP,GET,libgcc_$(ARCH).a)

@@ -212,7 +212,7 @@ uint32_t bpf_run(const struct sock_filter *prog, int proglen,
 
             switch (BPF_OP(code)) {
             case BPF_JA: // 无条件跳转
-                vm.pc += k;
+                vm.pc += k + 1;
                 continue;
             case BPF_JEQ:
                 cond = (vm.A == src);

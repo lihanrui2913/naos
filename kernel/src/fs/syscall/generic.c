@@ -1470,9 +1470,6 @@ uint64_t sys_read(uint64_t fd, void *buf, uint64_t len) {
     struct vfs_file *file;
     ssize_t ret;
 
-    if (!len) {
-        return 0;
-    }
     if (rw_validate_user_buffer(buf, len) < 0) {
         return (uint64_t)-EFAULT;
     }
@@ -1492,9 +1489,6 @@ uint64_t sys_write(uint64_t fd, const void *buf, uint64_t len) {
     struct vfs_file *file;
     ssize_t ret;
 
-    if (!len) {
-        return 0;
-    }
     if (rw_validate_user_buffer(buf, len) < 0) {
         return (uint64_t)-EFAULT;
     }
@@ -1836,7 +1830,7 @@ uint64_t sys_readv(uint64_t fd, struct iovec *iovec, uint64_t count) {
 
     ssize_t total_read = 0;
     for (uint64_t i = 0; i < count; i++) {
-        if (kiov[i].iov_base == NULL || kiov[i].len == 0)
+        if (kiov[i].iov_base == NULL)
             continue;
 
         ssize_t ret = vfs_read_file(file, kiov[i].iov_base, kiov[i].len, NULL);
@@ -1899,7 +1893,7 @@ uint64_t sys_writev(uint64_t fd, struct iovec *iovec, uint64_t count) {
 
     ssize_t total_written = 0;
     for (uint64_t i = 0; i < count; i++) {
-        if (kiov[i].iov_base == NULL || kiov[i].len == 0)
+        if (kiov[i].iov_base == NULL)
             continue;
 
         ssize_t ret = vfs_write_file(file, kiov[i].iov_base, kiov[i].len, NULL);

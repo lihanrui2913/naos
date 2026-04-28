@@ -3055,15 +3055,15 @@ size_t netlink_getsockopt(uint64_t fd, int level, int optname, void *optval,
             *optlen = sizeof(int);
             break;
         default:
-            printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-                   __LINE__, level, optname);
+            // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+            //        __LINE__, level, optname);
             NETLINK_GETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else if (level == SOL_NETLINK) {
         NETLINK_GETSOCKOPT_RETURN(0);
     } else {
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         NETLINK_GETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 
@@ -3153,8 +3153,8 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
             }
             break;
         default:
-            printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-                   __LINE__, level, optname);
+            // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+            //        __LINE__, level, optname);
             NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else if (level == SOL_NETLINK) {
@@ -3185,13 +3185,13 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
             // TODO
             NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         default:
-            printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-                   __LINE__, level, optname);
+            // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+            //        __LINE__, level, optname);
             NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
         }
     } else {
-        printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
-               __LINE__, level, optname);
+        // printk("%s:%d Unsupported optlevel or optname %d %d\n", __FILE__,
+        //        __LINE__, level, optname);
         NETLINK_SETSOCKOPT_RETURN(-ENOPROTOOPT);
     }
 
@@ -3362,7 +3362,7 @@ size_t netlink_sendmsg(uint64_t fd, const struct msghdr *msg, int flags) {
         if (sock) {
             spin_lock(&sock->lock);
             delivered = netlink_deliver_to_socket(sock, buffer, total_len,
-                                                  sender_pid, sender_groups);
+                                                  sender_pid, 0);
             spin_unlock(&sock->lock);
         }
         spin_unlock(&netlink_sockets_lock);
@@ -3425,7 +3425,7 @@ size_t netlink_sendto(uint64_t fd, uint8_t *in, size_t limit, int flags,
         if (sock) {
             spin_lock(&sock->lock);
             delivered = netlink_deliver_to_socket(sock, (char *)in, limit,
-                                                  sender_pid, sender_groups);
+                                                  sender_pid, 0);
             spin_unlock(&sock->lock);
         }
         spin_unlock(&netlink_sockets_lock);
@@ -3608,7 +3608,7 @@ int netlink_socket(int domain, int type, int protocol) {
         return ret;
     }
 
-    nl_sk->node = file->f_inode;
+    nl_sk->node = vfs_igrab(file->f_inode);
     ret = task_install_file(current_task, file,
                             (type & O_CLOEXEC) ? FD_CLOEXEC : 0, 0);
     vfs_file_put(file);
@@ -3733,7 +3733,11 @@ static void netlink_handle_release(socket_handle_t *handle) {
 
     struct netlink_sock *nl_sk = handle->sock;
     if (nl_sk != NULL) {
-        nl_sk->node = NULL;
+        if (nl_sk->node) {
+            vfs_node_t *node = nl_sk->node;
+            nl_sk->node = NULL;
+            vfs_iput(node);
+        }
         // Remove from global socket array
         spin_lock(&netlink_sockets_lock);
         for (int i = 0; i < MAX_NETLINK_SOCKETS; i++) {

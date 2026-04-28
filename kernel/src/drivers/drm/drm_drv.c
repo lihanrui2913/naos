@@ -428,19 +428,6 @@ static void drm_device_setup_sysfs(int major, int card_minor, int render_minor,
         return;
     }
 
-    vfs_node_t *card_root =
-        sysfs_regist_dev('c', major, card_minor, "", card_dev_name,
-                         "SUBSYSTEM=drm\nDEVTYPE=drm_minor\n", NULL, NULL, NULL,
-                         pci_device_path);
-    vfs_node_t *card_root_dev = sysfs_child_append(card_root, "dev", false);
-    char devnum_content[32];
-    sprintf(devnum_content, "%d:%d\n", major, card_minor);
-    sysfs_write_node(card_root_dev, devnum_content, strlen(devnum_content), 0);
-
-    sysfs_child_append_symlink(card_root, "device", pci_device_path);
-
-    vfs_iput(card_root);
-
     vfs_node_t *drm_dir = sysfs_child_append(pci_device_dir, "drm", true);
 
     char content[128];
@@ -451,76 +438,30 @@ static void drm_device_setup_sysfs(int major, int card_minor, int render_minor,
 
     char card_node_name[16];
     sprintf(card_node_name, "card%d", card_minor);
-    vfs_node_t *card_node = sysfs_child_append(drm_dir, card_node_name, true);
-    vfs_node_t *card_node_dev = sysfs_child_append(card_node, "dev", false);
-    sysfs_write_node(card_node_dev, devnum_content, strlen(devnum_content), 0);
-
-    vfs_node_t *card_uevent = sysfs_child_append(card_node, "uevent", false);
-    sprintf(content,
-            "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/%s\nSUBSYSTEM=drm\nDEVTYPE="
-            "drm_minor\n",
-            major, card_minor, card_node_name);
-    sysfs_write_node(card_uevent, content, strlen(content), 0);
-    sysfs_child_append_symlink(card_node, "subsystem", "/sys/class/drm");
-    sysfs_child_append_symlink(card_node, "device", pci_device_path);
-
-    vfs_node_t *class_drm = sysfs_ensure_dir("/sys/class/drm");
-
     char card_path[256];
     sprintf(card_path, "%s/drm/%s", pci_device_path, card_node_name);
-    sysfs_child_append_symlink(class_drm, card_node_name, card_path);
+    vfs_node_t *card_node =
+        sysfs_regist_dev('c', major, card_minor, card_path, card_dev_name,
+                         "SUBSYSTEM=drm\nDEVTYPE=drm_minor\n", "/sys/class/drm",
+                         "/sys/class/drm", card_node_name, pci_device_path);
 
     if (has_render_node) {
-        vfs_node_t *render_root =
-            sysfs_regist_dev('c', major, render_minor, "", render_dev_name,
-                             "SUBSYSTEM=drm\nDEVTYPE=drm_minor\n", NULL, NULL,
-                             NULL, pci_device_path);
-        vfs_node_t *render_root_dev =
-            sysfs_child_append(render_root, "dev", false);
-        sprintf(devnum_content, "%d:%d\n", major, render_minor);
-        sysfs_write_node(render_root_dev, devnum_content,
-                         strlen(devnum_content), 0);
-
-        sysfs_child_append_symlink(render_root, "device", pci_device_path);
-
-        vfs_iput(render_root);
-
         char render_node_name[16];
         sprintf(render_node_name, "renderD%d", render_minor);
-        vfs_node_t *render_node =
-            sysfs_child_append(drm_dir, render_node_name, true);
-        vfs_node_t *render_node_dev =
-            sysfs_child_append(render_node, "dev", false);
-        sysfs_write_node(render_node_dev, devnum_content,
-                         strlen(devnum_content), 0);
-        vfs_node_t *render_uevent =
-            sysfs_child_append(render_node, "uevent", false);
-        sprintf(content,
-                "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/%s\nSUBSYSTEM=drm\nDEVTYPE="
-                "drm_minor\n",
-                major, render_minor, render_node_name);
-        sysfs_write_node(render_uevent, content, strlen(content), 0);
-        sysfs_child_append_symlink(render_node, "subsystem", "/sys/class/drm");
-        sysfs_child_append_symlink(render_node, "device", pci_device_path);
-
         char render_path[256];
         sprintf(render_path, "%s/drm/%s", pci_device_path, render_node_name);
-        sysfs_child_append_symlink(class_drm, render_node_name, render_path);
+        vfs_node_t *render_node = sysfs_regist_dev(
+            'c', major, render_minor, render_path, render_dev_name,
+            "SUBSYSTEM=drm\nDEVTYPE=drm_minor\n", "/sys/class/drm",
+            "/sys/class/drm", render_node_name, pci_device_path);
 
-        vfs_iput(render_root_dev);
         vfs_iput(render_node);
-        vfs_iput(render_node_dev);
-        vfs_iput(render_uevent);
     }
 
     vfs_iput(pci_device_dir);
-    vfs_iput(card_root_dev);
     vfs_iput(drm_dir);
     vfs_iput(version);
     vfs_iput(card_node);
-    vfs_iput(card_node_dev);
-    vfs_iput(card_uevent);
-    vfs_iput(class_drm);
 }
 
 static int drm_id = 0;

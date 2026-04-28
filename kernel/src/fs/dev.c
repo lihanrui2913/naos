@@ -1143,7 +1143,7 @@ static bool input_event_queue_has_data(dev_input_event_t *event) {
 }
 
 ssize_t inputdev_event_read(void *data, void *buf, uint64_t offset,
-                            uint64_t len, uint64_t flags) {
+                            uint64_t len, fd_t *fd) {
     dev_input_event_t *event = data;
     (void)offset;
     if (!event || !buf)
@@ -1161,9 +1161,13 @@ ssize_t inputdev_event_read(void *data, void *buf, uint64_t offset,
         size_t cnt = input_event_queue_pop(event, events, max_events);
         if (cnt > 0)
             return cnt * sizeof(struct input_event);
-        if (flags & O_NONBLOCK)
+        if (fd && (fd_get_flags(fd) & O_NONBLOCK))
             return -EWOULDBLOCK;
-        return 0;
+
+        vfs_node_t *wait_node = fd && fd->node ? fd->node : event->devnode;
+        int reason = inputdev_wait_node(wait_node, EPOLLIN, "input_read");
+        if (reason != EOK)
+            return reason < 0 ? reason : -EINTR;
     }
 }
 
@@ -1213,7 +1217,7 @@ ssize_t inputdev_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
     }
     case 0x07: {
         int to_copy = MIN(size, (size_t)strlen(event->physloc) + 1);
-        if (to_copy && (!arg || copy_to_user((void *)arg, event->devname,
+        if (to_copy && (!arg || copy_to_user((void *)arg, event->physloc,
                                              (size_t)to_copy)))
             return -EFAULT;
         ret = to_copy;
@@ -1278,6 +1282,16 @@ void devfs_register_device(device_t *device) {
     vfs_mknodat(AT_FDCWD, path,
                 0600 | (device->type == DEV_BLOCK ? S_IFBLK : S_IFCHR),
                 device->dev);
+
+    if (device->subtype == DEV_INPUT && device->ptr) {
+        dev_input_event_t *event = device->ptr;
+        vfs_node_t *inode = devtmpfs_lookup_inode_path(path, LOOKUP_FOLLOW);
+        if (inode) {
+            if (event->devnode)
+                vfs_iput(event->devnode);
+            event->devnode = inode;
+        }
+    }
 
     if (device->type == DEV_BLOCK && device->ptr) {
         vfs_node_t *inode = devtmpfs_lookup_inode_path(path, LOOKUP_FOLLOW);

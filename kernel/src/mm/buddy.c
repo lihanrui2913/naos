@@ -315,7 +315,7 @@ static bool percpu_push(zone_t *zone, uintptr_t addr) {
         return false;
 
     per_cpu_pages_t *pcp = &per_cpu_pagesets[current_cpu_id];
-    page_t *page = get_page(addr);
+    page_t *page = get_page_by_addr(addr);
     const uint64_t pfn = phys_to_pfn(addr);
     bool need_drain = false;
 
@@ -529,12 +529,12 @@ void add_memory_region(uintptr_t start, uintptr_t end, enum zone_type type) {
 
 static bool claim_last_page_refs(uintptr_t addr, size_t pages) {
     for (size_t offset = 0; offset < pages; offset++) {
-        page_t *page = get_page(addr + offset * PAGE_SIZE);
+        page_t *page = get_page_by_addr(addr + offset * PAGE_SIZE);
         if (page && page_try_release_last(page))
             continue;
 
         for (size_t rollback = 0; rollback < offset; rollback++)
-            page_ref(get_page(addr + rollback * PAGE_SIZE));
+            page_ref(get_page_by_addr(addr + rollback * PAGE_SIZE));
         return false;
     }
 
@@ -543,7 +543,7 @@ static bool claim_last_page_refs(uintptr_t addr, size_t pages) {
 
 static bool pages_are_unreferenced(uintptr_t addr, size_t pages) {
     for (size_t offset = 0; offset < pages; offset++) {
-        page_t *page = get_page(addr + offset * PAGE_SIZE);
+        page_t *page = get_page_by_addr(addr + offset * PAGE_SIZE);
         if (!page || page_refcount_read(page) != 0)
             return false;
     }
@@ -584,14 +584,14 @@ uintptr_t alloc_frames(size_t count) {
         ASSERT(!"Out of memory");
 
     for (size_t offset = 0; offset < required_pages; offset++) {
-        page_t *page = get_page(addr + offset * PAGE_SIZE);
+        page_t *page = get_page_by_addr(addr + offset * PAGE_SIZE);
         if (page) {
             page_mark_allocated(page, ZONE_NORMAL, MIN_ORDER);
             page_ref(page);
         }
     }
 
-    page_t *head = get_page(addr);
+    page_t *head = get_page_by_addr(addr);
     if (head)
         head->buddy_order =
             (uint8_t)(MIN_ORDER + __builtin_ctzll(required_pages));
@@ -642,7 +642,7 @@ static void free_frames_common(uintptr_t addr, size_t count,
             return;
     }
 
-    page_t *head = get_page(addr);
+    page_t *head = get_page_by_addr(addr);
     if (!head)
         return;
     if (head->flags & (PAGE_FLAG_BUDDY | PAGE_FLAG_PCPU))

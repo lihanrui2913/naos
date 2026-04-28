@@ -3,7 +3,6 @@
 #include <init/callbacks.h>
 #include <drivers/logger.h>
 #include <mm/mm.h>
-#include <mm/heap.h>
 #include <arch/arch.h>
 #include <irq/irq_manager.h>
 #include <dev/device.h>
@@ -178,8 +177,6 @@ void kmain(void) {
     frame_init();
 
     page_table_init();
-
-    heap_init_alloc();
 
     irq_manager_init();
 

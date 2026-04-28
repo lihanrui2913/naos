@@ -3,6 +3,7 @@
 #include <fs/vfs/cgroup/cgroupfs.h>
 #include <init/callbacks.h>
 #include <libs/string_builder.h>
+#include <mm/fault.h>
 #include <mm/mm.h>
 #include <task/sched.h>
 #include <task/keyring.h>
@@ -255,6 +256,65 @@ static int sync_task_user_instruction_memory(task_t *task, uint64_t uaddr,
     return 0;
 }
 
+static uint64_t task_user_translate_access(task_t *task, uint64_t uaddr,
+                                           bool write) {
+    if (!task || !task->mm || !uaddr)
+        return 0;
+
+    uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
+    uint64_t indexs[ARCH_MAX_PT_LEVEL];
+    for (uint64_t i = 0; i < ARCH_MAX_PT_LEVEL; i++)
+        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(uaddr, i + 1);
+
+    for (uint64_t i = 0; i < ARCH_MAX_PT_LEVEL - 1; i++) {
+        uint64_t entry = pgdir[indexs[i]];
+        if (ARCH_PT_IS_LARGE(entry)) {
+            uint64_t flags = ARCH_READ_PTE_FLAG(entry);
+            if (!(flags & ARCH_PT_FLAG_USER))
+                return 0;
+#if !defined(__aarch64__)
+            if (write && !(flags & ARCH_PT_FLAG_WRITEABLE))
+                return 0;
+#endif
+            return (ARCH_READ_PTE(entry) & ~PAGE_CALC_PAGE_TABLE_MASK(i + 1)) +
+                   (uaddr & PAGE_CALC_PAGE_TABLE_MASK(i + 1));
+        }
+        if (!ARCH_PT_IS_TABLE(entry))
+            return 0;
+        pgdir = (uint64_t *)phys_to_virt(ARCH_READ_PTE(entry));
+    }
+
+    uint64_t pte = pgdir[indexs[ARCH_MAX_PT_LEVEL - 1]];
+    if (!(pte & ARCH_PT_FLAG_VALID))
+        return 0;
+
+    uint64_t flags = ARCH_READ_PTE_FLAG(pte);
+    if (!(flags & ARCH_PT_FLAG_USER))
+        return 0;
+#if !defined(__aarch64__)
+    if (write && !(flags & ARCH_PT_FLAG_WRITEABLE))
+        return 0;
+#endif
+
+    return ARCH_READ_PTE(pte) +
+           (uaddr & PAGE_CALC_PAGE_TABLE_MASK(ARCH_MAX_PT_LEVEL));
+}
+
+static uint64_t task_user_translate_or_fault(task_t *task, uint64_t uaddr,
+                                             bool write) {
+    uint64_t pa = task_user_translate_access(task, uaddr, write);
+    if (pa)
+        return pa;
+
+    if (handle_page_fault_flags(task, uaddr,
+                                write ? PF_ACCESS_WRITE : PF_ACCESS_READ) !=
+        PF_RES_OK) {
+        return 0;
+    }
+
+    return task_user_translate_access(task, uaddr, write);
+}
+
 int write_task_user_memory(task_t *task, uint64_t uaddr, const void *src,
                            size_t size) {
     if (!task || !task->arch_context || !task->mm)
@@ -264,13 +324,12 @@ int write_task_user_memory(task_t *task, uint64_t uaddr, const void *src,
     if (check_user_overflow(uaddr, size))
         return -EFAULT;
 
-    uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
     const uint8_t *in = (const uint8_t *)src;
     uint64_t va = uaddr;
     size_t remain = size;
 
     while (remain > 0) {
-        uint64_t pa = translate_address(pgdir, va);
+        uint64_t pa = task_user_translate_or_fault(task, va, true);
         if (!pa)
             return -EFAULT;
 
@@ -295,13 +354,12 @@ int read_task_user_memory(task_t *task, uint64_t uaddr, void *dst,
     if (check_user_overflow(uaddr, size))
         return -EFAULT;
 
-    uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
     uint8_t *out = (uint8_t *)dst;
     uint64_t va = uaddr;
     size_t remain = size;
 
     while (remain > 0) {
-        uint64_t pa = translate_address(pgdir, va);
+        uint64_t pa = task_user_translate_or_fault(task, va, false);
         if (!pa)
             return -EFAULT;
 
@@ -847,6 +905,10 @@ size_t task_reap_deferred(size_t budget) {
     return reaped;
 }
 
+#define TASK_EXEC_MAX_ARGS 4096
+#define TASK_EXEC_MAX_ARG_STRLEN VFS_PATH_MAX
+#define TASK_EXEC_MAX_PHDRS 128
+
 static void task_execve_free_string_array(char **strings, int count) {
     if (!strings) {
         return;
@@ -859,6 +921,29 @@ static void task_execve_free_string_array(char **strings, int count) {
     }
 
     free(strings);
+}
+
+static int task_execve_read_user_string_ptr(const char **strings, int index,
+                                            const char **out) {
+    if (!strings || !out || index < 0)
+        return -EINVAL;
+    memcpy(out, &strings[index], sizeof(*out));
+    return 0;
+}
+
+static int task_execve_copy_user_string(const char *user, char **out) {
+    char *copy;
+
+    if (!user || !out)
+        return -EINVAL;
+
+    copy = calloc(1, TASK_EXEC_MAX_ARG_STRLEN);
+    if (!copy)
+        return -ENOMEM;
+    memcpy(copy, user, TASK_EXEC_MAX_ARG_STRLEN);
+
+    *out = copy;
+    return 0;
 }
 
 typedef struct task_execve_creds {
@@ -1344,8 +1429,17 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
     }
 
     char **new_argv = (char **)malloc((argv_count + 1) * sizeof(char *));
+    if (!new_argv) {
+        vfs_close_file(exec_file);
+        return (uint64_t)-ENOMEM;
+    }
     memset(new_argv, 0, (argv_count + 1) * sizeof(char *));
     char **new_envp = (char **)malloc((envp_count + 1) * sizeof(char *));
+    if (!new_envp) {
+        free(new_argv);
+        vfs_close_file(exec_file);
+        return (uint64_t)-ENOMEM;
+    }
     memset(new_envp, 0, (envp_count + 1) * sizeof(char *));
 
     argv_count = 0;
@@ -1593,16 +1687,29 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
     task_execve_creds_t exec_creds = task_execve_prepare_creds(self, exec_file);
 
     Elf64_Phdr *phdr;
-    size_t phdr_size = ehdr->e_phnum * sizeof(Elf64_Phdr);
+    size_t phdr_size = (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
     bool phdr_allocated = false;
 
     if (ehdr->e_phoff + phdr_size <= sizeof(header_buf)) {
         phdr = (Elf64_Phdr *)(header_buf + ehdr->e_phoff);
     } else {
         phdr = (Elf64_Phdr *)malloc(phdr_size);
+        if (!phdr) {
+            task_execve_free_string_array(new_argv, argv_count);
+            task_execve_free_string_array(new_envp, envp_count);
+            vfs_close_file(exec_file);
+            return (uint64_t)-ENOMEM;
+        }
         phdr_allocated = true;
         loff_t phdr_pos = (loff_t)ehdr->e_phoff;
-        vfs_read_file(exec_file, phdr, phdr_size, &phdr_pos);
+        if (vfs_read_file(exec_file, phdr, phdr_size, &phdr_pos) !=
+            (ssize_t)phdr_size) {
+            free(phdr);
+            task_execve_free_string_array(new_argv, argv_count);
+            task_execve_free_string_array(new_envp, envp_count);
+            vfs_close_file(exec_file);
+            return (uint64_t)-ENOEXEC;
+        }
     }
 
     shm_exec(self);
@@ -1646,12 +1753,23 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
         if (phdr[i].p_type == PT_INTERP) {
             char interp_name[128];
             loff_t interp_pos = (loff_t)phdr[i].p_offset;
-            vfs_read_file(exec_file, interp_name,
-                          phdr[i].p_filesz < 256 ? phdr[i].p_filesz : 255,
-                          &interp_pos);
-            interp_name[phdr[i].p_filesz < 256 ? phdr[i].p_filesz : 255] = '\0';
+            if (phdr[i].p_filesz == 0 ||
+                phdr[i].p_filesz >= sizeof(interp_name)) {
+                exec_fail_ret = (uint64_t)-ENOEXEC;
+                goto exec_fail_restore_mm;
+            }
+            if (vfs_read_file(exec_file, interp_name, phdr[i].p_filesz,
+                              &interp_pos) != (ssize_t)phdr[i].p_filesz) {
+                exec_fail_ret = (uint64_t)-ENOEXEC;
+                goto exec_fail_restore_mm;
+            }
+            interp_name[phdr[i].p_filesz] = '\0';
 
             interpreter_path = strdup(interp_name);
+            if (!interpreter_path) {
+                exec_fail_ret = (uint64_t)-ENOMEM;
+                goto exec_fail_restore_mm;
+            }
 
             struct vfs_file *interpreter_file = NULL;
             if (vfs_openat(AT_FDCWD, interp_name, &exec_how,
@@ -1663,14 +1781,37 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
 
             Elf64_Ehdr interp_ehdr;
             loff_t interp_hdr_pos = 0;
-            vfs_read_file(interpreter_file, &interp_ehdr, sizeof(Elf64_Ehdr),
-                          &interp_hdr_pos);
+            if (vfs_read_file(interpreter_file, &interp_ehdr,
+                              sizeof(Elf64_Ehdr),
+                              &interp_hdr_pos) != (ssize_t)sizeof(Elf64_Ehdr) ||
+                !arch_check_elf(&interp_ehdr) ||
+                interp_ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
+                interp_ehdr.e_phnum == 0 ||
+                interp_ehdr.e_phnum > TASK_EXEC_MAX_PHDRS ||
+                interp_ehdr.e_phoff >
+                    UINT64_MAX -
+                        (uint64_t)interp_ehdr.e_phnum * sizeof(Elf64_Phdr)) {
+                vfs_close_file(interpreter_file);
+                exec_fail_ret = (uint64_t)-ENOEXEC;
+                goto exec_fail_restore_mm;
+            }
 
-            size_t interp_phdr_size = interp_ehdr.e_phnum * sizeof(Elf64_Phdr);
+            size_t interp_phdr_size =
+                (size_t)interp_ehdr.e_phnum * sizeof(Elf64_Phdr);
             Elf64_Phdr *interp_phdr = (Elf64_Phdr *)malloc(interp_phdr_size);
+            if (!interp_phdr) {
+                vfs_close_file(interpreter_file);
+                exec_fail_ret = (uint64_t)-ENOMEM;
+                goto exec_fail_restore_mm;
+            }
             loff_t interp_phdr_pos = (loff_t)interp_ehdr.e_phoff;
-            vfs_read_file(interpreter_file, interp_phdr, interp_phdr_size,
-                          &interp_phdr_pos);
+            if (vfs_read_file(interpreter_file, interp_phdr, interp_phdr_size,
+                              &interp_phdr_pos) != (ssize_t)interp_phdr_size) {
+                free(interp_phdr);
+                vfs_close_file(interpreter_file);
+                exec_fail_ret = (uint64_t)-ENOEXEC;
+                goto exec_fail_restore_mm;
+            }
 
             for (int j = 0; j < interp_ehdr.e_phnum; j++) {
                 if (interp_phdr[j].p_type != PT_LOAD)

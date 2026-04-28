@@ -21,7 +21,7 @@ extern page_t *page_maps;
 
 void page_init();
 
-page_t *get_page(uint64_t addr);
+page_t *get_page_by_addr(uint64_t addr);
 
 int page_refcount_read(page_t *page);
 void page_ref(page_t *page);

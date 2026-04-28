@@ -16,7 +16,9 @@ void page_init() {
     memset(page_maps, 0, page_maps_size);
 }
 
-page_t *get_page(uint64_t addr) { return page_maps + (addr / PAGE_SIZE); }
+page_t *get_page_by_addr(uint64_t addr) {
+    return page_maps + (addr / PAGE_SIZE);
+}
 
 int page_refcount_read(page_t *page) {
     if (!page)
@@ -76,15 +78,16 @@ bool address_ref(uint64_t addr) {
     if (!address_is_managed(addr))
         return true;
 
-    return page_try_ref(get_page(addr));
+    return page_try_ref(get_page_by_addr(addr));
 }
 void address_unref(uint64_t addr) {
     if (address_is_managed(addr))
-        page_unref(get_page(addr));
+        page_unref(get_page_by_addr(addr));
 }
 
 bool address_can_free(uint64_t addr) {
-    return address_is_managed(addr) ? page_can_free(get_page(addr)) : false;
+    return address_is_managed(addr) ? page_can_free(get_page_by_addr(addr))
+                                    : false;
 }
 
 bool address_is_managed(uint64_t addr) {
@@ -102,7 +105,7 @@ void address_release(uint64_t addr) {
     if (!address_is_managed(addr))
         return;
 
-    page_t *page = get_page(addr);
+    page_t *page = get_page_by_addr(addr);
     if (!page)
         return;
 

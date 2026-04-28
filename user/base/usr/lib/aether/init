@@ -17,12 +17,6 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 export WLR_RENDERER=pixman
 
-mkdir -p /run/udev/data/c226:0
-mkdir -p /run/udev/data/c13:0
-mkdir -p /run/udev/data/c13:1
-mkdir -p /run/udev/data/c13:2
-mkdir -p /run/udev/data/c13:3
-
 mkdir -p /tmp/.X11-unix
 mkdir -p /tmp/.ICE-unix
 mkdir -p $HOME/.config/dconf
@@ -37,10 +31,12 @@ chmod 0700 $XDG_RUNTIME_DIR
 dbus-daemon --system --fork
 dbus-uuidgen --ensure
 
-udevd &
+udevd --daemon
 
 while [ ! -e "/run/udev/control" ]; do
-    sleep 0.1
+    sleep 0.5
 done
+
+udevadm settle
 
 exec dbus-run-session -- seatd-launch -- startxfce4 --wayland

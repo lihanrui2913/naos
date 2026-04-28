@@ -304,6 +304,14 @@ dev_input_event_t *regist_input_dev(const char *device_name,
     input_event->clock_id = CLOCK_MONOTONIC;
     strncpy(input_event->uniq, device_name, sizeof(input_event->uniq));
     input_event->devname = strdup(device_name);
+    input_event->physloc = strdup("");
+    if (!input_event->devname || !input_event->physloc) {
+        free(input_event->devname);
+        free(input_event->physloc);
+        free(input_event);
+        spin_unlock(&inputdev_regist_lock);
+        return NULL;
+    }
     input_event->event_queue_capacity =
         INPUT_EVENT_RING_SIZE / sizeof(struct input_event);
     if (input_event->event_queue_capacity == 0) {
@@ -313,6 +321,7 @@ dev_input_event_t *regist_input_dev(const char *device_name,
         calloc(input_event->event_queue_capacity, sizeof(struct input_event));
     if (!input_event->event_queue) {
         free(input_event->devname);
+        free(input_event->physloc);
         free(input_event);
         spin_unlock(&inputdev_regist_lock);
         return NULL;
@@ -325,6 +334,7 @@ dev_input_event_t *regist_input_dev(const char *device_name,
                                   inputdev_event_write, NULL);
     if (!dev) {
         free(input_event->devname);
+        free(input_event->physloc);
         free(input_event->event_queue);
         free(input_event);
         spin_unlock(&inputdev_regist_lock);
@@ -369,6 +379,12 @@ dev_input_event_t *regist_input_dev(const char *device_name,
             sprintf(sysfs_path, "/sys/devices/usb/input/%s/%s", input_dirname,
                     dirname);
         }
+    }
+
+    char *physloc = strdup(input_dir_path);
+    if (physloc) {
+        free(input_event->physloc);
+        input_event->physloc = physloc;
     }
 
     vfs_node_t *node = sysfs_regist_dev(

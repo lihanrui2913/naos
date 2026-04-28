@@ -48,17 +48,19 @@ static int poll_scan_ready(struct pollfd *fds, int nfds) {
     int ready = 0;
 
     for (int i = 0; i < nfds; i++) {
+        struct vfs_file *file;
+
         fds[i].revents = 0;
         if (fds[i].fd < 0)
             continue;
-        if (fds[i].fd >= MAX_FD_NUM ||
-            !current_task->fd_info->fds[fds[i].fd].file) {
+
+        file = task_get_file(current_task, fds[i].fd);
+        if (!file) {
             fds[i].revents |= POLLNVAL;
             ready++;
             continue;
         }
 
-        struct vfs_file *file = current_task->fd_info->fds[fds[i].fd].file;
         uint32_t query_events = poll_to_epoll_comp(fds[i].events) | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
         int polled = EPOLLNVAL;
@@ -72,6 +74,7 @@ static int poll_scan_ready(struct pollfd *fds, int nfds) {
             fds[i].revents = revents;
             ready++;
         }
+        vfs_file_put(file);
     }
 
     return ready;
@@ -80,16 +83,22 @@ static int poll_scan_ready(struct pollfd *fds, int nfds) {
 static void poll_arm_waiters(struct pollfd *fds, int nfds,
                              vfs_poll_wait_t *waits) {
     for (int i = 0; i < nfds; i++) {
+        struct vfs_file *file;
+        vfs_node_t *node;
+
         if (fds[i].fd < 0)
             continue;
-        if (fds[i].fd >= MAX_FD_NUM ||
-            !current_task->fd_info->fds[fds[i].fd].file)
+
+        file = task_get_file(current_task, fds[i].fd);
+        if (!file)
             continue;
-        vfs_node_t *node = current_task->fd_info->fds[fds[i].fd].file->node;
+
+        node = file->node;
         uint32_t query_events = poll_to_epoll_comp(fds[i].events) | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
         vfs_poll_wait_init(&waits[i], current_task, query_events);
         vfs_poll_wait_arm(node, &waits[i]);
+        vfs_file_put(file);
     }
 }
 
@@ -295,9 +304,14 @@ uint64_t sys_ppoll(struct pollfd *fds, uint64_t nfds,
 static inline struct pollfd *select_add(struct pollfd **comp, size_t *compIndex,
                                         size_t *complength, int fd,
                                         int events) {
-    if ((*compIndex + 1) * sizeof(struct pollfd) >= *complength) {
+    if ((*compIndex + 1) * sizeof(struct pollfd) > *complength) {
+        struct pollfd *new_comp;
+
         *complength *= 2;
-        *comp = realloc(*comp, *complength);
+        new_comp = realloc(*comp, *complength);
+        if (!new_comp)
+            return NULL;
+        *comp = new_comp;
     }
 
     (*comp)[*compIndex].fd = fd;
@@ -322,36 +336,74 @@ static inline void select_bitmap_set(uint8_t *map, int index) {
 
 size_t sys_select(int nfds, uint8_t *read, uint8_t *write, uint8_t *except,
                   struct timeval *timeout) {
-    size_t complength = sizeof(struct pollfd) * nfds * 8;
+    if (nfds < 0 || nfds > MAX_FD_NUM)
+        return (size_t)-EINVAL;
+
+    size_t bitmap_bytes = ((size_t)nfds + 7) / 8;
+    if ((read && check_user_overflow((uint64_t)read, bitmap_bytes)) ||
+        (write && check_user_overflow((uint64_t)write, bitmap_bytes)) ||
+        (except && check_user_overflow((uint64_t)except, bitmap_bytes))) {
+        return (size_t)-EFAULT;
+    }
+
+    uint8_t *kread = NULL;
+    uint8_t *kwrite = NULL;
+    uint8_t *kexcept = NULL;
+    if (bitmap_bytes) {
+        if (read) {
+            kread = calloc(1, bitmap_bytes);
+            if (!kread)
+                return (size_t)-ENOMEM;
+            if (copy_from_user(kread, read, bitmap_bytes))
+                goto fault;
+        }
+        if (write) {
+            kwrite = calloc(1, bitmap_bytes);
+            if (!kwrite)
+                goto nomem;
+            if (copy_from_user(kwrite, write, bitmap_bytes))
+                goto fault;
+        }
+        if (except) {
+            kexcept = calloc(1, bitmap_bytes);
+            if (!kexcept)
+                goto nomem;
+            if (copy_from_user(kexcept, except, bitmap_bytes))
+                goto fault;
+        }
+    }
+
+    size_t complength = sizeof(struct pollfd) * MAX((size_t)nfds * 3, 1);
     struct pollfd *comp = (struct pollfd *)malloc(complength);
+    if (!comp)
+        goto nomem;
     size_t compIndex = 0;
-    if (read) {
+    if (kread) {
         for (int i = 0; i < nfds; i++) {
-            if (select_bitmap(read, i))
+            if (select_bitmap(kread, i))
                 select_add(&comp, &compIndex, &complength, i, POLLIN);
         }
     }
-    if (write) {
+    if (kwrite) {
         for (int i = 0; i < nfds; i++) {
-            if (select_bitmap(write, i))
+            if (select_bitmap(kwrite, i))
                 select_add(&comp, &compIndex, &complength, i, POLLOUT);
         }
     }
-    if (except) {
+    if (kexcept) {
         for (int i = 0; i < nfds; i++) {
-            if (select_bitmap(except, i))
+            if (select_bitmap(kexcept, i))
                 select_add(&comp, &compIndex, &complength, i,
                            POLLPRI | POLLERR);
         }
     }
 
-    int toZero = (nfds + 7) / 8;
-    if (read)
-        memset(read, 0, toZero);
-    if (write)
-        memset(write, 0, toZero);
-    if (except)
-        memset(except, 0, toZero);
+    if (kread)
+        memset(kread, 0, bitmap_bytes);
+    if (kwrite)
+        memset(kwrite, 0, bitmap_bytes);
+    if (kexcept)
+        memset(kexcept, 0, bitmap_bytes);
 
     size_t res = do_poll(
         comp, compIndex,
@@ -360,6 +412,9 @@ size_t sys_select(int nfds, uint8_t *read, uint8_t *write, uint8_t *except,
 
     if ((int64_t)res < 0) {
         free(comp);
+        free(kread);
+        free(kwrite);
+        free(kexcept);
         return res;
     }
 
@@ -367,38 +422,65 @@ size_t sys_select(int nfds, uint8_t *read, uint8_t *write, uint8_t *except,
     for (size_t i = 0; i < compIndex; i++) {
         if (!comp[i].revents)
             continue;
-        if (comp[i].events & POLLIN && comp[i].revents & POLLIN) {
-            select_bitmap_set(read, comp[i].fd);
+        if (kread && comp[i].events & POLLIN && comp[i].revents & POLLIN) {
+            select_bitmap_set(kread, comp[i].fd);
             verify++;
         }
-        if (comp[i].events & POLLOUT && comp[i].revents & POLLOUT) {
-            select_bitmap_set(write, comp[i].fd);
+        if (kwrite && comp[i].events & POLLOUT && comp[i].revents & POLLOUT) {
+            select_bitmap_set(kwrite, comp[i].fd);
             verify++;
         }
-        if ((comp[i].events & POLLPRI && comp[i].revents & POLLPRI) ||
-            (comp[i].events & POLLERR && comp[i].revents & POLLERR)) {
-            select_bitmap_set(except, comp[i].fd);
+        if (kexcept &&
+            ((comp[i].events & POLLPRI && comp[i].revents & POLLPRI) ||
+             (comp[i].events & POLLERR && comp[i].revents & POLLERR))) {
+            select_bitmap_set(kexcept, comp[i].fd);
             verify++;
         }
     }
 
+    if ((kread && copy_to_user(read, kread, bitmap_bytes)) ||
+        (kwrite && copy_to_user(write, kwrite, bitmap_bytes)) ||
+        (kexcept && copy_to_user(except, kexcept, bitmap_bytes))) {
+        free(comp);
+        free(kread);
+        free(kwrite);
+        free(kexcept);
+        return (size_t)-EFAULT;
+    }
+
     free(comp);
+    free(kread);
+    free(kwrite);
+    free(kexcept);
     return verify;
+
+fault:
+    free(kread);
+    free(kwrite);
+    free(kexcept);
+    return (size_t)-EFAULT;
+
+nomem:
+    free(kread);
+    free(kwrite);
+    free(kexcept);
+    return (size_t)-ENOMEM;
 }
 
 uint64_t sys_pselect6(uint64_t nfds, fd_set *readfds, fd_set *writefds,
                       fd_set *exceptfds, struct timespec *timeout,
                       weird_pselect6_t *weird_pselect6) {
-    if (readfds &&
-        check_user_overflow((uint64_t)readfds, sizeof(fd_set) * nfds)) {
+    if (nfds > MAX_FD_NUM)
+        return (size_t)-EINVAL;
+
+    size_t bitmap_bytes = (nfds + 7) / 8;
+    if (readfds && check_user_overflow((uint64_t)readfds, bitmap_bytes)) {
         return (size_t)-EFAULT;
     }
-    if (writefds &&
-        check_user_overflow((uint64_t)writefds, sizeof(fd_set) * nfds)) {
+    if (writefds && check_user_overflow((uint64_t)writefds, bitmap_bytes)) {
         return (size_t)-EFAULT;
     }
-    if (exceptfds &&
-        check_user_overflow((uint64_t)exceptfds, sizeof(fd_set) * nfds)) {
+    if (exceptfds && check_user_overflow((uint64_t)exceptfds, bitmap_bytes)) {
         return (size_t)-EFAULT;
     }
 

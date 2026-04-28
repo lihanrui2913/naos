@@ -6,7 +6,6 @@
 #include <mm/page_table.h>
 #include <arch/arch.h>
 #include <mm/vma.h>
-#include <mm/heap.h>
 
 void *malloc(size_t size);
 void *calloc(size_t nmemb, size_t size);

@@ -284,7 +284,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     }
 
     if (address_is_managed(old_paddr) &&
-        page_refcount_read(get_page(old_paddr)) == 1) {
+        page_refcount_read(get_page_by_addr(old_paddr)) == 1) {
         uint64_t flags = ARCH_READ_PTE_FLAG(current_entry);
 #if defined(__aarch64__)
         flags &= ~ARCH_PT_FLAG_READONLY;
