@@ -42,12 +42,14 @@ void spin_lock(spinlock_t *sl) {
 }
 
 void spin_unlock(spinlock_t *sl) {
+    bool irq_state = sl->irq_state;
+
     raw_spin_unlock(sl);
 
     if (current_task)
         current_task->preempt_count--;
 
-    if (sl->irq_state) {
+    if (irq_state) {
         arch_enable_interrupt();
     }
 }

@@ -25,6 +25,18 @@ static struct {
     bool port2_available;
 } ps2_state = {0};
 
+#define PS2_STATUS_OUTPUT_FULL 0x01
+#define PS2_STATUS_INPUT_FULL 0x02
+#define PS2_STATUS_PORT2_OUTPUT 0x20
+
+#define PS2_CONFIG_PORT1_INTERRUPT 0x01
+#define PS2_CONFIG_PORT2_INTERRUPT 0x02
+#define PS2_CONFIG_PORT1_CLOCK_DISABLED 0x10
+#define PS2_CONFIG_PORT2_CLOCK_DISABLED 0x20
+#define PS2_CONFIG_TRANSLATION 0x40
+
+#define PS2_WAIT_TIMEOUT_NS (1000ULL * 1000000ULL)
+
 static bool ps2_input_now(dev_input_event_t *event, struct timespec *now) {
     if (!event || !now)
         return false;
@@ -40,55 +52,85 @@ static bool ps2_input_now(dev_input_event_t *event, struct timespec *now) {
 
 // 等待可以写入
 static bool ps2_wait_write(void) {
-    uint64_t deadline = nano_time() + 1000ULL * 1000000ULL;
+    uint64_t deadline = nano_time() + PS2_WAIT_TIMEOUT_NS;
     while (nano_time() < deadline) {
-        if ((io_in8(PS2_STATUS_PORT) & 0x02) == 0) {
+        if ((io_in8(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0) {
             return true;
         }
+        arch_pause();
     }
     return false;
 }
 
 // 等待可以读取
 static bool ps2_wait_read(void) {
-    uint64_t deadline = nano_time() + 1000ULL * 1000000ULL;
+    uint64_t deadline = nano_time() + PS2_WAIT_TIMEOUT_NS;
     while (nano_time() < deadline) {
-        if (io_in8(PS2_STATUS_PORT) & 0x01) {
+        if (io_in8(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
             return true;
         }
+        arch_pause();
     }
     return false;
 }
 
 // 读取数据
-static uint8_t ps2_read_data(void) {
+static bool ps2_read_data(uint8_t *data) {
+    if (!data)
+        return false;
     if (!ps2_wait_read()) {
-        return 0xFF;
+        return false;
     }
-    return io_in8(PS2_DATA_PORT);
+    *data = io_in8(PS2_DATA_PORT);
+    return true;
 }
 
 // 写入命令
-static void ps2_write_command(uint8_t cmd) {
+static bool ps2_write_command(uint8_t cmd) {
     if (!ps2_wait_write()) {
-        return;
+        return false;
     }
     io_out8(PS2_COMMAND_PORT, cmd);
+    return true;
 }
 
 // 写入数据
-static void ps2_write_data(uint8_t data) {
+static bool ps2_write_data(uint8_t data) {
     if (!ps2_wait_write()) {
-        return;
+        return false;
     }
     io_out8(PS2_DATA_PORT, data);
+    return true;
+}
+
+static void ps2_flush_output(void) {
+    for (int i = 0; i < 64; i++) {
+        if (!(io_in8(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL))
+            break;
+        io_in8(PS2_DATA_PORT);
+    }
+}
+
+static bool ps2_read_config(uint8_t *config) {
+    if (!ps2_write_command(PS2_CMD_READ_CONFIG))
+        return false;
+    return ps2_read_data(config);
+}
+
+static bool ps2_write_config(uint8_t config) {
+    if (!ps2_write_command(PS2_CMD_WRITE_CONFIG))
+        return false;
+    return ps2_write_data(config);
 }
 
 // 发送命令到第一个端口（键盘）
 static bool ps2_send_to_port1(uint8_t cmd) {
     for (int i = 0; i < 3; i++) {
-        ps2_write_data(cmd);
-        uint8_t response = ps2_read_data();
+        if (!ps2_write_data(cmd))
+            return false;
+        uint8_t response;
+        if (!ps2_read_data(&response))
+            return false;
         if (response == PS2_ACK) {
             return true;
         }
@@ -102,9 +144,13 @@ static bool ps2_send_to_port1(uint8_t cmd) {
 // 发送命令到第二个端口（鼠标）
 static bool ps2_send_to_port2(uint8_t cmd) {
     for (int i = 0; i < 3; i++) {
-        ps2_write_command(PS2_CMD_WRITE_PORT2);
-        ps2_write_data(cmd);
-        uint8_t response = ps2_read_data();
+        if (!ps2_write_command(PS2_CMD_WRITE_PORT2))
+            return false;
+        if (!ps2_write_data(cmd))
+            return false;
+        uint8_t response;
+        if (!ps2_read_data(&response))
+            return false;
         if (response == PS2_ACK) {
             return true;
         }
@@ -141,7 +187,9 @@ static bool ps2_mouse_detect_wheel(void) {
         return false;
     }
 
-    uint8_t id = ps2_read_data();
+    uint8_t id;
+    if (!ps2_read_data(&id))
+        return false;
 
     // ID = 3 表示支持滚轮
     // ID = 4 表示支持滚轮和5个按钮
@@ -333,52 +381,64 @@ void ps2_mouse_callback(ps2_mouse_event_t event) {
 
 // 初始化PS/2控制器
 bool ps2_init(void) {
-    // 1. 禁用设备
-    ps2_write_command(PS2_CMD_DISABLE_PORT1);
-    ps2_write_command(PS2_CMD_DISABLE_PORT2);
+    ps2_state.port1_available = false;
+    ps2_state.port2_available = false;
 
-    // 2. 清空输出缓冲区
-    io_in8(PS2_DATA_PORT);
+    // 1. 禁用设备
+    if (!ps2_write_command(PS2_CMD_DISABLE_PORT1))
+        return false;
+    if (!ps2_write_command(PS2_CMD_DISABLE_PORT2))
+        return false;
+
+    // 2. 清空输出缓冲区，避免旧扫描码或设备响应污染后续 ACK/BAT。
+    ps2_flush_output();
 
     // 3. 设置控制器配置
-    ps2_write_command(PS2_CMD_READ_CONFIG);
-    uint8_t config = ps2_read_data();
+    uint8_t config;
+    if (!ps2_read_config(&config))
+        return false;
 
     // 禁用中断和翻译
-    config &= ~0x43;
+    config &= ~(PS2_CONFIG_PORT1_INTERRUPT | PS2_CONFIG_PORT2_INTERRUPT |
+                PS2_CONFIG_TRANSLATION);
 
-    // 检查是否是双通道
-    bool is_dual_channel = (config & 0x20) != 0;
-
-    ps2_write_command(PS2_CMD_WRITE_CONFIG);
-    ps2_write_data(config);
+    if (!ps2_write_config(config))
+        return false;
 
     // 4. 执行控制器自检
-    ps2_write_command(PS2_CMD_TEST_CONTROLLER);
-    if (ps2_read_data() != 0x55) {
+    if (!ps2_write_command(PS2_CMD_TEST_CONTROLLER))
+        return false;
+    uint8_t response;
+    if (!ps2_read_data(&response) || response != 0x55) {
         return false;
     }
 
-    // 5. 确定可用端口数量
-    if (is_dual_channel) {
-        ps2_write_command(PS2_CMD_ENABLE_PORT2);
-        ps2_write_command(PS2_CMD_READ_CONFIG);
-        config = ps2_read_data();
-        if ((config & 0x20) == 0) {
-            ps2_state.port2_available = true;
-            ps2_write_command(PS2_CMD_DISABLE_PORT2);
-        }
+    // 一些控制器自检后会重置配置字，必须重新写入关闭中断/翻译的配置。
+    if (!ps2_write_config(config))
+        return false;
+
+    // 5. 确定可用端口数量。不要依赖初始 bit5，直接尝试打开第二端口再确认。
+    if (!ps2_write_command(PS2_CMD_ENABLE_PORT2))
+        return false;
+    if (!ps2_read_config(&config))
+        return false;
+    if ((config & PS2_CONFIG_PORT2_CLOCK_DISABLED) == 0) {
+        ps2_state.port2_available = true;
+        if (!ps2_write_command(PS2_CMD_DISABLE_PORT2))
+            return false;
     }
 
     // 6. 测试端口
-    ps2_write_command(PS2_CMD_TEST_PORT1);
-    if (ps2_read_data() == 0x00) {
+    if (!ps2_write_command(PS2_CMD_TEST_PORT1))
+        return false;
+    if (ps2_read_data(&response) && response == 0x00) {
         ps2_state.port1_available = true;
     }
 
     if (ps2_state.port2_available) {
-        ps2_write_command(PS2_CMD_TEST_PORT2);
-        if (ps2_read_data() != 0x00) {
+        if (!ps2_write_command(PS2_CMD_TEST_PORT2))
+            return false;
+        if (!ps2_read_data(&response) || response != 0x00) {
             ps2_state.port2_available = false;
         }
     }
@@ -393,7 +453,9 @@ bool ps2_keyboard_init(void) {
     }
 
     // 启用端口1
-    ps2_write_command(PS2_CMD_ENABLE_PORT1);
+    if (!ps2_write_command(PS2_CMD_ENABLE_PORT1))
+        return false;
+    ps2_flush_output();
 
     // 重置键盘
     if (!ps2_send_to_port1(PS2_DEV_RESET)) {
@@ -401,12 +463,8 @@ bool ps2_keyboard_init(void) {
     }
 
     // 等待自检完成 (0xAA = 通过)
-    if (ps2_read_data() != 0xAA) {
-        return false;
-    }
-
-    // 启用扫描
-    if (!ps2_send_to_port1(PS2_DEV_ENABLE)) {
+    uint8_t response;
+    if (!ps2_read_data(&response) || response != 0xAA) {
         return false;
     }
 
@@ -419,12 +477,10 @@ bool ps2_keyboard_init(void) {
         return false;
     }
 
-    // 启用中断
-    ps2_write_command(PS2_CMD_READ_CONFIG);
-    uint8_t config = ps2_read_data();
-    config |= 0x01; // 启用端口1中断
-    ps2_write_command(PS2_CMD_WRITE_CONFIG);
-    ps2_write_data(config);
+    // 启用扫描
+    if (!ps2_send_to_port1(PS2_DEV_ENABLE)) {
+        return false;
+    }
 
     ps2_keyboard_set_callback(ps2_keyboard_callback);
 
@@ -441,6 +497,15 @@ bool ps2_keyboard_init(void) {
         (void (*)(uint64_t, void *, struct pt_regs *))ps2_interrupt_handler, 1,
         NULL, &apic_controller, "PS/2 Keyboard", 0);
 
+    // IRQ handler 注册完成后再打开控制器中断位。
+    uint8_t config;
+    if (!ps2_read_config(&config))
+        return false;
+    config |= PS2_CONFIG_PORT1_INTERRUPT; // 启用端口1中断
+    config &= ~(PS2_CONFIG_TRANSLATION | PS2_CONFIG_PORT1_CLOCK_DISABLED);
+    if (!ps2_write_config(config))
+        return false;
+
     return true;
 }
 
@@ -451,7 +516,9 @@ bool ps2_mouse_init(void) {
     }
 
     // 启用端口2
-    ps2_write_command(PS2_CMD_ENABLE_PORT2);
+    if (!ps2_write_command(PS2_CMD_ENABLE_PORT2))
+        return false;
+    ps2_flush_output();
 
     // 重置鼠标
     if (!ps2_send_to_port2(PS2_DEV_RESET)) {
@@ -459,12 +526,15 @@ bool ps2_mouse_init(void) {
     }
 
     // 等待自检完成
-    if (ps2_read_data() != 0xAA) {
+    uint8_t response;
+    if (!ps2_read_data(&response) || response != 0xAA) {
         return false;
     }
 
     // 读取设备ID (应该是 0x00)
-    ps2_read_data();
+    if (!ps2_read_data(&response)) {
+        return false;
+    }
 
     // 检测滚轮支持
     ps2_state.mouse_has_wheel = ps2_mouse_detect_wheel();
@@ -478,13 +548,6 @@ bool ps2_mouse_init(void) {
     if (!ps2_send_to_port2(PS2_DEV_ENABLE)) {
         return false;
     }
-
-    // 启用中断
-    ps2_write_command(PS2_CMD_READ_CONFIG);
-    uint8_t config = ps2_read_data();
-    config |= 0x02; // 启用端口2中断
-    ps2_write_command(PS2_CMD_WRITE_CONFIG);
-    ps2_write_data(config);
 
     ps2_state.mouse_cycle = 0;
 
@@ -506,6 +569,19 @@ bool ps2_mouse_init(void) {
         PS2_MOUSE_INTERRUPT_VECTOR,
         (void (*)(uint64_t, void *, struct pt_regs *))ps2_interrupt_handler, 12,
         NULL, &apic_controller, "PS/2 Mouse", 0);
+
+    // IRQ handler 注册完成后再打开控制器中断位。
+    uint8_t config;
+    if (!ps2_read_config(&config))
+        return false;
+    config |= PS2_CONFIG_PORT2_INTERRUPT; // 启用端口2中断
+    if (ps2_state.port1_available && ps2_kb_input_event)
+        config |= PS2_CONFIG_PORT1_INTERRUPT;
+    config &= ~(PS2_CONFIG_TRANSLATION | PS2_CONFIG_PORT2_CLOCK_DISABLED);
+    if (ps2_state.port1_available && ps2_kb_input_event)
+        config &= ~PS2_CONFIG_PORT1_CLOCK_DISABLED;
+    if (!ps2_write_config(config))
+        return false;
 
     return true;
 }

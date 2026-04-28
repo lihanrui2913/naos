@@ -156,8 +156,10 @@ void vfs_file_put(struct vfs_file *file) {
 
     if (file->f_op && file->f_op->release)
         file->f_op->release(file->f_inode, file);
-    if (file->f_inode)
+    if (file->f_inode) {
         vfs_iput(file->f_inode);
+        file->f_inode = NULL;
+    }
     vfs_path_put(&file->f_path);
     free(file);
 }

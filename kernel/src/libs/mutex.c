@@ -53,6 +53,7 @@ void mutex_lock(mutex_t *mtx) {
             if (node) {
                 wait_queue_remove_locked(mtx, node);
                 free(node);
+                node = NULL;
             }
             spin_unlock(&mtx->guard);
             return;
@@ -66,6 +67,7 @@ void mutex_lock(mutex_t *mtx) {
             if (node) {
                 wait_queue_remove_locked(mtx, node);
                 free(node);
+                node = NULL;
             }
             spin_unlock(&mtx->guard);
             return;

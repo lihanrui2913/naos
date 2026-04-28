@@ -46,7 +46,6 @@ extern const char *zone_names[__MAX_NR_ZONES];
 
 // 初始化
 void buddy_init(void);
-void buddy_enable_percpu_caches(void);
 void add_memory_region(uintptr_t start, uintptr_t end, enum zone_type type);
 
 // 分配/释放（底层接口）

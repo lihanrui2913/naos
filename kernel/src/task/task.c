@@ -464,7 +464,8 @@ static void task_timeout_softirq(void) {
         task_timeout_refresh_next_locked();
         spin_unlock(&task_timeout_lock);
 
-        arch_enable_interrupt();
+        if (irq_state)
+            arch_enable_interrupt();
 
         if (!expired_count) {
             return;
@@ -900,6 +901,8 @@ task_t *get_free_task() {
 
 task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
                     int priority) {
+    bool irq_state = arch_interrupt_enabled();
+
     arch_disable_interrupt();
 
     can_schedule = false;
@@ -907,6 +910,8 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task_t *task = get_free_task();
     if (!task) {
         can_schedule = true;
+        if (irq_state)
+            arch_enable_interrupt();
         return NULL;
     }
     task->signal = task_signal_create_empty();
@@ -1023,11 +1028,15 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
 
     can_schedule = true;
 
+    if (irq_state)
+        arch_enable_interrupt();
     return task;
 
 fail:
     can_schedule = true;
     task_cleanup_partial(task, true);
+    if (irq_state)
+        arch_enable_interrupt();
     return NULL;
 }
 
@@ -1205,6 +1214,8 @@ int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
     result = task->status;
 
 ret:
+    if (lock_irq_state)
+        arch_enable_interrupt();
     return result;
 }
 
@@ -1215,8 +1226,6 @@ void task_unblock(task_t *task, int reason) {
 
     bool irq_state = arch_interrupt_enabled();
     bool should_trigger_sched_ipi = false;
-
-    bool lock_irq_state = arch_interrupt_enabled();
 
     arch_disable_interrupt();
 

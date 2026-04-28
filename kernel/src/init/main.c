@@ -186,8 +186,6 @@ void kmain(void) {
 
     arch_early_init();
 
-    buddy_enable_percpu_caches();
-
     device_init();
 
     vfs_init();

@@ -15,6 +15,7 @@ extern uint32_t cpuid_to_lapicid[MAX_CPU_NUM];
 
 #define XHCI_RING_ITEMS 128
 #define XHCI_RING_SIZE (XHCI_RING_ITEMS * sizeof(struct xhci_trb))
+#define XHCI_DEFERRED_CB_MAX 256
 #define XHCI_TRB_MAX_XFER 65536
 #define XHCI_EVENT_POLL_NS (1ULL * 1000 * 1000)
 #define XHCI_IMAN_IP (1U << 0)
@@ -176,6 +177,13 @@ typedef struct xhci_ring xhci_ring_t;
 typedef struct xhci_portmap xhci_portmap_t;
 typedef struct xhci_event_ring xhci_event_ring_t;
 typedef struct xhci_pipe xhci_pipe_t;
+
+struct xhci_deferred_cb {
+    usb_xfer_cb cb;
+    int status;
+    int actual;
+    void *user_data;
+};
 
 struct xhci_event_ring {
     struct xhci_ring ring;
@@ -515,7 +523,37 @@ static void xhci_commit_erdp(usb_xhci_t *xhci, struct xhci_event_ring *intr) {
     }
 }
 
-static void xhci_process_event_ring(struct xhci_event_ring *intr) {
+static void xhci_defer_cb(struct xhci_deferred_cb *callbacks,
+                          uint32_t *callback_count, usb_xfer_cb cb, int status,
+                          int actual, void *user_data) {
+    if (!cb)
+        return;
+    if (!callbacks || !callback_count ||
+        *callback_count >= XHCI_DEFERRED_CB_MAX) {
+        printk("xhci: dropping async callback, deferred queue full\n");
+        return;
+    }
+
+    callbacks[*callback_count].cb = cb;
+    callbacks[*callback_count].status = status;
+    callbacks[*callback_count].actual = actual;
+    callbacks[*callback_count].user_data = user_data;
+    (*callback_count)++;
+}
+
+static void xhci_run_deferred_callbacks(struct xhci_deferred_cb *callbacks,
+                                        uint32_t callback_count) {
+    for (uint32_t i = 0; i < callback_count; i++) {
+        if (callbacks[i].cb) {
+            callbacks[i].cb(callbacks[i].status, callbacks[i].actual,
+                            callbacks[i].user_data);
+        }
+    }
+}
+
+static void xhci_process_event_ring(struct xhci_event_ring *intr,
+                                    struct xhci_deferred_cb *callbacks,
+                                    uint32_t *callback_count) {
     struct xhci_ring *evts = &intr->ring;
     usb_xhci_t *xhci = intr->xhci;
     uint32_t processed = 0;
@@ -571,8 +609,8 @@ static void xhci_process_event_ring(struct xhci_event_ring *intr) {
                     pipe->async_len = 0;
                     pipe->async_dir = 0;
 
-                    if (cb)
-                        cb(status, actual, user_data);
+                    xhci_defer_cb(callbacks, callback_count, cb, status, actual,
+                                  user_data);
                 }
             } else {
                 printk(
@@ -624,11 +662,16 @@ static void xhci_process_event_ring(struct xhci_event_ring *intr) {
 }
 
 static void xhci_process_events(usb_xhci_t *xhci) {
+    struct xhci_deferred_cb callbacks[XHCI_DEFERRED_CB_MAX];
+    uint32_t callback_count = 0;
+
     spin_lock(&xhci->event_lock);
     for (int i = 0; i < MIN(cpu_count, xhci->enabled_intrs); i++) {
-        xhci_process_event_ring(&xhci->evt[i]);
+        xhci_process_event_ring(&xhci->evt[i], callbacks, &callback_count);
     }
     spin_unlock(&xhci->event_lock);
+
+    xhci_run_deferred_callbacks(callbacks, callback_count);
 }
 
 static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
@@ -1066,10 +1109,15 @@ static void xhci_event_thread(uint64_t arg) {
 static void xhci_irq_handler(uint64_t irq_num, void *data,
                              struct pt_regs *regs) {
     xhci_event_ring_t *ring = (xhci_event_ring_t *)data;
+    struct xhci_deferred_cb callbacks[XHCI_DEFERRED_CB_MAX];
+    uint32_t callback_count = 0;
+
     spin_lock(&ring->xhci->event_lock);
-    xhci_process_event_ring(ring);
+    xhci_process_event_ring(ring, callbacks, &callback_count);
     writel(&ring->xhci->op->usbsts, XHCI_STS_EINT);
     spin_unlock(&ring->xhci->event_lock);
+
+    xhci_run_deferred_callbacks(callbacks, callback_count);
 }
 
 static int xhci_alloc_runtime_state(usb_xhci_t *xhci) {

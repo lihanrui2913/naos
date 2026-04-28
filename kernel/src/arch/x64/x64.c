@@ -34,8 +34,19 @@ void arch_init() {
 void arch_init_after_thread() {}
 
 void arch_input_dev_init() {
+    bool irq_state = arch_interrupt_enabled();
+    if (irq_state)
+        arch_disable_interrupt();
+
     if (ps2_init()) {
-        ps2_keyboard_init();
-        ps2_mouse_init();
+        if (!ps2_keyboard_init()) {
+            printk("PS/2 keyboard init failed\n");
+        }
+        if (!ps2_mouse_init()) {
+            printk("PS/2 mouse init failed\n");
+        }
     }
+
+    if (irq_state)
+        arch_enable_interrupt();
 }

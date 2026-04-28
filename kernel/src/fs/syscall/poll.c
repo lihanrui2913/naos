@@ -336,7 +336,7 @@ static inline void select_bitmap_set(uint8_t *map, int index) {
 
 size_t sys_select(int nfds, uint8_t *read, uint8_t *write, uint8_t *except,
                   struct timeval *timeout) {
-    if (nfds < 0 || nfds > MAX_FD_NUM)
+    if (nfds < 0 || nfds >= MAX_FD_NUM)
         return (size_t)-EINVAL;
 
     size_t bitmap_bytes = ((size_t)nfds + 7) / 8;
@@ -470,7 +470,7 @@ nomem:
 uint64_t sys_pselect6(uint64_t nfds, fd_set *readfds, fd_set *writefds,
                       fd_set *exceptfds, struct timespec *timeout,
                       weird_pselect6_t *weird_pselect6) {
-    if (nfds > MAX_FD_NUM)
+    if (nfds >= MAX_FD_NUM)
         return (size_t)-EINVAL;
 
     size_t bitmap_bytes = (nfds + 7) / 8;
