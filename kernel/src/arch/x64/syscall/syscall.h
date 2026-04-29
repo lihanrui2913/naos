@@ -17,6 +17,7 @@ struct stat {
     int st_mode;
     int st_uid;
     int st_gid;
+    int __pad0;
     long st_rdev;
     long long st_size;
     long st_blksize;

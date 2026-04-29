@@ -179,8 +179,8 @@ static long pidfd_ioctl(struct vfs_file *file, unsigned long cmd,
             info.egid = task->egid;
             info.suid = task->suid;
             info.sgid = task->sgid;
-            info.fsuid = task->uid;
-            info.fsgid = task->gid;
+            info.fsuid = task->fsuid;
+            info.fsgid = task->fsgid;
         }
         info.exit_code = ctx->exited ? ctx->exit_status : 0;
         info.coredump_mask = 0;

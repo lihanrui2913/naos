@@ -149,8 +149,12 @@ void mutex_unlock(mutex_t *mtx) {
 
     while ((node = wait_queue_dequeue(mtx))) {
         waiter = node->task;
-        if (!waiter || waiter->state == TASK_DIED) {
+        if (!waiter) {
             free(node);
+            waiter = NULL;
+            continue;
+        }
+        if (waiter->state == TASK_DIED) {
             waiter = NULL;
             continue;
         }

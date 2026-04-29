@@ -953,6 +953,8 @@ typedef struct task_execve_creds {
     int64_t egid;
     int64_t suid;
     int64_t sgid;
+    int64_t fsuid;
+    int64_t fsgid;
     bool secure_exec;
 } task_execve_creds_t;
 
@@ -965,6 +967,8 @@ static task_execve_creds_t task_execve_prepare_creds(task_t *task,
         .egid = task->egid,
         .suid = task->suid,
         .sgid = task->sgid,
+        .fsuid = task->fsuid,
+        .fsgid = task->fsgid,
         .secure_exec = false,
     };
     struct vfs_inode *inode = file ? file->f_inode : NULL;
@@ -981,6 +985,8 @@ static task_execve_creds_t task_execve_prepare_creds(task_t *task,
 
     creds.suid = creds.euid;
     creds.sgid = creds.egid;
+    creds.fsuid = creds.euid;
+    creds.fsgid = creds.egid;
     creds.secure_exec = creds.euid != task->euid || creds.egid != task->egid;
     return creds;
 }
@@ -996,6 +1002,8 @@ static void task_execve_commit_creds(task_t *task,
     task->egid = creds->egid;
     task->suid = creds->suid;
     task->sgid = creds->sgid;
+    task->fsuid = creds->fsuid;
+    task->fsgid = creds->fsgid;
 }
 
 static uint64_t simple_rand() {
@@ -2643,6 +2651,8 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     child->egid = self->egid;
     child->suid = self->suid;
     child->sgid = self->sgid;
+    child->fsuid = self->fsuid;
+    child->fsgid = self->fsgid;
     child->pgid = self->pgid;
     child->sid = self->sid;
     task_keyring_inherit(child, self);
@@ -3731,14 +3741,42 @@ uint64_t sys_sched_getaffinity(int pid, size_t len,
     return task_sched_affinity_bytes();
 }
 
-uint64_t sys_setpriority(int which, int who, int niceval) {
+uint64_t sys_getpriority(int which, int who) {
     task_t *task = NULL;
     switch (which) {
     case PRIO_PROCESS:
-        task = task_find_by_pid(who);
+        task = who == 0 ? current_task : task_find_by_pid(who);
         if (!task)
             return -ESRCH;
 
+        /*
+         * Linux returns 20 - nice from the raw syscall so libc can represent
+         * negative nice values without ambiguity. This kernel does not track
+         * nice yet, so expose the default nice value 0.
+         */
+        return 20;
+
+    default:
+        printk("sys_getpriority: Unsupported which: %d\n", which);
+        return (uint64_t)-EINVAL;
+    }
+}
+
+uint64_t sys_setpriority(int which, int who, int niceval) {
+    task_t *task = NULL;
+
+    if (niceval < -20)
+        niceval = -20;
+    if (niceval > 19)
+        niceval = 19;
+
+    switch (which) {
+    case PRIO_PROCESS:
+        task = who == 0 ? current_task : task_find_by_pid(who);
+        if (!task)
+            return -ESRCH;
+
+        (void)niceval;
         return 0;
 
     default:

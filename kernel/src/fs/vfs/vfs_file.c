@@ -319,6 +319,9 @@ int vfs_openat(int dfd, const char *name, const struct vfs_open_how *how,
             ret = -EOPNOTSUPP;
             goto out;
         }
+        ret = vfs_inode_permission(dir, VFS_MAY_WRITE | VFS_MAY_EXEC);
+        if (ret < 0)
+            goto out;
         ret = dir->i_op->create(dir, dentry, (umode_t)local_how.mode,
                                 !!(local_how.flags & O_EXCL));
         if (ret < 0)

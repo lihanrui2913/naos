@@ -25,6 +25,62 @@ static inline tmpfs_inode_info_t *tmpfs_i(struct vfs_inode *inode) {
     return inode ? container_of(inode, tmpfs_inode_info_t, vfs_inode) : NULL;
 }
 
+static int tmpfs_parse_mount_options(tmpfs_fs_info_t *fsi,
+                                     const char *options) {
+    char buf[512];
+    char *cursor;
+
+    if (!fsi)
+        return -EINVAL;
+    if (!options || !options[0])
+        return 0;
+
+    strncpy(buf, options, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    cursor = buf;
+    while (*cursor) {
+        char *opt = cursor;
+        char *comma = strchr(opt, ',');
+        char *value;
+        char *end = NULL;
+        uint64_t parsed;
+
+        if (comma) {
+            *comma = '\0';
+            cursor = comma + 1;
+        } else {
+            cursor = opt + strlen(opt);
+        }
+        if (!*opt)
+            continue;
+
+        value = strchr(opt, '=');
+        if (!value)
+            continue;
+        *value++ = '\0';
+
+        if (!strcmp(opt, "mode")) {
+            parsed = strtoul(value, &end, 8);
+            if (!end || *end || parsed > 07777)
+                return -EINVAL;
+            fsi->root_mode = S_IFDIR | (umode_t)parsed;
+        } else if (!strcmp(opt, "uid")) {
+            parsed = strtoul(value, &end, 10);
+            if (!end || *end || parsed > 0xffffffffULL)
+                return -EINVAL;
+            fsi->root_uid = (uid32_t)parsed;
+        } else if (!strcmp(opt, "gid")) {
+            parsed = strtoul(value, &end, 10);
+            if (!end || *end || parsed > 0xffffffffULL)
+                return -EINVAL;
+            fsi->root_gid = (gid32_t)parsed;
+        }
+    }
+
+    return 0;
+}
+
 static tmpfs_dirent_t *tmpfs_find_dirent_locked(tmpfs_inode_info_t *info,
                                                 const char *name) {
     tmpfs_dirent_t *de, *tmp;
@@ -277,7 +333,7 @@ static int tmpfs_resize_inode(struct vfs_inode *inode, uint64_t new_size) {
 }
 
 static struct vfs_inode *tmpfs_new_inode(struct vfs_super_block *sb,
-                                         umode_t mode) {
+                                         struct vfs_inode *dir, umode_t mode) {
     struct vfs_inode *inode = vfs_alloc_inode(sb);
     tmpfs_inode_info_t *info = tmpfs_i(inode);
 
@@ -287,9 +343,7 @@ static struct vfs_inode *tmpfs_new_inode(struct vfs_super_block *sb,
     mutex_init(&info->lock);
     llist_init_head(&info->children);
     inode->i_ino = tmpfs_next_ino(sb);
-    inode->i_mode = mode;
-    inode->i_uid = 0;
-    inode->i_gid = 0;
+    vfs_inode_init_owner(inode, dir, mode);
     inode->inode = inode->i_ino;
     inode->type = S_ISDIR(mode)    ? file_dir
                   : S_ISLNK(mode)  ? file_symlink
@@ -346,7 +400,7 @@ static int tmpfs_create_common(struct vfs_inode *dir, struct vfs_dentry *dentry,
     if (tmpfs_find_dirent(dir, dentry->d_name.name))
         return -EEXIST;
 
-    inode = tmpfs_new_inode(dir->i_sb, mode);
+    inode = tmpfs_new_inode(dir->i_sb, dir, mode);
     if (!inode)
         return -ENOMEM;
 
@@ -562,9 +616,7 @@ static const char *tmpfs_get_link(struct vfs_dentry *dentry,
 }
 
 static int tmpfs_permission(struct vfs_inode *inode, int mask) {
-    (void)inode;
-    (void)mask;
-    return 0;
+    return vfs_inode_permission(inode, mask);
 }
 
 static int tmpfs_getattr(const struct vfs_path *path, struct vfs_kstat *stat,
@@ -879,6 +931,7 @@ static int tmpfs_get_tree(struct vfs_fs_context *fc) {
     struct vfs_inode *root_inode;
     struct vfs_dentry *root_dentry;
     struct vfs_qstr root_name = {.name = "", .len = 0, .hash = 0};
+    int opt_ret;
 
     if (!sb)
         return -EINVAL;
@@ -889,16 +942,26 @@ static int tmpfs_get_tree(struct vfs_fs_context *fc) {
     spin_init(&fsi->lock);
     fsi->next_ino = 1;
     fsi->dev = 0;
+    fsi->root_uid = vfs_current_fsuid();
+    fsi->root_gid = vfs_current_fsgid();
+    fsi->root_mode = S_IFDIR | 01777;
+    opt_ret = tmpfs_parse_mount_options(fsi, fc->data);
+    if (opt_ret < 0) {
+        free(fsi);
+        return opt_ret;
+    }
 
     sb->s_fs_info = fsi;
     sb->s_op = &tmpfs_super_ops;
     sb->s_type = &tmpfs_fs_type;
     sb->s_magic = 0x01021994;
 
-    root_inode = tmpfs_new_inode(sb, S_IFDIR | 0755);
+    root_inode = tmpfs_new_inode(sb, NULL, fsi->root_mode);
     if (!root_inode)
         return -ENOMEM;
 
+    root_inode->i_uid = fsi->root_uid;
+    root_inode->i_gid = fsi->root_gid;
     root_inode->i_op = &tmpfs_inode_ops;
     root_inode->i_fop = &tmpfs_dir_ops;
 

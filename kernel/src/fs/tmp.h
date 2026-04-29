@@ -6,6 +6,9 @@
 typedef struct tmpfs_fs_info {
     uint64_t next_ino;
     dev64_t dev;
+    uid32_t root_uid;
+    gid32_t root_gid;
+    umode_t root_mode;
     spinlock_t lock;
 } tmpfs_fs_info_t;
 

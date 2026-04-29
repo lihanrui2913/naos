@@ -310,6 +310,8 @@ typedef struct task {
     int64_t egid;
     int64_t suid;
     int64_t sgid;
+    int64_t fsuid;
+    int64_t fsgid;
     int64_t pgid;
     int64_t tgid;
     int64_t sid;

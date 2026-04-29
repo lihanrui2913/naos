@@ -594,6 +594,9 @@ static int generic_link_pathat(const struct vfs_path *old_path, int newdfd,
         ret = -EOPNOTSUPP;
         goto out;
     }
+    ret = vfs_inode_permission(new_dir, VFS_MAY_WRITE | VFS_MAY_EXEC);
+    if (ret < 0)
+        goto out;
 
     existing = vfs_d_lookup(new_parent.dentry, &last);
     if (existing) {
@@ -629,6 +632,8 @@ uint64_t sys_mount(char *dev_name, char *dir_name, char *type_user,
     char devname[128] = "none";
     char dirname[512] = {0};
     char type[128] = "tmpfs";
+    char data_string[512] = {0};
+    void *mount_data = data;
 
     if (copy_from_user_str(dirname, dir_name, sizeof(dirname)))
         return (uint64_t)-EFAULT;
@@ -696,9 +701,14 @@ uint64_t sys_mount(char *dev_name, char *dir_name, char *type_user,
         if (copy_from_user_str(devname, dev_name, sizeof(devname)))
             return (uint64_t)-EFAULT;
     }
+    if (data) {
+        if (copy_from_user_str(data_string, data, sizeof(data_string)))
+            return (uint64_t)-EFAULT;
+        mount_data = data_string;
+    }
 
     return (uint64_t)vfs_do_mount(AT_FDCWD, dirname, type, mnt_flags, devname,
-                                  data);
+                                  mount_data);
 }
 
 uint64_t sys_umount2(const char *target, uint64_t flags) {

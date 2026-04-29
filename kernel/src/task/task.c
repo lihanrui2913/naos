@@ -926,6 +926,8 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task->egid = 0;
     task->suid = 0;
     task->sgid = 0;
+    task->fsuid = 0;
+    task->fsgid = 0;
     task->pgid = 0;
     task->tgid = task->pid;
     task->sid = 0;
@@ -1299,8 +1301,6 @@ void task_exit_inner(task_t *task, int64_t code) {
         entity->task = NULL;
     }
 
-    task->current_state = TASK_DIED;
-    task->state = TASK_DIED;
     task_timeout_cancel(task);
     task_tick_work_cancel(task);
 
@@ -1316,6 +1316,9 @@ void task_exit_inner(task_t *task, int64_t code) {
     futex_on_exit_task(task);
     pidfd_on_task_exit(task);
     on_exit_task_call(task);
+
+    task->current_state = TASK_DIED;
+    task->state = TASK_DIED;
 
     task->fd_info = NULL;
 

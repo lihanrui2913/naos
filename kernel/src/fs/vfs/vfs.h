@@ -64,6 +64,10 @@
 #define S_ISFIFO(mode) (((mode) & S_IFMT) == S_IFIFO)
 #define S_ISSOCK(mode) (((mode) & S_IFMT) == S_IFSOCK)
 
+#define VFS_MAY_EXEC 1
+#define VFS_MAY_WRITE 2
+#define VFS_MAY_READ 4
+
 #define ERR_PTR(err) ((void *)(intptr_t)(err))
 #define PTR_ERR(ptr) ((long)(intptr_t)(ptr))
 #define IS_ERR(ptr) ((uintptr_t)(void *)(ptr) >= (uintptr_t)-4095)
@@ -538,6 +542,7 @@ struct vfs_fs_context {
     unsigned long sb_flags;
     unsigned long mnt_flags;
     const char *source;
+    const void *data;
     void *fs_private;
     struct vfs_super_block *sb;
 };
@@ -679,6 +684,11 @@ struct vfs_inode *vfs_igrab(struct vfs_inode *inode);
 void vfs_iput(struct vfs_inode *inode);
 void vfs_inode_init_owner(struct vfs_inode *inode, struct vfs_inode *dir,
                           umode_t mode);
+uid32_t vfs_current_fsuid(void);
+gid32_t vfs_current_fsgid(void);
+void vfs_init_new_inode_owner(struct vfs_inode *dir, umode_t *mode,
+                              uid32_t *uid, gid32_t *gid);
+int vfs_inode_permission(struct vfs_inode *inode, int mask);
 
 /**
  * Allocate a dentry under the given parent and copy the supplied name into it.

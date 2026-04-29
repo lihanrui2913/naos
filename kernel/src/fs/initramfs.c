@@ -72,7 +72,7 @@ void initramfs_init() {
     if (!initramfs_module)
         return;
 
-    int ret = vfs_kern_mount("tmpfs", 0, NULL, NULL, &root_mnt);
+    int ret = vfs_kern_mount("tmpfs", 0, NULL, "mode=0755", &root_mnt);
     if (ret < 0) {
         printk("Failed mount tmpfs as init root\n");
         return;

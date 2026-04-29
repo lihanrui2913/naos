@@ -35,6 +35,9 @@ typedef struct devtmpfs_fs_info {
     mutex_t populate_lock;
     bool populated;
     bool populating;
+    uid32_t root_uid;
+    gid32_t root_gid;
+    umode_t root_mode;
 } devtmpfs_fs_info_t;
 
 static struct vfs_file_system_type devtmpfs_fs_type;
@@ -49,6 +52,62 @@ bool devfs_initialized = false;
 
 static inline devtmpfs_inode_info_t *devtmpfs_i(vfs_node_t *inode) {
     return inode ? container_of(inode, devtmpfs_inode_info_t, vfs_inode) : NULL;
+}
+
+static int devtmpfs_parse_mount_options(devtmpfs_fs_info_t *fsi,
+                                        const char *options) {
+    char buf[512];
+    char *cursor;
+
+    if (!fsi)
+        return -EINVAL;
+    if (!options || !options[0])
+        return 0;
+
+    strncpy(buf, options, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    cursor = buf;
+    while (*cursor) {
+        char *opt = cursor;
+        char *comma = strchr(opt, ',');
+        char *value;
+        char *end = NULL;
+        uint64_t parsed;
+
+        if (comma) {
+            *comma = '\0';
+            cursor = comma + 1;
+        } else {
+            cursor = opt + strlen(opt);
+        }
+        if (!*opt)
+            continue;
+
+        value = strchr(opt, '=');
+        if (!value)
+            continue;
+        *value++ = '\0';
+
+        if (!strcmp(opt, "mode")) {
+            parsed = strtoul(value, &end, 8);
+            if (!end || *end || parsed > 07777)
+                return -EINVAL;
+            fsi->root_mode = S_IFDIR | (umode_t)parsed;
+        } else if (!strcmp(opt, "uid")) {
+            parsed = strtoul(value, &end, 10);
+            if (!end || *end || parsed > 0xffffffffULL)
+                return -EINVAL;
+            fsi->root_uid = (uid32_t)parsed;
+        } else if (!strcmp(opt, "gid")) {
+            parsed = strtoul(value, &end, 10);
+            if (!end || *end || parsed > 0xffffffffULL)
+                return -EINVAL;
+            fsi->root_gid = (gid32_t)parsed;
+        }
+    }
+
+    return 0;
 }
 
 static devtmpfs_dirent_t *
@@ -264,6 +323,7 @@ static void devtmpfs_free_dirent(devtmpfs_dirent_t *de) {
 }
 
 static struct vfs_inode *devtmpfs_new_inode(struct vfs_super_block *sb,
+                                            struct vfs_inode *dir,
                                             umode_t mode) {
     struct vfs_inode *inode = vfs_alloc_inode(sb);
     devtmpfs_inode_info_t *info = devtmpfs_i(inode);
@@ -275,9 +335,7 @@ static struct vfs_inode *devtmpfs_new_inode(struct vfs_super_block *sb,
     llist_init_head(&info->children);
     inode->i_op = &devtmpfs_inode_ops;
     inode->i_fop = S_ISDIR(mode) ? &devtmpfs_dir_file_ops : &devtmpfs_file_ops;
-    inode->i_mode = mode;
-    inode->i_uid = 0;
-    inode->i_gid = 0;
+    vfs_inode_init_owner(inode, dir, mode);
     inode->i_nlink = S_ISDIR(mode) ? 2 : 1;
     inode->i_blkbits = 12;
     inode->i_ino = (ino64_t)(uintptr_t)inode;
@@ -335,7 +393,7 @@ static int devtmpfs_create_common(struct vfs_inode *dir,
     if (devtmpfs_find_dirent(dir, dentry->d_name.name))
         return -EEXIST;
 
-    inode = devtmpfs_new_inode(dir->i_sb, mode);
+    inode = devtmpfs_new_inode(dir->i_sb, dir, mode);
     if (!inode)
         return -ENOMEM;
 
@@ -549,9 +607,7 @@ static const char *devtmpfs_get_link(struct vfs_dentry *dentry,
 }
 
 static int devtmpfs_permission(struct vfs_inode *inode, int mask) {
-    (void)inode;
-    (void)mask;
-    return 0;
+    return vfs_inode_permission(inode, mask);
 }
 
 static int devtmpfs_getattr(const struct vfs_path *path, struct vfs_kstat *stat,
@@ -836,6 +892,7 @@ static int devtmpfs_get_tree(struct vfs_fs_context *fc) {
     vfs_node_t *root_inode;
     struct vfs_dentry *root_dentry;
     struct vfs_qstr root_name = {.name = "", .len = 0, .hash = 0};
+    int opt_ret;
 
     if (!fc)
         return -EINVAL;
@@ -852,13 +909,23 @@ static int devtmpfs_get_tree(struct vfs_fs_context *fc) {
     sb->s_magic = DEVTMPFS_MAGIC;
     sb->s_fs_info = fsi;
     fc->fs_private = NULL;
+    fsi->root_uid = vfs_current_fsuid();
+    fsi->root_gid = vfs_current_fsgid();
+    fsi->root_mode = S_IFDIR | 0755;
+    opt_ret = devtmpfs_parse_mount_options(fsi, fc->data);
+    if (opt_ret < 0) {
+        vfs_put_super(sb);
+        return opt_ret;
+    }
 
-    root_inode = devtmpfs_new_inode(sb, S_IFDIR | 0755);
+    root_inode = devtmpfs_new_inode(sb, NULL, fsi->root_mode);
     if (!root_inode) {
         vfs_put_super(sb);
         return -ENOMEM;
     }
 
+    root_inode->i_uid = fsi->root_uid;
+    root_inode->i_gid = fsi->root_gid;
     root_dentry = vfs_d_alloc(sb, NULL, &root_name);
     if (!root_dentry) {
         vfs_iput(root_inode);
@@ -1422,6 +1489,40 @@ ssize_t urandom_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
 
 extern char *default_console;
 
+static ssize_t ttydev_ioctl(void *data, ssize_t request, ssize_t arg,
+                            fd_t *fd) {
+    (void)data;
+    (void)fd;
+    if (!kernel_session)
+        return -ENODEV;
+    return tty_ioctl(kernel_session, (int)request, (void *)arg);
+}
+
+static ssize_t ttydev_poll(void *data, int events) {
+    (void)data;
+    if (!kernel_session)
+        return -ENODEV;
+    return tty_poll(kernel_session, events);
+}
+
+static ssize_t ttydev_read(void *data, void *buf, uint64_t offset, uint64_t len,
+                           fd_t *fd) {
+    (void)data;
+    if (!kernel_session)
+        return -ENODEV;
+    return tty_read(kernel_session, buf, offset, len,
+                    fd ? fd_get_flags(fd) : 0);
+}
+
+static ssize_t ttydev_write(void *data, void *buf, uint64_t offset,
+                            uint64_t len, fd_t *fd) {
+    (void)data;
+    (void)fd;
+    if (!kernel_session)
+        return -ENODEV;
+    return tty_write(kernel_session, buf, offset, len, 0);
+}
+
 void setup_console_symlinks() {
     vfs_node_t *tty_node =
         devtmpfs_lookup_inode_path(default_console, LOOKUP_FOLLOW);
@@ -1431,16 +1532,12 @@ void setup_console_symlinks() {
         return;
 
     vfs_mknodat(AT_FDCWD, "/dev/console", 0600 | S_IFCHR, tty_node->i_rdev);
-    vfs_mknodat(AT_FDCWD, "/dev/tty", 0600 | S_IFCHR, tty_node->i_rdev);
     tty0_node = devtmpfs_lookup_inode_path("/dev/tty0", LOOKUP_FOLLOW);
     if (!tty0_node)
         vfs_mknodat(AT_FDCWD, "/dev/tty0", 0600 | S_IFCHR, tty_node->i_rdev);
     else
         vfs_iput(tty0_node);
     vfs_mknodat(AT_FDCWD, "/dev/tty1", 0600 | S_IFCHR, tty_node->i_rdev);
-    vfs_mknodat(AT_FDCWD, "/dev/stdin", 0600 | S_IFCHR, tty_node->i_rdev);
-    vfs_mknodat(AT_FDCWD, "/dev/stdout", 0600 | S_IFCHR, tty_node->i_rdev);
-    vfs_mknodat(AT_FDCWD, "/dev/stderr", 0600 | S_IFCHR, tty_node->i_rdev);
 
     vfs_iput(tty_node);
 }
@@ -1560,6 +1657,8 @@ void devfs_nodes_init() {
                    urandom_ioctl, NULL, urandom_read, urandom_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, kernel_session, "kmsg", 0, NULL, NULL,
                    kmsg_ioctl, kmsg_poll, kmsg_read, kmsg_write, NULL);
+    device_install(DEV_CHAR, DEV_SYSDEV, NULL, "tty", 0, NULL, NULL,
+                   ttydev_ioctl, ttydev_poll, ttydev_read, ttydev_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, NULL, "rfkill", 0, NULL, NULL, NULL,
                    rfkill_poll, rfkill_read, NULL, NULL);
 

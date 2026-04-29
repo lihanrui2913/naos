@@ -19,7 +19,7 @@ mkdir -p "$(dirname "$XBPS_INSTALL_PATH")"
 [ $ARCH == aarch64 ] && export ARCH_SPEC=aarch64
 
 sudo XBPS_ARCH=$ARCH $XBPS_INSTALL_PATH/usr/bin/xbps-install -S -r $ROOTFS_SYSROOT -R "http://mirror.nju.edu.cn/voidlinux/current/$ARCH_SPEC" \
-    base-minimal bash coreutils util-linux inetutils bind-utils pciutils iw \
+    base-minimal bash coreutils util-linux inetutils bind-utils pciutils sudo iw \
     gcc binutils make strace sysbench \
     glibc-locales ncurses tzdata which shadow grep elfutils curl \
     seatd eudev dbus xfce4 labwc xorg-server-xwayland xrandr \
@@ -29,5 +29,6 @@ sudo XBPS_ARCH=$ARCH $XBPS_INSTALL_PATH/usr/bin/xbps-install -S -r $ROOTFS_SYSRO
 sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai $ROOTFS_SYSROOT/etc/localtime
 
 sudo chroot $ROOTFS_SYSROOT /bin/bash --login -c "xbps-reconfigure -f glibc-locales"
+sudo chroot $ROOTFS_SYSROOT /bin/bash --login -c "echo \"root:root\" | chpasswd"
 
 sudo cp -r $SCRIPTPATH/base/* $ROOTFS_SYSROOT/

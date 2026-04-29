@@ -480,10 +480,8 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_SETRESGID, (syscall_handle_t)sys_setresgid);
     regist_syscall_handler(SYS_GETRESGID, (syscall_handle_t)sys_getresgid);
     regist_syscall_handler(SYS_GETPGID, (syscall_handle_t)sys_getpgid);
-    regist_syscall_handler(SYS_SETFSUID,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_SETFSGID,
-                           (syscall_handle_t)dummy_syscall_handler);
+    regist_syscall_handler(SYS_SETFSUID, (syscall_handle_t)sys_setfsuid);
+    regist_syscall_handler(SYS_SETFSGID, (syscall_handle_t)sys_setfsgid);
     regist_syscall_handler(SYS_GETSID, (syscall_handle_t)sys_getsid);
     regist_syscall_handler(SYS_CAPGET, (syscall_handle_t)dummy_syscall_handler);
     regist_syscall_handler(SYS_CAPSET, (syscall_handle_t)dummy_syscall_handler);
@@ -502,8 +500,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_STATFS, (syscall_handle_t)sys_statfs);
     regist_syscall_handler(SYS_FSTATFS, (syscall_handle_t)sys_fstatfs);
     // regist_syscall_handler(SYS_SYSFS, (syscall_handle_t)sys_sysfs);
-    regist_syscall_handler(SYS_GETPRIORITY,
-                           (syscall_handle_t)dummy_syscall_handler);
+    regist_syscall_handler(SYS_GETPRIORITY, (syscall_handle_t)sys_getpriority);
     regist_syscall_handler(SYS_SETPRIORITY, (syscall_handle_t)sys_setpriority);
     regist_syscall_handler(SYS_SCHED_SETPARAM,
                            (syscall_handle_t)sys_sched_setparam);
@@ -523,7 +520,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_MUNLOCK, (syscall_handle_t)sys_munlock);
     regist_syscall_handler(SYS_MLOCKALL, (syscall_handle_t)sys_mlockall);
     regist_syscall_handler(SYS_MUNLOCKALL, (syscall_handle_t)sys_munlockall);
-    // regist_syscall_handler(SYS_VHANGUP, (syscall_handle_t)sys_vhangup);
+    regist_syscall_handler(SYS_VHANGUP, (syscall_handle_t)sys_vhangup);
     // regist_syscall_handler(SYS_MODIFY_LDT,
     // (syscall_handle_t)sys_modify_ldt);
     regist_syscall_handler(SYS_PIVOT_ROOT, (syscall_handle_t)sys_pivot_root);

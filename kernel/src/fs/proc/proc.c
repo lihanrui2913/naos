@@ -584,9 +584,7 @@ static int procfs_d_revalidate(struct vfs_dentry *dentry, unsigned int flags) {
 }
 
 static int procfs_permission(struct vfs_inode *inode, int mask) {
-    (void)inode;
-    (void)mask;
-    return 0;
+    return vfs_inode_permission(inode, mask);
 }
 
 static int procfs_getattr(const struct vfs_path *path, struct vfs_kstat *stat,

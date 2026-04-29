@@ -437,6 +437,13 @@ static inline int64_t cred_keep_or_set(int value, int64_t current) {
 }
 
 /**
+ * Linux contract: virtually hang up the caller's controlling terminal.
+ * Current kernel: accepts the request as a compatibility no-op. This is enough
+ * for login/getty paths that call vhangup() to reset inherited terminal state.
+ */
+static inline uint64_t sys_vhangup(void) { return 0; }
+
+/**
  * Linux contract: set real/effective/saved user IDs according to setuid(2).
  * Current kernel: updates all three IDs unconditionally for the caller.
  * Gaps: Linux capability and permission checks are not implemented.
@@ -448,6 +455,7 @@ static inline uint64_t sys_setuid(uint64_t uid) {
     current_task->uid = uid;
     current_task->euid = uid;
     current_task->suid = uid;
+    current_task->fsuid = uid;
     return 0;
 }
 
@@ -500,6 +508,8 @@ static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
     current_task->suid = cred_keep_or_set(suid, current_task->suid);
+    if (euid != -1)
+        current_task->fsuid = current_task->euid;
 
     return 0;
 }
@@ -514,6 +524,8 @@ static inline uint64_t sys_setreuid(int ruid, int euid) {
 
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
+    if (euid != -1)
+        current_task->fsuid = current_task->euid;
     if (ruid != -1 || (euid != -1 && current_task->euid != old_ruid))
         current_task->suid = current_task->euid;
 
@@ -554,6 +566,8 @@ static inline uint64_t sys_setresgid(int rgid, int egid, int sgid) {
     current_task->gid = cred_keep_or_set(rgid, current_task->gid);
     current_task->egid = cred_keep_or_set(egid, current_task->egid);
     current_task->sgid = cred_keep_or_set(sgid, current_task->sgid);
+    if (egid != -1)
+        current_task->fsgid = current_task->egid;
 
     return 0;
 }
@@ -566,6 +580,8 @@ static inline uint64_t sys_setregid(int rgid, int egid) {
 
     current_task->gid = cred_keep_or_set(rgid, current_task->gid);
     current_task->egid = cred_keep_or_set(egid, current_task->egid);
+    if (egid != -1)
+        current_task->fsgid = current_task->egid;
     if (rgid != -1 || (egid != -1 && current_task->egid != old_rgid))
         current_task->sgid = current_task->egid;
 
@@ -584,7 +600,44 @@ static inline uint64_t sys_setgid(uint64_t gid) {
     current_task->gid = gid;
     current_task->egid = gid;
     current_task->sgid = gid;
+    current_task->fsgid = gid;
     return 0;
+}
+
+/**
+ * Linux contract: set the caller's filesystem uid and return the old fsuid.
+ * The change is accepted for root or for one of the caller's existing saved
+ * user IDs; otherwise Linux keeps the old fsuid and still returns it.
+ */
+static inline uint64_t sys_setfsuid(uint64_t uid) {
+    int64_t old = current_task->fsuid;
+
+    if (uid <= 0xffffffffULL &&
+        (current_task->euid == 0 || (int64_t)uid == current_task->uid ||
+         (int64_t)uid == current_task->euid ||
+         (int64_t)uid == current_task->suid ||
+         (int64_t)uid == current_task->fsuid)) {
+        current_task->fsuid = (int64_t)uid;
+    }
+
+    return (uint64_t)old;
+}
+
+/**
+ * Linux contract: set the caller's filesystem gid and return the old fsgid.
+ */
+static inline uint64_t sys_setfsgid(uint64_t gid) {
+    int64_t old = current_task->fsgid;
+
+    if (gid <= 0xffffffffULL &&
+        (current_task->euid == 0 || (int64_t)gid == current_task->gid ||
+         (int64_t)gid == current_task->egid ||
+         (int64_t)gid == current_task->sgid ||
+         (int64_t)gid == current_task->fsgid)) {
+        current_task->fsgid = (int64_t)gid;
+    }
+
+    return (uint64_t)old;
 }
 
 /**
@@ -683,6 +736,7 @@ static inline uint64_t sys_set_tid_address(int *ptr) {
  * scheduler behavior.
  * Gaps: PRIO_PGRP and PRIO_USER are not implemented.
  */
+uint64_t sys_getpriority(int which, int who);
 uint64_t sys_setpriority(int which, int who, int niceval);
 
 /**

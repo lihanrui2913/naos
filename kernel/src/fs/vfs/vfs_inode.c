@@ -1,5 +1,6 @@
 #include "fs/vfs/vfs_internal.h"
 #include "mm/mm.h"
+#include "task/task.h"
 
 static uint32_t vfs_mode_to_type(umode_t mode) {
     switch (mode & S_IFMT) {
@@ -100,8 +101,79 @@ void vfs_inode_init_owner(struct vfs_inode *inode, struct vfs_inode *dir,
                           umode_t mode) {
     if (!inode)
         return;
+
+    uid32_t uid = 0;
+    gid32_t gid = 0;
+    vfs_init_new_inode_owner(dir, &mode, &uid, &gid);
     inode->i_mode = mode;
-    inode->i_uid = dir ? dir->i_uid : 0;
-    inode->i_gid = dir ? dir->i_gid : 0;
+    inode->i_uid = uid;
+    inode->i_gid = gid;
     inode->type = vfs_mode_to_type(mode);
+}
+
+uid32_t vfs_current_fsuid(void) {
+    task_t *task = current_task;
+
+    if (!task)
+        return 0;
+    return (uid32_t)task->fsuid;
+}
+
+gid32_t vfs_current_fsgid(void) {
+    task_t *task = current_task;
+
+    if (!task)
+        return 0;
+    return (gid32_t)task->fsgid;
+}
+
+void vfs_init_new_inode_owner(struct vfs_inode *dir, umode_t *mode,
+                              uid32_t *uid, gid32_t *gid) {
+    uid32_t new_uid = vfs_current_fsuid();
+    gid32_t new_gid = vfs_current_fsgid();
+    umode_t new_mode = mode ? *mode : 0;
+
+    if (dir && (dir->i_mode & S_ISGID)) {
+        new_gid = dir->i_gid;
+        if (S_ISDIR(new_mode))
+            new_mode |= S_ISGID;
+    } else if ((new_mode & S_ISGID) && !S_ISDIR(new_mode) &&
+               vfs_current_fsuid() != 0) {
+        new_mode &= ~S_ISGID;
+    }
+
+    if (mode)
+        *mode = new_mode;
+    if (uid)
+        *uid = new_uid;
+    if (gid)
+        *gid = new_gid;
+}
+
+int vfs_inode_permission(struct vfs_inode *inode, int mask) {
+    uid32_t fsuid;
+    gid32_t fsgid;
+    umode_t mode;
+    int granted;
+
+    if (!inode)
+        return -ENOENT;
+    mask &= VFS_MAY_READ | VFS_MAY_WRITE | VFS_MAY_EXEC;
+    if (!mask)
+        return 0;
+
+    fsuid = vfs_current_fsuid();
+    if (fsuid == 0)
+        return 0;
+
+    fsgid = vfs_current_fsgid();
+    mode = inode->i_mode;
+    if (fsuid == inode->i_uid)
+        granted = (mode >> 6) & 7;
+    else if (fsgid == inode->i_gid)
+        granted = (mode >> 3) & 7;
+    else
+        granted = mode & 7;
+
+    return ((granted & mask) == mask) ? 0 : -EACCES;
 }
