@@ -38,10 +38,14 @@ static int vfs_open_last_lookups(int dfd, const char *name,
                                  &parent_type);
     if (ret < 0)
         return ret;
-    if (!parent->dentry || !parent->dentry->d_inode)
-        return -ENOENT;
-    if (!S_ISDIR(parent->dentry->d_inode->i_mode))
-        return -ENOTDIR;
+    if (!parent->dentry || !parent->dentry->d_inode) {
+        ret = -ENOENT;
+        goto err_parent;
+    }
+    if (!S_ISDIR(parent->dentry->d_inode->i_mode)) {
+        ret = -ENOTDIR;
+        goto err_parent;
+    }
 
     dentry = vfs_d_lookup(parent->dentry, last);
     if (dentry) {
@@ -96,6 +100,10 @@ static int vfs_open_last_lookups(int dfd, const char *name,
         return -ENOENT;
     *res_dentry = dentry;
     return 0;
+
+err_parent:
+    vfs_path_put(parent);
+    return ret;
 }
 
 struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
@@ -176,18 +184,20 @@ void vfs_poll_wait_init(vfs_poll_wait_t *wait, struct task *task,
 }
 
 int vfs_poll_wait_arm(vfs_node_t *node, vfs_poll_wait_t *wait) {
-    if (!node || !wait || !wait->task)
+    if (!node || !wait || (!wait->task && !wait->notify_node))
         return -EINVAL;
     if (wait->armed)
         return 0;
 
     wait->watch_node = node;
-    wait->revents = 0;
+    __atomic_store_n(&wait->revents, 0, __ATOMIC_RELEASE);
 
     spin_lock(&node->poll_waiters_lock);
     llist_append(&node->poll_waiters, &wait->node);
     wait->armed = true;
     vfs_igrab(node);
+    if (wait->notify_node)
+        vfs_igrab(wait->notify_node);
     spin_unlock(&node->poll_waiters_lock);
     return 0;
 }
@@ -204,10 +214,14 @@ void vfs_poll_wait_disarm(vfs_poll_wait_t *wait) {
         llist_delete(&wait->node);
         wait->armed = false;
         vfs_iput(node);
+        if (wait->notify_node)
+            vfs_iput(wait->notify_node);
     }
     spin_unlock(&node->poll_waiters_lock);
 
     wait->watch_node = NULL;
+    wait->notify_node = NULL;
+    wait->notify_events = 0;
     llist_init_head(&wait->node);
 }
 
@@ -225,7 +239,7 @@ int vfs_poll_wait_sleep(vfs_node_t *node, vfs_poll_wait_t *wait,
         deadline = nano_time() + (uint64_t)timeout_ns;
 
     while (true) {
-        if (wait->revents & want)
+        if (__atomic_load_n(&wait->revents, __ATOMIC_ACQUIRE) & want)
             return EOK;
         if (task_signal_has_deliverable(wait->task))
             return -EINTR;
@@ -268,9 +282,19 @@ void vfs_poll_notify(vfs_node_t *node, uint32_t events) {
         node->poll_seq_pri++;
 
     llist_for_each(pos, tmp, &node->poll_waiters, node) {
-        pos->revents |= events;
-        if (pos->task)
+        uint32_t want =
+            pos->events | EPOLLERR | EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
+        uint32_t matched = events & want;
+        if (!matched)
+            continue;
+
+        __atomic_fetch_or(&pos->revents, matched, __ATOMIC_ACQ_REL);
+        if (pos->notify_node && pos->notify_node != node) {
+            vfs_poll_notify(pos->notify_node,
+                            pos->notify_events ? pos->notify_events : matched);
+        } else if (pos->task) {
             task_unblock(pos->task, EOK);
+        }
     }
     spin_unlock(&node->poll_waiters_lock);
 }

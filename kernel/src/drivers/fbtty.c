@@ -189,8 +189,7 @@ uint64_t create_session_terminal(tty_t *session) {
     struct flanterm_context *fl_context =
         framebuffer->address
             ? flanterm_fb_init(
-                  malloc, (void (*)(void *, size_t))free,
-                  (void *)framebuffer->address, framebuffer->width,
+                  NULL, NULL, (void *)framebuffer->address, framebuffer->width,
                   framebuffer->height, framebuffer->pitch,
                   framebuffer->red_mask_size, framebuffer->red_mask_shift,
                   framebuffer->green_mask_size, framebuffer->green_mask_shift,

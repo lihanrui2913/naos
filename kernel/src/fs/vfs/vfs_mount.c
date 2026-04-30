@@ -118,14 +118,14 @@ static void vfs_rebind_task_root_paths(const struct vfs_path *old_root,
     if (!fs)
         return;
 
+    spin_lock(&fs->lock);
     replace_root =
         fs->root.mnt == old_root->mnt && fs->root.dentry == old_root->dentry;
     replace_pwd =
         fs->pwd.mnt == old_root->mnt && fs->pwd.dentry == old_root->dentry;
     if (!replace_root && !replace_pwd)
-        return;
+        goto out;
 
-    spin_lock(&fs->lock);
     if (replace_root) {
         vfs_path_put(&fs->root);
         fs->root.mnt = vfs_mntget(new_mnt);
@@ -137,6 +137,7 @@ static void vfs_rebind_task_root_paths(const struct vfs_path *old_root,
         fs->pwd.dentry = vfs_dget(new_mnt->mnt_root);
     }
     fs->seq++;
+out:
     spin_unlock(&fs->lock);
 }
 
@@ -809,7 +810,7 @@ static int vfs_mount_attach_tree(struct vfs_mount *parent,
         return -EBUSY;
     }
 
-    child->mnt_parent = parent ? parent : child;
+    child->mnt_parent = parent ? vfs_mntget(parent) : child;
     child->mnt_mountpoint = vfs_dget(mountpoint);
     child->mnt_stack_prev = mountpoint->d_mounted;
     child->mnt_stack_next = NULL;
@@ -824,16 +825,37 @@ static int vfs_mount_attach_tree(struct vfs_mount *parent,
 }
 
 void vfs_mntput(struct vfs_mount *mnt) {
+    struct vfs_mount *parent;
+    struct vfs_dentry *mountpoint;
+    struct vfs_mount *below;
+    struct vfs_mount *above;
+
     if (!mnt)
         return;
     if (!vfs_ref_put(&mnt->mnt_ref))
         return;
+
+    parent =
+        (mnt->mnt_parent && mnt->mnt_parent != mnt) ? mnt->mnt_parent : NULL;
+    mountpoint = mnt->mnt_mountpoint;
+    below = mnt->mnt_stack_prev;
+    above = mnt->mnt_stack_next;
+
+    if (above)
+        above->mnt_stack_prev = below;
+    if (below)
+        below->mnt_stack_next = above;
+    if (mountpoint && mountpoint->d_mounted == mnt)
+        mountpoint->d_mounted = below;
+    if (mountpoint && !mountpoint->d_mounted)
+        mountpoint->d_flags &= ~VFS_DENTRY_MOUNTPOINT;
+
     if (!llist_empty(&mnt->mnt_child))
         llist_delete(&mnt->mnt_child);
     if (!llist_empty(&mnt->mnt_sb_link))
         llist_delete(&mnt->mnt_sb_link);
-    if (mnt->mnt_mountpoint)
-        vfs_dput(mnt->mnt_mountpoint);
+    if (mountpoint)
+        vfs_dput(mountpoint);
     if (mnt->mnt_root)
         vfs_dput(mnt->mnt_root);
     if (mnt->mnt_sb)
@@ -847,6 +869,8 @@ void vfs_mntput(struct vfs_mount *mnt) {
     mnt->mnt_sb = NULL;
     mnt->mnt_propagation_source_id = 0;
     free(mnt);
+    if (parent)
+        vfs_mntput(parent);
 }
 
 static int vfs_mount_attach_locked(struct vfs_mount *parent,
@@ -862,7 +886,7 @@ static int vfs_mount_attach_locked(struct vfs_mount *parent,
         return -EBUSY;
     }
 
-    child->mnt_parent = parent ? parent : child;
+    child->mnt_parent = parent ? vfs_mntget(parent) : child;
     child->mnt_mountpoint = vfs_dget(mountpoint);
     child->mnt_stack_prev = mountpoint->d_mounted;
     child->mnt_stack_next = NULL;
@@ -893,6 +917,8 @@ static int vfs_mount_attach_locked(struct vfs_mount *parent,
         if (!mountpoint->d_mounted)
             mountpoint->d_flags &= ~VFS_DENTRY_MOUNTPOINT;
         vfs_dput(child->mnt_mountpoint);
+        if (child->mnt_parent && child->mnt_parent != child)
+            vfs_mntput(child->mnt_parent);
         child->mnt_parent = child;
         child->mnt_mountpoint = NULL;
         child->mnt_stack_prev = NULL;
@@ -925,12 +951,15 @@ int vfs_mount_attach(struct vfs_mount *parent, struct vfs_dentry *mountpoint,
 
 static void vfs_mount_detach_locked(struct vfs_mount *mnt, bool propagate) {
     struct vfs_dentry *mountpoint;
+    struct vfs_mount *parent;
     struct vfs_mount *below;
     struct vfs_mount *above;
 
     if (!mnt)
         return;
     mountpoint = mnt->mnt_mountpoint;
+    parent =
+        (mnt->mnt_parent && mnt->mnt_parent != mnt) ? mnt->mnt_parent : NULL;
     below = mnt->mnt_stack_prev;
     above = mnt->mnt_stack_next;
 
@@ -959,6 +988,8 @@ static void vfs_mount_detach_locked(struct vfs_mount *mnt, bool propagate) {
     vfs_init_mnt_ns.seq++;
     if (mountpoint)
         vfs_dput(mountpoint);
+    if (parent)
+        vfs_mntput(parent);
 }
 
 void vfs_mount_detach(struct vfs_mount *mnt) {
@@ -1460,10 +1491,15 @@ int vfs_pivot_root_mounts(struct vfs_mount *old_root,
     if (new_root->mnt_parent == new_root || !new_root->mnt_mountpoint)
         return -EINVAL;
 
-    new_root_parent = new_root->mnt_parent;
+    new_root_parent = vfs_mntget(new_root->mnt_parent);
     new_root_mountpoint = vfs_dget(new_root->mnt_mountpoint);
-    if (!new_root_mountpoint)
+    if (!new_root_parent || !new_root_mountpoint) {
+        if (new_root_parent)
+            vfs_mntput(new_root_parent);
+        if (new_root_mountpoint)
+            vfs_dput(new_root_mountpoint);
         return -ENOMEM;
+    }
 
     mutex_lock(&vfs_mount_lock);
 
@@ -1474,11 +1510,13 @@ int vfs_pivot_root_mounts(struct vfs_mount *old_root,
         (void)vfs_mount_attach_locked(new_root_parent, new_root_mountpoint,
                                       new_root, false);
         mutex_unlock(&vfs_mount_lock);
+        vfs_mntput(new_root_parent);
         vfs_dput(new_root_mountpoint);
         return ret;
     }
 
     mutex_unlock(&vfs_mount_lock);
+    vfs_mntput(new_root_parent);
     vfs_dput(new_root_mountpoint);
     return 0;
 }
@@ -1534,7 +1572,8 @@ int vfs_reconfigure_mount(struct vfs_mount *mnt, const struct vfs_path *to_path,
     mutex_lock(&vfs_mount_lock);
 
     if (!detached) {
-        old_parent = mnt->mnt_parent != mnt ? mnt->mnt_parent : NULL;
+        old_parent =
+            mnt->mnt_parent != mnt ? vfs_mntget(mnt->mnt_parent) : NULL;
         old_mountpoint =
             mnt->mnt_mountpoint ? vfs_dget(mnt->mnt_mountpoint) : NULL;
         vfs_mount_detach_locked(mnt, false);
@@ -1556,6 +1595,8 @@ int vfs_reconfigure_mount(struct vfs_mount *mnt, const struct vfs_path *to_path,
         vfs_rebind_namespace_root(&old_root, mnt);
 
 out:
+    if (old_parent)
+        vfs_mntput(old_parent);
     if (old_mountpoint)
         vfs_dput(old_mountpoint);
     vfs_path_put(&old_root);

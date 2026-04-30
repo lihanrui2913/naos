@@ -90,14 +90,12 @@ clean:
 	$(MAKE) -C kernel clean
 	$(MAKE) -C user clean
 	rm -rf $(IMAGE_NAME).img
-	rm -rf rootfs-$(ARCH) obj-modules-$(ARCH) modules-$(ARCH)
 
 .PHONY: distclean
 distclean:
 	$(MAKE) -C kernel distclean
 	$(MAKE) -C user distclean
 	rm -rf *.img assets
-	rm -rf rootfs-$(ARCH) obj-modules-$(ARCH) modules-$(ARCH)
 
 clippy:
 	$(MAKE) -C kernel clippy

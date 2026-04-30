@@ -22,6 +22,44 @@ static inline bool vfs_lookup_is_scoped(unsigned int lookup_flags) {
 }
 
 static bool vfs_mount_is_same_or_descendant(const struct vfs_mount *root,
+                                            const struct vfs_mount *mnt);
+
+static bool vfs_process_path_get(struct vfs_process_fs *fs, bool root,
+                                 struct vfs_path *out) {
+    struct vfs_path *src;
+
+    if (!fs || !out)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    spin_lock(&fs->lock);
+    src = root ? &fs->root : &fs->pwd;
+    if (src->mnt && src->dentry) {
+        out->mnt = vfs_mntget(src->mnt);
+        out->dentry = vfs_dget(src->dentry);
+    }
+    spin_unlock(&fs->lock);
+
+    return out->mnt && out->dentry;
+}
+
+static bool vfs_process_path_get_if_visible(struct vfs_process_fs *fs,
+                                            bool root,
+                                            struct vfs_mount *ns_root_mnt,
+                                            struct vfs_path *out) {
+    if (!vfs_process_path_get(fs, root, out))
+        return false;
+
+    if (ns_root_mnt && ns_root_mnt->mnt_root &&
+        !vfs_mount_is_same_or_descendant(ns_root_mnt, out->mnt)) {
+        vfs_path_put(out);
+        return false;
+    }
+
+    return true;
+}
+
+static bool vfs_mount_is_same_or_descendant(const struct vfs_mount *root,
                                             const struct vfs_mount *mnt) {
     const struct vfs_mount *cursor;
 
@@ -72,24 +110,19 @@ static int vfs_get_scoped_start(struct vfs_process_fs *fs,
                                 struct vfs_path *scoped) {
     struct vfs_file *file;
     int ret;
-    bool pwd_valid;
+    struct vfs_path fs_path = {0};
 
     if (!scoped)
         return -EINVAL;
     memset(scoped, 0, sizeof(*scoped));
 
     if (dfd == AT_FDCWD) {
-        pwd_valid = fs && fs->pwd.mnt && fs->pwd.dentry &&
-                    (!ns_root_mnt || !ns_root_mnt->mnt_root ||
-                     vfs_mount_is_same_or_descendant(ns_root_mnt, fs->pwd.mnt));
-        if (pwd_valid) {
-            vfs_path_get(&fs->pwd);
-            *scoped = fs->pwd;
+        if (vfs_process_path_get_if_visible(fs, false, ns_root_mnt, &fs_path)) {
+            *scoped = fs_path;
             return 0;
         }
-        if (fs && fs->root.mnt && fs->root.dentry) {
-            vfs_path_get(&fs->root);
-            *scoped = fs->root;
+        if (vfs_process_path_get(fs, true, &fs_path)) {
+            *scoped = fs_path;
             return 0;
         }
         return -ENOENT;
@@ -118,8 +151,7 @@ static int vfs_get_fs_start(int dfd, const char *name,
     struct vfs_file *file;
     struct vfs_mount *ns_root_mnt;
     int fd_path_ret;
-    bool root_valid;
-    bool pwd_valid;
+    struct vfs_path fs_path = {0};
 
     if (!start || !root)
         return -EINVAL;
@@ -155,12 +187,8 @@ static int vfs_get_fs_start(int dfd, const char *name,
         return -EBADF;
     }
 
-    root_valid = fs->root.mnt && fs->root.dentry &&
-                 (!ns_root_mnt || !ns_root_mnt->mnt_root ||
-                  vfs_mount_is_same_or_descendant(ns_root_mnt, fs->root.mnt));
-    if (root_valid) {
-        vfs_path_get(&fs->root);
-        *root = fs->root;
+    if (vfs_process_path_get_if_visible(fs, true, ns_root_mnt, &fs_path)) {
+        *root = fs_path;
     } else if (ns_root_mnt && ns_root_mnt->mnt_root) {
         root->mnt = vfs_mntget(ns_root_mnt);
         root->dentry = vfs_dget(ns_root_mnt->mnt_root);
@@ -210,12 +238,8 @@ static int vfs_get_fs_start(int dfd, const char *name,
     }
 
     if (dfd == AT_FDCWD) {
-        pwd_valid = fs->pwd.mnt && fs->pwd.dentry &&
-                    (!ns_root_mnt || !ns_root_mnt->mnt_root ||
-                     vfs_mount_is_same_or_descendant(ns_root_mnt, fs->pwd.mnt));
-        if (pwd_valid) {
-            vfs_path_get(&fs->pwd);
-            *start = fs->pwd;
+        if (vfs_process_path_get_if_visible(fs, false, ns_root_mnt, &fs_path)) {
+            *start = fs_path;
         } else {
             vfs_path_get(root);
             *start = *root;

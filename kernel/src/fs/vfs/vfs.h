@@ -185,7 +185,9 @@ typedef struct vfs_poll_wait {
     struct llist_header node;
     struct task *task;
     struct vfs_inode *watch_node;
+    struct vfs_inode *notify_node;
     uint32_t events;
+    uint32_t notify_events;
     volatile uint32_t revents;
     volatile bool armed;
 } vfs_poll_wait_t;

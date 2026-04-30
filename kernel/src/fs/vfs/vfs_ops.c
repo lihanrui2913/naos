@@ -152,7 +152,7 @@ int vfs_unlinkat(int dfd, const char *pathname, int flags) {
     struct vfs_dentry *victim = NULL;
     struct vfs_mount *mounted = NULL;
     struct vfs_inode *dir;
-    struct vfs_inode *victim_inode;
+    struct vfs_inode *victim_inode = NULL;
     int ret;
 
     ret = vfs_path_parent_lookup(dfd, pathname, LOOKUP_PARENT, &parent, &last,
@@ -177,6 +177,12 @@ int vfs_unlinkat(int dfd, const char *pathname, int flags) {
     if (ret < 0)
         goto out;
 
+    victim_inode = vfs_igrab(victim->d_inode);
+    if (!victim_inode) {
+        ret = -ENOENT;
+        goto out;
+    }
+
     if ((flags & AT_REMOVEDIR) || S_ISDIR(victim->d_inode->i_mode)) {
         if (!dir->i_op || !dir->i_op->rmdir) {
             ret = -EOPNOTSUPP;
@@ -191,7 +197,6 @@ int vfs_unlinkat(int dfd, const char *pathname, int flags) {
         ret = dir->i_op->unlink(dir, victim);
     }
 
-    victim_inode = victim->d_inode;
     if (ret == 0) {
         notifyfs_queue_inode_event(dir, victim_inode, victim->d_name.name,
                                    IN_DELETE, 0);
@@ -202,6 +207,8 @@ int vfs_unlinkat(int dfd, const char *pathname, int flags) {
     }
 
 out:
+    if (victim_inode)
+        vfs_iput(victim_inode);
     if (victim)
         vfs_dput(victim);
     vfs_path_put(&parent);
@@ -376,7 +383,7 @@ int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
     ctx.new_dir = new_parent.dentry->d_inode;
     ctx.new_dentry = new_dentry;
     ctx.flags = flags;
-    moved_inode = old_dentry->d_inode;
+    moved_inode = vfs_igrab(old_dentry->d_inode);
 
     if (!ctx.old_dir || !ctx.old_dir->i_op || !ctx.old_dir->i_op->rename) {
         ret = -EOPNOTSUPP;
@@ -414,6 +421,8 @@ int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
     }
 
 out:
+    if (moved_inode)
+        vfs_iput(moved_inode);
     if (old_dentry)
         vfs_dput(old_dentry);
     if (new_dentry)
