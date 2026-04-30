@@ -6,7 +6,7 @@ int vfs_sys_openat(int dfd, const char *pathname,
     struct vfs_file *file = NULL;
     int ret;
 
-    ret = vfs_openat(dfd, pathname, how, &file);
+    ret = vfs_openat(dfd, pathname, how, &file, false);
     if (ret < 0)
         return ret;
 

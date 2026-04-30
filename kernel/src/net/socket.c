@@ -459,7 +459,7 @@ static uint64_t unix_socket_name_hash(const char *name) {
 static void unix_socket_unlink_bound_path(const char *path) {
     if (!path || !path[0])
         return;
-    (void)vfs_unlinkat(AT_FDCWD, path, 0);
+    (void)vfs_unlinkat(AT_FDCWD, path, 0, true);
 }
 
 static inline unix_socket_bind_bucket_t *
@@ -1844,7 +1844,7 @@ int socket_bind(uint64_t fd, const struct sockaddr_un *addr,
             vfs_file_put(file);
             return -EADDRINUSE;
         }
-        int mkret = vfs_mknodat(AT_FDCWD, safe, S_IFSOCK | 0666, 0);
+        int mkret = vfs_mknodat(AT_FDCWD, safe, S_IFSOCK | 0666, 0, true);
         if (mkret < 0) {
             free(safe);
             vfs_file_put(file);

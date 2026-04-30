@@ -89,12 +89,14 @@ user/.build-stamp-$(ARCH):
 clean:
 	$(MAKE) -C kernel clean
 	$(MAKE) -C user clean
+	rm -rf obj-modules-$(ARCH) modules-$(ARCH)
 	rm -rf $(IMAGE_NAME).img
 
 .PHONY: distclean
 distclean:
 	$(MAKE) -C kernel distclean
 	$(MAKE) -C user distclean
+	rm -rf obj-modules-$(ARCH) modules-$(ARCH)
 	rm -rf *.img assets
 
 clippy:

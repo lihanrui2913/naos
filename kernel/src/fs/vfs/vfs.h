@@ -185,9 +185,7 @@ typedef struct vfs_poll_wait {
     struct llist_header node;
     struct task *task;
     struct vfs_inode *watch_node;
-    struct vfs_inode *notify_node;
     uint32_t events;
-    uint32_t notify_events;
     volatile uint32_t revents;
     volatile bool armed;
 } vfs_poll_wait_t;
@@ -777,7 +775,7 @@ int vfs_path_parent_lookup(int dfd, const char *name, unsigned int lookup_flags,
  * Open a path relative to dfd and return a referenced open file description.
  */
 int vfs_openat(int dfd, const char *name, const struct vfs_open_how *how,
-               struct vfs_file **out);
+               struct vfs_file **out, bool kernel);
 int vfs_close_file(struct vfs_file *file);
 ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
                       loff_t *ppos);
@@ -791,14 +789,16 @@ int vfs_fsync_file(struct vfs_file *file);
 int vfs_truncate_path(const struct vfs_path *path, uint64_t size);
 int vfs_poll(vfs_node_t *node, size_t events);
 
-int vfs_mkdirat(int dfd, const char *pathname, umode_t mode);
-int vfs_mknodat(int dfd, const char *pathname, umode_t mode, dev64_t dev);
-int vfs_unlinkat(int dfd, const char *pathname, int flags);
+int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel);
+int vfs_mknodat(int dfd, const char *pathname, umode_t mode, dev64_t dev,
+                bool kernel);
+int vfs_unlinkat(int dfd, const char *pathname, int flags, bool kernel);
 int vfs_linkat(int olddfd, const char *oldname, int newdfd, const char *newname,
-               int flags);
-int vfs_symlinkat(const char *target, int newdfd, const char *newname);
+               int flags, bool kernel);
+int vfs_symlinkat(const char *target, int newdfd, const char *newname,
+                  bool kernel);
 int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
-                  const char *newname, unsigned int flags);
+                  const char *newname, unsigned int flags, bool kernel);
 int vfs_statx(int dfd, const char *pathname, int flags, uint32_t mask,
               struct vfs_kstat *stat);
 

@@ -30,7 +30,7 @@ static int vfs_may_delete(struct vfs_inode *dir, struct vfs_inode *victim) {
     return -EPERM;
 }
 
-int vfs_mkdirat(int dfd, const char *pathname, umode_t mode) {
+int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel) {
     struct vfs_path parent = {0};
     struct vfs_qstr last = {0};
     struct vfs_dentry *dentry;
@@ -52,9 +52,12 @@ int vfs_mkdirat(int dfd, const char *pathname, umode_t mode) {
         ret = -EOPNOTSUPP;
         goto out;
     }
-    ret = vfs_may_write_dir(dir);
-    if (ret < 0)
-        goto out;
+
+    if (!kernel) {
+        ret = vfs_may_write_dir(dir);
+        if (ret < 0)
+            goto out;
+    }
 
     dentry = vfs_d_lookup(parent.dentry, &last);
     if (dentry) {
@@ -86,7 +89,8 @@ out:
     return ret;
 }
 
-int vfs_mknodat(int dfd, const char *pathname, umode_t mode, dev64_t dev) {
+int vfs_mknodat(int dfd, const char *pathname, umode_t mode, dev64_t dev,
+                bool kernel) {
     struct vfs_path parent = {0};
     struct vfs_qstr last = {0};
     struct vfs_dentry *dentry;
@@ -108,13 +112,16 @@ int vfs_mknodat(int dfd, const char *pathname, umode_t mode, dev64_t dev) {
         ret = -EOPNOTSUPP;
         goto out;
     }
-    if ((S_ISCHR(mode) || S_ISBLK(mode)) && vfs_current_fsuid() != 0) {
-        ret = -EPERM;
-        goto out;
+
+    if (!kernel) {
+        if ((S_ISCHR(mode) || S_ISBLK(mode)) && vfs_current_fsuid() != 0) {
+            ret = -EPERM;
+            goto out;
+        }
+        ret = vfs_may_write_dir(dir);
+        if (ret < 0)
+            goto out;
     }
-    ret = vfs_may_write_dir(dir);
-    if (ret < 0)
-        goto out;
 
     dentry = vfs_d_lookup(parent.dentry, &last);
     if (dentry) {
@@ -146,7 +153,7 @@ out:
     return ret;
 }
 
-int vfs_unlinkat(int dfd, const char *pathname, int flags) {
+int vfs_unlinkat(int dfd, const char *pathname, int flags, bool kernel) {
     struct vfs_path parent = {0};
     struct vfs_qstr last = {0};
     struct vfs_dentry *victim = NULL;
@@ -217,7 +224,7 @@ out:
 }
 
 int vfs_linkat(int olddfd, const char *oldname, int newdfd, const char *newname,
-               int flags) {
+               int flags, bool kernel) {
     struct vfs_path old_path = {0}, new_parent = {0};
     struct vfs_qstr last = {0};
     struct vfs_dentry *new_dentry = NULL;
@@ -285,7 +292,8 @@ out_old:
     return ret;
 }
 
-int vfs_symlinkat(const char *target, int newdfd, const char *newname) {
+int vfs_symlinkat(const char *target, int newdfd, const char *newname,
+                  bool kernel) {
     struct vfs_path parent = {0};
     struct vfs_qstr last = {0};
     struct vfs_dentry *dentry = NULL;
@@ -307,9 +315,12 @@ int vfs_symlinkat(const char *target, int newdfd, const char *newname) {
         ret = -EOPNOTSUPP;
         goto out;
     }
-    ret = vfs_may_write_dir(dir);
-    if (ret < 0)
-        goto out;
+
+    if (!kernel) {
+        ret = vfs_may_write_dir(dir);
+        if (ret < 0)
+            goto out;
+    }
 
     dentry = vfs_d_lookup(parent.dentry, &last);
     if (dentry) {
@@ -342,7 +353,7 @@ out:
 }
 
 int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
-                  const char *newname, unsigned int flags) {
+                  const char *newname, unsigned int flags, bool kernel) {
     struct vfs_path old_parent = {0}, new_parent = {0};
     struct vfs_qstr old_last = {0}, new_last = {0};
     struct vfs_dentry *old_dentry = NULL, *new_dentry = NULL;

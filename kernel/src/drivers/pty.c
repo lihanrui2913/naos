@@ -245,7 +245,8 @@ static int pty_pair_install_slave_node(pty_pair_t *pair) {
         return -EINVAL;
 
     snprintf(path, sizeof(path), "/dev/pts/%d", pair->id);
-    (void)vfs_mknodat(AT_FDCWD, path, S_IFCHR | 0620, (136U << 8) | pair->id);
+    (void)vfs_mknodat(AT_FDCWD, path, S_IFCHR | 0620, (136U << 8) | pair->id,
+                      true);
     inode = pty_lookup_inode_path(path);
     if (!inode)
         return -ENOENT;
@@ -274,7 +275,7 @@ static void pty_pair_cleanup(pty_pair_t *pair) {
     pair->ptmx_node = NULL;
 
     snprintf(path, sizeof(path), "/dev/pts/%d", pair->id);
-    (void)vfs_unlinkat(AT_FDCWD, path, 0);
+    (void)vfs_unlinkat(AT_FDCWD, path, 0, true);
     pty_bitmap_remove(pair->id);
 
     spin_lock(&pty_global_lock);
@@ -315,7 +316,7 @@ static int pty_open_peer_fd(pty_pair_t *pair, uint64_t flags) {
 
     snprintf(path, sizeof(path), "/dev/pts/%d", pair->id);
     how.flags = O_RDWR | (flags & O_NONBLOCK);
-    ret = vfs_openat(AT_FDCWD, path, &how, &file);
+    ret = vfs_openat(AT_FDCWD, path, &how, &file, true);
     if (ret < 0)
         return ret;
 
@@ -1055,7 +1056,8 @@ static const struct vfs_file_operations pts_file_ops = {
 void ptmx_init() {
     vfs_node_t *ptmx;
 
-    (void)vfs_mknodat(AT_FDCWD, "/dev/ptmx", S_IFCHR | 0666, (5U << 8) | 2U);
+    (void)vfs_mknodat(AT_FDCWD, "/dev/ptmx", S_IFCHR | 0666, (5U << 8) | 2U,
+                      true);
     ptmx = pty_lookup_inode_path("/dev/ptmx");
     if (!ptmx)
         return;
@@ -1065,7 +1067,7 @@ void ptmx_init() {
 }
 
 void pts_init() {
-    (void)vfs_mkdirat(AT_FDCWD, "/dev/pts", 0755);
+    (void)vfs_mkdirat(AT_FDCWD, "/dev/pts", 0755, true);
     if (first_pair.id == 0) {
         first_pair.id = 0xffffffff;
     }

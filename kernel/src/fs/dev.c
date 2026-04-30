@@ -1033,7 +1033,7 @@ static void devfs_ensure_parent_dirs(const char *path) {
 
     for (slash = copy + 1; (slash = strchr(slash, '/')) != NULL; slash++) {
         *slash = '\0';
-        (void)vfs_mkdirat(AT_FDCWD, copy, 0755);
+        (void)vfs_mkdirat(AT_FDCWD, copy, 0755, true);
         *slash = '/';
     }
 
@@ -1058,9 +1058,9 @@ static void devfs_register_existing_devices(void) {
 static void devtmpfs_populate_nodes(void) {
     pty_init();
 
-    (void)vfs_mkdirat(AT_FDCWD, "/dev/shm", 0755);
-    (void)vfs_mkdirat(AT_FDCWD, "/dev/bus", 0755);
-    (void)vfs_mkdirat(AT_FDCWD, "/dev/bus/usb", 0755);
+    (void)vfs_mkdirat(AT_FDCWD, "/dev/shm", 0755, true);
+    (void)vfs_mkdirat(AT_FDCWD, "/dev/bus", 0755, true);
+    (void)vfs_mkdirat(AT_FDCWD, "/dev/bus/usb", 0755, true);
 
     devfs_initialized = true;
     devfs_register_existing_devices();
@@ -1348,7 +1348,7 @@ void devfs_register_device(device_t *device) {
     devfs_ensure_parent_dirs(path);
     vfs_mknodat(AT_FDCWD, path,
                 0600 | (device->type == DEV_BLOCK ? S_IFBLK : S_IFCHR),
-                device->dev);
+                device->dev, true);
 
     if (device->subtype == DEV_INPUT && device->ptr) {
         dev_input_event_t *event = device->ptr;
@@ -1377,12 +1377,12 @@ void devfs_unregister_device(device_t *device) {
         return;
 
     snprintf(path, sizeof(path), "/dev/%s", device->name);
-    vfs_unlinkat(AT_FDCWD, path, 0);
+    vfs_unlinkat(AT_FDCWD, path, 0, true);
 }
 
 void devtmpfs_init() {
     vfs_register_filesystem(&devtmpfs_fs_type);
-    vfs_mkdirat(AT_FDCWD, "/dev", 0755);
+    vfs_mkdirat(AT_FDCWD, "/dev", 0755, true);
     vfs_do_mount(AT_FDCWD, "/dev", "devtmpfs", 0, NULL, NULL);
     devtmpfs_refresh_root();
 }
@@ -1531,13 +1531,15 @@ void setup_console_symlinks() {
     if (!tty_node)
         return;
 
-    vfs_mknodat(AT_FDCWD, "/dev/console", 0600 | S_IFCHR, tty_node->i_rdev);
+    vfs_mknodat(AT_FDCWD, "/dev/console", 0600 | S_IFCHR, tty_node->i_rdev,
+                true);
     tty0_node = devtmpfs_lookup_inode_path("/dev/tty0", LOOKUP_FOLLOW);
     if (!tty0_node)
-        vfs_mknodat(AT_FDCWD, "/dev/tty0", 0600 | S_IFCHR, tty_node->i_rdev);
+        vfs_mknodat(AT_FDCWD, "/dev/tty0", 0600 | S_IFCHR, tty_node->i_rdev,
+                    true);
     else
         vfs_iput(tty0_node);
-    vfs_mknodat(AT_FDCWD, "/dev/tty1", 0600 | S_IFCHR, tty_node->i_rdev);
+    vfs_mknodat(AT_FDCWD, "/dev/tty1", 0600 | S_IFCHR, tty_node->i_rdev, true);
 
     vfs_iput(tty_node);
 }
@@ -1645,9 +1647,9 @@ ssize_t rfkill_poll(void *data, int events) {
 }
 
 void devfs_nodes_init() {
-    vfs_mkdirat(AT_FDCWD, "/dev/shm", 0755);
-    vfs_mkdirat(AT_FDCWD, "/dev/bus", 0755);
-    vfs_mkdirat(AT_FDCWD, "/dev/bus/usb", 0755);
+    vfs_mkdirat(AT_FDCWD, "/dev/shm", 0755, true);
+    vfs_mkdirat(AT_FDCWD, "/dev/bus", 0755, true);
+    vfs_mkdirat(AT_FDCWD, "/dev/bus/usb", 0755, true);
 
     device_install(DEV_CHAR, DEV_SYSDEV, NULL, "null", 0, NULL, nulldev_ioctl,
                    NULL, NULL, nulldev_read, nulldev_write, NULL);

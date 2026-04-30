@@ -138,13 +138,13 @@ void initramfs_init() {
         }
 
         if ((mode & type_mask) == directory_type) {
-            vfs_mkdirat(AT_FDCWD, path, mode & 0777);
+            vfs_mkdirat(AT_FDCWD, path, mode & 0777, true);
             initramfs_set_mode(path, mode);
         } else if ((mode & 0120000) == 0120000) {
             char target_name[file_size + 1];
             memcpy(target_name, data, file_size);
             target_name[file_size] = '\0';
-            vfs_symlinkat(target_name, AT_FDCWD, path);
+            vfs_symlinkat(target_name, AT_FDCWD, path, true);
             initramfs_set_mode(path, mode);
         } else {
             struct vfs_file *file = NULL;
@@ -153,7 +153,7 @@ void initramfs_init() {
                 .mode = mode & 0777,
             };
 
-            ret = vfs_openat(AT_FDCWD, path, &how, &file);
+            ret = vfs_openat(AT_FDCWD, path, &how, &file, true);
             if (ret == 0 && file) {
                 loff_t pos = 0;
                 vfs_write_file(file, data, file_size, &pos);

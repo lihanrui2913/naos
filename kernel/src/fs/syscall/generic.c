@@ -2847,11 +2847,11 @@ uint64_t sys_rmdir(const char *name_user) {
     if (copy_from_user_str(name, name_user, sizeof(name))) {
         return (uint64_t)-EFAULT;
     }
-    return (uint64_t)vfs_unlinkat(AT_FDCWD, name, AT_REMOVEDIR);
+    return (uint64_t)vfs_unlinkat(AT_FDCWD, name, AT_REMOVEDIR, false);
 }
 
 static uint64_t do_unlink(const char *name) {
-    return (uint64_t)vfs_unlinkat(AT_FDCWD, name, 0);
+    return (uint64_t)vfs_unlinkat(AT_FDCWD, name, 0, false);
 }
 
 uint64_t sys_unlink(const char *name_user) {
@@ -2868,11 +2868,11 @@ uint64_t sys_unlinkat(uint64_t dirfd, const char *name_user, uint64_t flags) {
     if (copy_from_user_str(name, name_user, sizeof(name))) {
         return (uint64_t)-EFAULT;
     }
-    return (uint64_t)vfs_unlinkat((int)dirfd, name, (int)flags);
+    return (uint64_t)vfs_unlinkat((int)dirfd, name, (int)flags, false);
 }
 
 uint64_t do_rename(const char *old, const char *new) {
-    return (uint64_t)vfs_renameat2(AT_FDCWD, old, AT_FDCWD, new, 0);
+    return (uint64_t)vfs_renameat2(AT_FDCWD, old, AT_FDCWD, new, 0, false);
 }
 
 uint64_t sys_rename(const char *old_user, const char *new_user) {
@@ -2897,7 +2897,7 @@ uint64_t sys_renameat(uint64_t oldfd, const char *old_user, uint64_t newfd,
     if (copy_from_user_str(new, new_user, sizeof(new)))
         return (uint64_t)-EFAULT;
 
-    return (uint64_t)vfs_renameat2((int)oldfd, old, (int)newfd, new, 0);
+    return (uint64_t)vfs_renameat2((int)oldfd, old, (int)newfd, new, 0, false);
 }
 
 uint64_t sys_renameat2(uint64_t oldfd, const char *old_user, uint64_t newfd,
@@ -2911,7 +2911,7 @@ uint64_t sys_renameat2(uint64_t oldfd, const char *old_user, uint64_t newfd,
         return (uint64_t)-EFAULT;
 
     return (uint64_t)vfs_renameat2((int)oldfd, old, (int)newfd, new,
-                                   (unsigned int)flags);
+                                   (unsigned int)flags, false);
 }
 
 uint64_t sys_fchdir(uint64_t fd) {
@@ -2932,7 +2932,7 @@ uint64_t do_mkdir(const char *name, uint64_t mode) {
     umode_t dir_mode = (umode_t)(mode & 0777);
     if (current_task && current_task->fs)
         dir_mode &= ~current_task->fs->umask;
-    return (uint64_t)vfs_mkdirat(AT_FDCWD, name, dir_mode);
+    return (uint64_t)vfs_mkdirat(AT_FDCWD, name, dir_mode, false);
 }
 
 uint64_t sys_mkdir(const char *name_user, uint64_t mode) {
@@ -2950,11 +2950,11 @@ uint64_t sys_mkdirat(int dfd, const char *name_user, uint64_t mode) {
     umode_t dir_mode = (umode_t)(mode & 0777);
     if (current_task && current_task->fs)
         dir_mode &= ~current_task->fs->umask;
-    return (uint64_t)vfs_mkdirat((int)dfd, name, dir_mode);
+    return (uint64_t)vfs_mkdirat((int)dfd, name, dir_mode, false);
 }
 
 uint64_t do_link(const char *name, const char *new) {
-    return (uint64_t)vfs_linkat(AT_FDCWD, name, AT_FDCWD, new, 0);
+    return (uint64_t)vfs_linkat(AT_FDCWD, name, AT_FDCWD, new, 0, false);
 }
 
 static int parse_proc_self_fd_path(const char *path, int *fd_out) {
@@ -3043,7 +3043,7 @@ uint64_t sys_link(const char *name_user, const char *new_user) {
 }
 
 uint64_t do_symlink(const char *name, const char *new) {
-    return (uint64_t)vfs_symlinkat(name, AT_FDCWD, new);
+    return (uint64_t)vfs_symlinkat(name, AT_FDCWD, new, false);
 }
 
 uint64_t sys_symlink(const char *name_user, const char *target_name_user) {
@@ -3083,7 +3083,7 @@ uint64_t sys_linkat(uint64_t olddirfd, const char *oldpath_user,
         vfs_path_put(&source);
     } else {
         ret = vfs_linkat((int)olddirfd, oldpath, (int)newdirfd, newpath,
-                         flags & AT_SYMLINK_FOLLOW);
+                         flags & AT_SYMLINK_FOLLOW, false);
     }
 
     return ret;
@@ -3096,7 +3096,7 @@ uint64_t sys_symlinkat(const char *name_user, int dfd, const char *new_user) {
     char new[512];
     if (copy_from_user_str(new, new_user, sizeof(new)))
         return (uint64_t)-EFAULT;
-    return (uint64_t)vfs_symlinkat(name, dfd, new);
+    return (uint64_t)vfs_symlinkat(name, dfd, new, false);
 }
 
 uint64_t sys_mknod(const char *name_user, uint16_t umode, int dev) {
@@ -3109,7 +3109,7 @@ uint64_t sys_mknod(const char *name_user, uint16_t umode, int dev) {
         masked_mode =
             (umode & S_IFMT) | ((umode & 0777) & ~current_task->fs->umask);
 
-    int ret = vfs_mknodat(AT_FDCWD, name, masked_mode, (dev64_t)dev);
+    int ret = vfs_mknodat(AT_FDCWD, name, masked_mode, (dev64_t)dev, false);
     if (ret < 0)
         return (uint64_t)-EINVAL;
 
@@ -3127,7 +3127,7 @@ uint64_t sys_mknodat(uint64_t fd, const char *path_user, uint16_t umode,
         masked_mode =
             (umode & S_IFMT) | ((umode & 0777) & ~current_task->fs->umask);
 
-    int ret = vfs_mknodat((int)fd, path, masked_mode, (dev64_t)dev);
+    int ret = vfs_mknodat((int)fd, path, masked_mode, (dev64_t)dev, false);
     if (ret < 0)
         return (uint64_t)-EINVAL;
 

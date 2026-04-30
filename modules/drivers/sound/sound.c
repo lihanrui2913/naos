@@ -1373,7 +1373,7 @@ static sound_pcm_substream_t *sound_lookup_substream_by_path(const char *path) {
 static void sound_register_node(const char *path) {
     struct vfs_file *file = NULL;
     struct vfs_open_how how = {0};
-    int ret = vfs_openat(AT_FDCWD, path, &how, &file);
+    int ret = vfs_openat(AT_FDCWD, path, &how, &file, true);
     if (ret < 0 || !file || !file->f_inode) {
         return;
     }
@@ -1397,7 +1397,7 @@ int sound_init(void) {
         return 0;
     }
 
-    vfs_mkdirat(AT_FDCWD, "/dev/snd", 0600);
+    vfs_mkdirat(AT_FDCWD, "/dev/snd", 0600, true);
     sound_ready = true;
     return 0;
 }

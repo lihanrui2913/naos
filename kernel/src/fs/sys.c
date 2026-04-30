@@ -879,7 +879,7 @@ void sysfs_unregister_device(bus_device_t *device) { (void)device; }
 void sysfs_init(void) {
     vfs_register_filesystem(&sysfs_fs_type);
     sysfs_ensure_internal_mount();
-    vfs_mkdirat(AT_FDCWD, "/sys", 0755);
+    vfs_mkdirat(AT_FDCWD, "/sys", 0755, true);
     vfs_do_mount(AT_FDCWD, "/sys", "sysfs", 0, NULL, NULL);
 
     sysfs_ensure_dir("/sys/fs/cgroup");

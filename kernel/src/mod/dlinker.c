@@ -95,7 +95,7 @@ static int collect_module_actor(struct vfs_dir_context *ctx, const char *name,
     if (!module->path)
         return -ENOMEM;
 
-    if (vfs_openat(AT_FDCWD, path, &how, &file) < 0 || !file) {
+    if (vfs_openat(AT_FDCWD, path, &how, &file, true) < 0 || !file) {
         free(module->path);
         module->path = NULL;
         return 0;
@@ -1145,7 +1145,8 @@ void dlinker_init() {
     struct vfs_open_how dir_how = {
         .flags = O_RDONLY | O_DIRECTORY,
     };
-    if (vfs_openat(AT_FDCWD, "/lib/modules", &dir_how, &modules_root) < 0 ||
+    if (vfs_openat(AT_FDCWD, "/lib/modules", &dir_how, &modules_root, true) <
+            0 ||
         !modules_root) {
         return;
     }

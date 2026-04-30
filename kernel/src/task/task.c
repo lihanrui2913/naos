@@ -984,11 +984,14 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
         struct vfs_file *stdout_file = NULL;
         struct vfs_file *stderr_file = NULL;
 
-        if (vfs_openat(AT_FDCWD, "/dev/console", &in_how, &stdin_file) == 0)
+        if (vfs_openat(AT_FDCWD, "/dev/console", &in_how, &stdin_file, true) ==
+            0)
             task_replace_file(task, 0, stdin_file, 0);
-        if (vfs_openat(AT_FDCWD, "/dev/console", &out_how, &stdout_file) == 0)
+        if (vfs_openat(AT_FDCWD, "/dev/console", &out_how, &stdout_file,
+                       true) == 0)
             task_replace_file(task, 1, stdout_file, 0);
-        if (vfs_openat(AT_FDCWD, "/dev/console", &out_how, &stderr_file) == 0)
+        if (vfs_openat(AT_FDCWD, "/dev/console", &out_how, &stderr_file,
+                       true) == 0)
             task_replace_file(task, 2, stderr_file, 0);
         if (stdin_file)
             vfs_file_put(stdin_file);

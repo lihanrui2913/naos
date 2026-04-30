@@ -184,20 +184,18 @@ void vfs_poll_wait_init(vfs_poll_wait_t *wait, struct task *task,
 }
 
 int vfs_poll_wait_arm(vfs_node_t *node, vfs_poll_wait_t *wait) {
-    if (!node || !wait || (!wait->task && !wait->notify_node))
+    if (!node || !wait || !wait->task)
         return -EINVAL;
     if (wait->armed)
         return 0;
 
     wait->watch_node = node;
-    __atomic_store_n(&wait->revents, 0, __ATOMIC_RELEASE);
+    wait->revents = 0;
 
     spin_lock(&node->poll_waiters_lock);
     llist_append(&node->poll_waiters, &wait->node);
     wait->armed = true;
     vfs_igrab(node);
-    if (wait->notify_node)
-        vfs_igrab(wait->notify_node);
     spin_unlock(&node->poll_waiters_lock);
     return 0;
 }
@@ -214,14 +212,10 @@ void vfs_poll_wait_disarm(vfs_poll_wait_t *wait) {
         llist_delete(&wait->node);
         wait->armed = false;
         vfs_iput(node);
-        if (wait->notify_node)
-            vfs_iput(wait->notify_node);
     }
     spin_unlock(&node->poll_waiters_lock);
 
     wait->watch_node = NULL;
-    wait->notify_node = NULL;
-    wait->notify_events = 0;
     llist_init_head(&wait->node);
 }
 
@@ -239,7 +233,7 @@ int vfs_poll_wait_sleep(vfs_node_t *node, vfs_poll_wait_t *wait,
         deadline = nano_time() + (uint64_t)timeout_ns;
 
     while (true) {
-        if (__atomic_load_n(&wait->revents, __ATOMIC_ACQUIRE) & want)
+        if (wait->revents & want)
             return EOK;
         if (task_signal_has_deliverable(wait->task))
             return -EINTR;
@@ -282,25 +276,15 @@ void vfs_poll_notify(vfs_node_t *node, uint32_t events) {
         node->poll_seq_pri++;
 
     llist_for_each(pos, tmp, &node->poll_waiters, node) {
-        uint32_t want =
-            pos->events | EPOLLERR | EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
-        uint32_t matched = events & want;
-        if (!matched)
-            continue;
-
-        __atomic_fetch_or(&pos->revents, matched, __ATOMIC_ACQ_REL);
-        if (pos->notify_node && pos->notify_node != node) {
-            vfs_poll_notify(pos->notify_node,
-                            pos->notify_events ? pos->notify_events : matched);
-        } else if (pos->task) {
+        pos->revents |= events;
+        if (pos->task)
             task_unblock(pos->task, EOK);
-        }
     }
     spin_unlock(&node->poll_waiters_lock);
 }
 
 int vfs_openat(int dfd, const char *name, const struct vfs_open_how *how,
-               struct vfs_file **out) {
+               struct vfs_file **out, bool kernel) {
     struct vfs_open_how local_how;
     struct vfs_path parent = {0};
     struct vfs_path target = {0};
@@ -343,9 +327,11 @@ int vfs_openat(int dfd, const char *name, const struct vfs_open_how *how,
             ret = -EOPNOTSUPP;
             goto out;
         }
-        ret = vfs_inode_permission(dir, VFS_MAY_WRITE | VFS_MAY_EXEC);
-        if (ret < 0)
-            goto out;
+        if (!kernel) {
+            ret = vfs_inode_permission(dir, VFS_MAY_WRITE | VFS_MAY_EXEC);
+            if (ret < 0)
+                goto out;
+        }
         ret = dir->i_op->create(dir, dentry, (umode_t)local_how.mode,
                                 !!(local_how.flags & O_EXCL));
         if (ret < 0)

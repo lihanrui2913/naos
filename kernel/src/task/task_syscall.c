@@ -1369,7 +1369,7 @@ static int task_execve_open_exec_file(int dirfd, const char *pathname,
     if (flags & AT_SYMLINK_NOFOLLOW)
         exec_how.flags |= O_NOFOLLOW;
 
-    ret = vfs_openat(dirfd, pathname, &exec_how, out_exec_file);
+    ret = vfs_openat(dirfd, pathname, &exec_how, out_exec_file, true);
     if (ret < 0)
         return ret;
 
@@ -1634,8 +1634,8 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
         }
 
         struct vfs_file *interpreter_file = NULL;
-        if (vfs_openat(AT_FDCWD, interpreter_name, &exec_how,
-                       &interpreter_file) < 0 ||
+        if (vfs_openat(AT_FDCWD, interpreter_name, &exec_how, &interpreter_file,
+                       true) < 0 ||
             !interpreter_file) {
             task_execve_free_string_array(replaced_argv, replaced_index);
             task_execve_free_string_array(new_argv, argv_count);
@@ -1780,8 +1780,8 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
             }
 
             struct vfs_file *interpreter_file = NULL;
-            if (vfs_openat(AT_FDCWD, interp_name, &exec_how,
-                           &interpreter_file) < 0 ||
+            if (vfs_openat(AT_FDCWD, interp_name, &exec_how, &interpreter_file,
+                           true) < 0 ||
                 !interpreter_file) {
                 exec_fail_ret = (uint64_t)-ENOENT;
                 goto exec_fail_restore_mm;
