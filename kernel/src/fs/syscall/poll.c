@@ -115,7 +115,7 @@ static size_t do_poll(struct pollfd *fds, int nfds, uint64_t timeout) {
         return (size_t)-EINVAL;
     if (nfds > 0 && !fds)
         return (size_t)-EFAULT;
-    if (!current_task || !current_task->fd_info)
+    if (!current_task)
         return (size_t)-EINVAL;
 
     vfs_poll_wait_t *waits = NULL;

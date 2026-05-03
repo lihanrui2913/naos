@@ -698,12 +698,14 @@ static inline struct timeval task_ns_to_timeval(uint64_t ns) {
     return tv;
 }
 
-static void task_fd_info_put(fd_info_t *fd_info, task_t *task) {
+void task_fd_info_put(fd_info_t *fd_info, task_t *task) {
     if (!fd_info)
         return;
 
-    if (--fd_info->ref_count > 0)
+    if (task_fd_info_ref_put(fd_info) > 0)
         return;
+
+    struct vfs_file *to_close[MAX_FD_NUM] = {0};
 
     with_fd_info_lock(fd_info, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
@@ -713,10 +715,16 @@ static void task_fd_info_put(fd_info_t *fd_info, task_t *task) {
             struct vfs_file *entry = fd_info->fds[i].file;
             fd_info->fds[i].file = NULL;
             fd_info->fds[i].flags = 0;
-            on_close_file_call(task, i, entry);
-            vfs_close_file(entry);
+            to_close[i] = entry;
         }
     });
+
+    for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
+        if (!to_close[i])
+            continue;
+        on_close_file_call(task, i, to_close[i]);
+        vfs_close_file(to_close[i]);
+    }
 
     free(fd_info);
 }
@@ -735,10 +743,9 @@ void task_cleanup_partial(task_t *task, bool kernel_mm) {
     if (task->shm_ids && task->arch_context && task->mm)
         shm_exit(task);
 
-    if (task->fd_info) {
-        task_fd_info_put(task->fd_info, task);
-        task->fd_info = NULL;
-    }
+    fd_info_t *fd_info = task_fd_info_detach(task);
+    if (fd_info)
+        task_fd_info_put(fd_info, task);
 
     if (task->exec_file) {
         vfs_close_file(task->exec_file);
@@ -1908,11 +1915,20 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
         interpreter_entry ? INTERPRETER_BASE_ADDR : 0, path, &exec_creds);
 
     if (self->clone_flags & CLONE_FILES) {
-        fd_info_t *old = self->fd_info;
+        fd_info_t *old = task_fd_info_get(self);
+        if (!old) {
+            exec_fail_ret = (uint64_t)-EBADF;
+            goto exec_fail_restore_mm;
+        }
         fd_info_t *new = calloc(1, sizeof(fd_info_t));
-        new->ref_count++;
+        if (!new) {
+            task_fd_info_put(old, self);
+            exec_fail_ret = (uint64_t)-ENOMEM;
+            goto exec_fail_restore_mm;
+        }
+        task_fd_info_ref_init(new, 1);
 
-        mutex_init(&new->fdt_lock);
+        spin_init(&new->fdt_lock);
         with_fd_info_lock(old, {
             for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
                 struct vfs_file *fd = old->fds[i].file;
@@ -1927,8 +1943,9 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
             }
         });
 
-        self->fd_info = new;
+        fd_info_t *replaced = task_fd_info_replace(self, new);
         task_fd_info_put(old, self);
+        task_fd_info_put(replaced, self);
     }
 
     string_builder_t *builder = create_string_builder(PAGE_SIZE * 8);
@@ -1955,20 +1972,36 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
     free(new_envp);
     new_envp = NULL;
 
-    with_fd_info_lock(self->fd_info, {
+    struct vfs_file *exec_close_files[MAX_FD_NUM] = {0};
+
+    fd_info_t *exec_fd_info = task_fd_info_get(self);
+    if (!exec_fd_info) {
+        exec_fail_ret = (uint64_t)-EBADF;
+        goto exec_fail_restore_mm;
+    }
+
+    with_fd_info_lock(exec_fd_info, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            if (!self->fd_info->fds[i].file)
+            if (!exec_fd_info->fds[i].file)
                 continue;
 
-            if (self->fd_info->fds[i].flags & FD_CLOEXEC) {
-                struct vfs_file *entry = self->fd_info->fds[i].file;
-                self->fd_info->fds[i].file = NULL;
-                self->fd_info->fds[i].flags = 0;
-                on_close_file_call(self, i, entry);
-                vfs_close_file(entry);
+            if (exec_fd_info->fds[i].flags & FD_CLOEXEC) {
+                struct vfs_file *entry = exec_fd_info->fds[i].file;
+                exec_fd_info->fds[i].file = NULL;
+                exec_fd_info->fds[i].flags = 0;
+                exec_close_files[i] = entry;
             }
         }
     });
+
+    task_fd_info_put(exec_fd_info, self);
+
+    for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
+        if (!exec_close_files[i])
+            continue;
+        on_close_file_call(self, i, exec_close_files[i]);
+        vfs_close_file(exec_close_files[i]);
+    }
 
     task_signal_info_t *new_signal = task_signal_reset_after_exec(self);
     if (!new_signal) {
@@ -2669,27 +2702,32 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     child->load_start = self->load_start;
     child->load_end = self->load_end;
 
-    child->fd_info =
-        (flags & CLONE_FILES) ? self->fd_info : calloc(1, sizeof(fd_info_t));
+    child->fd_info = (flags & CLONE_FILES) ? task_fd_info_get(self)
+                                           : calloc(1, sizeof(fd_info_t));
     if (!child->fd_info)
         goto fail;
 
     if (!(flags & CLONE_FILES)) {
-        mutex_init(&child->fd_info->fdt_lock);
-        for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-            struct vfs_file *fd = self->fd_info->fds[i].file;
+        spin_init(&child->fd_info->fdt_lock);
+        task_fd_info_ref_init(child->fd_info, 1);
+        fd_info_t *self_fd_info = task_fd_info_get(self);
+        if (!self_fd_info)
+            goto fail;
+        with_fd_info_lock(self_fd_info, {
+            for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
+                struct vfs_file *fd = self_fd_info->fds[i].file;
 
-            if (fd) {
-                child->fd_info->fds[i].file = vfs_file_get(fd);
-                child->fd_info->fds[i].flags = self->fd_info->fds[i].flags;
-            } else {
-                child->fd_info->fds[i].file = NULL;
-                child->fd_info->fds[i].flags = 0;
+                if (fd) {
+                    child->fd_info->fds[i].file = vfs_file_get(fd);
+                    child->fd_info->fds[i].flags = self_fd_info->fds[i].flags;
+                } else {
+                    child->fd_info->fds[i].file = NULL;
+                    child->fd_info->fds[i].flags = 0;
+                }
             }
-        }
+        });
+        task_fd_info_put(self_fd_info, self);
     }
-
-    child->fd_info->ref_count++;
 
     spin_lock(&task_queue_lock);
     task_parent_index_attach_locked(child);
@@ -2809,8 +2847,8 @@ static fd_info_t *task_fd_info_clone(fd_info_t *old) {
     if (!new_info)
         return NULL;
 
-    mutex_init(&new_info->fdt_lock);
-    new_info->ref_count = 1;
+    spin_init(&new_info->fdt_lock);
+    task_fd_info_ref_init(new_info, 1);
 
     with_fd_info_lock(old, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
@@ -2914,8 +2952,11 @@ uint64_t sys_unshare(uint64_t unshare_flags) {
     }
 
     need_unshare_fs = !!(unshare_flags & CLONE_FS);
-    need_unshare_files = !!(unshare_flags & CLONE_FILES) && self->fd_info &&
-                         self->fd_info->ref_count > 1;
+    fd_info_t *cur_fd_info = task_fd_info_get(self);
+    need_unshare_files = !!(unshare_flags & CLONE_FILES) && cur_fd_info &&
+                         task_fd_info_ref_read(cur_fd_info) > 2;
+    if (cur_fd_info)
+        task_fd_info_put(cur_fd_info, self);
 
     if (ns_flags) {
         new_nsproxy = task_ns_proxy_clone(self, ns_flags);
@@ -2943,7 +2984,11 @@ uint64_t sys_unshare(uint64_t unshare_flags) {
     }
 
     if (need_unshare_files) {
-        new_fd_info = task_fd_info_clone(self->fd_info);
+        fd_info_t *clone_source = task_fd_info_get(self);
+        if (!clone_source)
+            goto fail;
+        new_fd_info = task_fd_info_clone(clone_source);
+        task_fd_info_put(clone_source, self);
         if (!new_fd_info)
             goto fail;
     }
@@ -2959,8 +3004,7 @@ uint64_t sys_unshare(uint64_t unshare_flags) {
     }
 
     if (new_fd_info) {
-        old_fd_info = self->fd_info;
-        self->fd_info = new_fd_info;
+        old_fd_info = task_fd_info_replace(self, new_fd_info);
     }
 
     if (unshare_flags & CLONE_FS)
@@ -2975,10 +3019,7 @@ uint64_t sys_unshare(uint64_t unshare_flags) {
     if (old_fs)
         task_fs_put(old_fs);
     if (old_fd_info) {
-        with_fd_info_lock(old_fd_info, {
-            if (old_fd_info->ref_count > 0)
-                old_fd_info->ref_count--;
-        });
+        task_fd_info_put(old_fd_info, self);
     }
 
     return 0;
@@ -3834,8 +3875,14 @@ uint64_t sys_kcmp(uint64_t pid1, uint64_t pid2, int type, uint64_t idx1,
     }
     case LINUX_KCMP_VM:
         return (uint64_t)linux_kcmp_ptrs(task1->mm, task2->mm);
-    case LINUX_KCMP_FILES:
-        return (uint64_t)linux_kcmp_ptrs(task1->fd_info, task2->fd_info);
+    case LINUX_KCMP_FILES: {
+        fd_info_t *fd_info1 = task_fd_info_get(task1);
+        fd_info_t *fd_info2 = task_fd_info_get(task2);
+        int ret = linux_kcmp_ptrs(fd_info1, fd_info2);
+        task_fd_info_put(fd_info1, task1);
+        task_fd_info_put(fd_info2, task2);
+        return (uint64_t)ret;
+    }
     case LINUX_KCMP_FS:
         return (uint64_t)linux_kcmp_ptrs(task1->fs, task2->fs);
     case LINUX_KCMP_SIGHAND:

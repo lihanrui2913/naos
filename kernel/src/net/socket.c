@@ -1723,11 +1723,15 @@ static size_t unix_socket_install_pending_files(fd_t **pending_files,
                                                 int *fds_out, int *msg_flags,
                                                 int recv_flags) {
     size_t installed = 0;
-    with_fd_info_lock(current_task->fd_info, {
+    fd_info_t *fd_info = task_fd_info_get(current_task);
+    if (!fd_info)
+        return 0;
+
+    with_fd_info_lock(fd_info, {
         for (size_t i = 0; i < pending_count; i++) {
             int new_fd = -1;
             for (int fd_idx = 0; fd_idx < MAX_FD_NUM; fd_idx++) {
-                if (current_task->fd_info->fds[fd_idx].file == NULL) {
+                if (fd_info->fds[fd_idx].file == NULL) {
                     new_fd = fd_idx;
                     break;
                 }
@@ -1739,12 +1743,13 @@ static size_t unix_socket_install_pending_files(fd_t **pending_files,
             fd_t *new_entry = vfs_file_get(pending_files[i]);
             if (!new_entry)
                 break;
-            current_task->fd_info->fds[new_fd].file = new_entry;
-            current_task->fd_info->fds[new_fd].flags =
+            fd_info->fds[new_fd].file = new_entry;
+            fd_info->fds[new_fd].flags =
                 (recv_flags & MSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0;
             fds_out[installed++] = new_fd;
         }
     });
+    task_fd_info_put(fd_info, current_task);
 
     for (size_t i = 0; i < installed; i++) {
         vfs_file_put(pending_files[i]);

@@ -1255,29 +1255,33 @@ uint64_t sys_fsync(uint64_t fd) {
 
 uint64_t sys_close(uint64_t fd) {
     task_t *self = current_task;
+    fd_info_t *fd_info;
 
     if (fd >= MAX_FD_NUM)
         return (uint64_t)-EBADF;
 
     fd_t *entry = NULL;
     uint64_t ret = (uint64_t)-EBADF;
-    with_fd_info_lock(self->fd_info, {
-        entry = vfs_file_get(self->fd_info->fds[fd].file);
+    fd_info = task_fd_info_get(self);
+    if (!fd_info)
+        return (uint64_t)-EBADF;
+
+    with_fd_info_lock(fd_info, {
+        entry = fd_info->fds[fd].file;
         if (!entry)
             break;
 
-        file_lock_release_pid(entry->f_inode, self->pid);
-
-        self->fd_info->fds[fd].file = NULL;
-        self->fd_info->fds[fd].flags = 0;
+        fd_info->fds[fd].file = NULL;
+        fd_info->fds[fd].flags = 0;
         ret = 0;
-
-        vfs_file_put(entry);
     });
+
+    task_fd_info_put(fd_info, self);
 
     if (ret)
         return ret;
 
+    file_lock_release_pid(entry->f_inode, self->pid);
     on_close_file_call(self, fd, entry);
 
     vfs_close_file(entry);
@@ -1286,22 +1290,26 @@ uint64_t sys_close(uint64_t fd) {
 }
 
 static int close_range_unshare_fd_table(task_t *self) {
-    if (!self || !self->fd_info) {
+    if (!self) {
         return -EINVAL;
     }
 
-    fd_info_t *old = self->fd_info;
-    if (old->ref_count <= 1) {
+    fd_info_t *old = task_fd_info_get(self);
+    if (!old)
+        return -EINVAL;
+    if (task_fd_info_ref_read(old) <= 2) {
+        task_fd_info_put(old, self);
         return 0;
     }
 
     fd_info_t *new_info = calloc(1, sizeof(fd_info_t));
     if (!new_info) {
+        task_fd_info_put(old, self);
         return -ENOMEM;
     }
 
-    mutex_init(&new_info->fdt_lock);
-    new_info->ref_count = 1;
+    spin_init(&new_info->fdt_lock);
+    task_fd_info_ref_init(new_info, 1);
 
     with_fd_info_lock(old, {
         for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
@@ -1310,10 +1318,12 @@ static int close_range_unshare_fd_table(task_t *self) {
                 new_info->fds[i].flags = old->fds[i].flags;
             }
         }
-        old->ref_count--;
     });
 
-    self->fd_info = new_info;
+    fd_info_t *replaced = task_fd_info_replace(self, new_info);
+    task_fd_info_put(old, self);
+    old = replaced;
+    task_fd_info_put(old, self);
     return 0;
 }
 
@@ -1344,37 +1354,43 @@ uint64_t sys_close_range(uint64_t fd, uint64_t maxfd, uint64_t flags) {
     }
 
     if (flags & CLOSE_RANGE_CLOEXEC) {
-        with_fd_info_lock(self->fd_info, {
+        fd_info_t *fd_info = task_fd_info_get(self);
+        if (!fd_info)
+            return (uint64_t)-EBADF;
+        with_fd_info_lock(fd_info, {
             for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-                if (!self->fd_info->fds[fd_].file)
+                if (!fd_info->fds[fd_].file)
                     continue;
-                self->fd_info->fds[fd_].flags |= FD_CLOEXEC;
+                fd_info->fds[fd_].flags |= FD_CLOEXEC;
             }
         });
+        task_fd_info_put(fd_info, self);
         return 0;
     }
 
     fd_t *to_close[MAX_FD_NUM] = {0};
 
-    with_fd_info_lock(self->fd_info, {
+    fd_info_t *fd_info = task_fd_info_get(self);
+    if (!fd_info)
+        return (uint64_t)-EBADF;
+    with_fd_info_lock(fd_info, {
         for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
-            fd_t *entry = vfs_file_get(self->fd_info->fds[fd_].file);
+            fd_t *entry = fd_info->fds[fd_].file;
             if (!entry)
                 continue;
 
-            file_lock_release_pid(entry->f_inode, self->pid);
-
-            self->fd_info->fds[fd_].file = NULL;
-            self->fd_info->fds[fd_].flags = 0;
+            fd_info->fds[fd_].file = NULL;
+            fd_info->fds[fd_].flags = 0;
             to_close[fd_] = entry;
         }
     });
+    task_fd_info_put(fd_info, self);
 
     for (uint64_t fd_ = fd; fd_ <= maxfd; fd_++) {
         fd_t *entry = to_close[fd_];
         if (!entry)
             continue;
-        vfs_file_put(entry);
+        file_lock_release_pid(entry->f_inode, self->pid);
         on_close_file_call(self, fd_, entry);
         vfs_close_file(entry);
     }
@@ -1746,12 +1762,10 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         }
         break;
     case FIOCLEX:
-        self->fd_info->fds[fd].flags |= FD_CLOEXEC;
-        ret = 0;
+        ret = task_set_fd_flags_mask_for_file(self, (int)fd, f, FD_CLOEXEC, 0);
         break;
     case FIONCLEX:
-        self->fd_info->fds[fd].flags &= ~FD_CLOEXEC;
-        ret = 0;
+        ret = task_set_fd_flags_mask_for_file(self, (int)fd, f, 0, FD_CLOEXEC);
         break;
 
     default:
@@ -2263,8 +2277,11 @@ static uint64_t dup_to_exact(task_t *self, uint64_t fd, uint64_t newfd,
     bool installed_new = false;
     fd_t *replaced_fd = NULL;
     unsigned int new_fd_flags = 0;
-    with_fd_info_lock(self->fd_info, {
-        if (!self->fd_info->fds[fd].file) {
+    fd_info_t *fd_info = task_fd_info_get(self);
+    if (!fd_info)
+        return (uint64_t)-EBADF;
+    with_fd_info_lock(fd_info, {
+        if (!fd_info->fds[fd].file) {
             ret = (uint64_t)-EBADF;
             break;
         }
@@ -2278,24 +2295,25 @@ static uint64_t dup_to_exact(task_t *self, uint64_t fd, uint64_t newfd,
             break;
         }
 
-        fd_t *newf = vfs_file_get(self->fd_info->fds[fd].file);
+        fd_t *newf = vfs_file_get(fd_info->fds[fd].file);
         if (!newf) {
             ret = (uint64_t)-ENOSPC;
             break;
         }
 
-        if (self->fd_info->fds[newfd].file) {
-            replaced_fd = self->fd_info->fds[newfd].file;
-            self->fd_info->fds[newfd].file = NULL;
-            self->fd_info->fds[newfd].flags = 0;
+        if (fd_info->fds[newfd].file) {
+            replaced_fd = fd_info->fds[newfd].file;
+            fd_info->fds[newfd].file = NULL;
+            fd_info->fds[newfd].flags = 0;
             replaced_existing = true;
         }
 
         new_fd_flags = cloexec ? FD_CLOEXEC : 0;
-        self->fd_info->fds[newfd].file = newf;
-        self->fd_info->fds[newfd].flags = new_fd_flags;
+        fd_info->fds[newfd].file = newf;
+        fd_info->fds[newfd].flags = new_fd_flags;
         installed_new = true;
     });
+    task_fd_info_put(fd_info, self);
 
     if ((int64_t)ret >= 0 && installed_new) {
         if (replaced_existing) {
@@ -2323,15 +2341,19 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
         return (uint64_t)-EINVAL;
 
     uint64_t ret = (uint64_t)-EBADF;
-    with_fd_info_lock(self->fd_info, {
-        if (!self->fd_info->fds[fd].file) {
+    int installed_fd = -1;
+    fd_info_t *fd_info = task_fd_info_get(self);
+    if (!fd_info)
+        return (uint64_t)-EBADF;
+    with_fd_info_lock(fd_info, {
+        if (!fd_info->fds[fd].file) {
             ret = (uint64_t)-EBADF;
             break;
         }
 
         uint64_t i;
         for (i = start; i < MAX_FD_NUM; i++) {
-            if (!self->fd_info->fds[i].file)
+            if (!fd_info->fds[i].file)
                 break;
         }
 
@@ -2340,17 +2362,21 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
             break;
         }
 
-        fd_t *newf = vfs_file_get(self->fd_info->fds[fd].file);
+        fd_t *newf = vfs_file_get(fd_info->fds[fd].file);
         if (!newf) {
             ret = (uint64_t)-ENOSPC;
             break;
         }
 
-        self->fd_info->fds[i].file = newf;
-        self->fd_info->fds[i].flags = cloexec ? FD_CLOEXEC : 0;
-        on_open_file_call(self, i);
+        fd_info->fds[i].file = newf;
+        fd_info->fds[i].flags = cloexec ? FD_CLOEXEC : 0;
+        installed_fd = (int)i;
         ret = i;
     });
+    task_fd_info_put(fd_info, self);
+
+    if (installed_fd >= 0)
+        on_open_file_call(self, installed_fd);
 
     return ret;
 }
@@ -2378,18 +2404,22 @@ uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t arg) {
     task_t *self = current_task;
     fd_t *file = task_get_file(self, (int)fd);
     uint64_t out = (uint64_t)-EINVAL;
+    unsigned int fd_flags = 0;
     if (fd >= MAX_FD_NUM || !file)
         return (uint64_t)-EBADF;
 
     switch (command) {
     case F_GETFD:
-        out = (self->fd_info->fds[fd].flags & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+        if (task_get_fd_flags_for_file(self, (int)fd, file, &fd_flags) < 0) {
+            out = (uint64_t)-EBADF;
+            break;
+        }
+        out = (fd_flags & FD_CLOEXEC) ? FD_CLOEXEC : 0;
         break;
     case F_SETFD:
-        self->fd_info->fds[fd].flags =
-            (self->fd_info->fds[fd].flags & ~FD_CLOEXEC) |
-            ((arg & FD_CLOEXEC) ? FD_CLOEXEC : 0);
-        out = 0;
+        out = task_set_fd_flags_mask_for_file(
+            self, (int)fd, file, (arg & FD_CLOEXEC) ? FD_CLOEXEC : 0,
+            FD_CLOEXEC);
         break;
     case F_DUPFD_CLOEXEC:
         out = dup_to_free_slot(self, fd, arg, true);

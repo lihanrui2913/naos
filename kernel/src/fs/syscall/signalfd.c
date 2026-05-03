@@ -56,15 +56,9 @@ static inline void signalfd_apply_flags(int fd_num, fd_t *fd, int flags) {
         file_flags |= O_NONBLOCK;
     fd_set_flags(fd, file_flags);
 
-    with_fd_info_lock(current_task->fd_info, {
-        if (fd_num >= 0 && fd_num < MAX_FD_NUM &&
-            current_task->fd_info->fds[fd_num].file) {
-            if (flags & O_CLOEXEC)
-                current_task->fd_info->fds[fd_num].flags |= FD_CLOEXEC;
-            else
-                current_task->fd_info->fds[fd_num].flags &= ~FD_CLOEXEC;
-        }
-    });
+    task_set_fd_flags_mask_for_file(current_task, fd_num, fd,
+                                    (flags & O_CLOEXEC) ? FD_CLOEXEC : 0,
+                                    FD_CLOEXEC);
 }
 
 static struct vfs_inode *signalfdfs_alloc_inode(struct vfs_super_block *sb) {

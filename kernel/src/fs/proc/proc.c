@@ -858,7 +858,7 @@ static int procfs_iterate_shared(struct vfs_file *file,
     case PROCFS_INO_FD_DIR:
     case PROCFS_INO_FDINFO_DIR:
         task = procfs_info_task(info);
-        if (task && task->fd_info) {
+        if (task) {
             for (int fd_num = 0; fd_num < MAX_FD_NUM; ++fd_num) {
                 char name[16];
 
@@ -1101,8 +1101,7 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
     case PROCFS_INO_FD_DIR:
     case PROCFS_INO_FDINFO_DIR:
         task = procfs_info_task(info);
-        if (procfs_parse_decimal(dentry->d_name.name, &fd_num) == 0 && task &&
-            task->fd_info) {
+        if (procfs_parse_decimal(dentry->d_name.name, &fd_num) == 0 && task) {
             fd_t *fd_file = task_get_file(task, fd_num);
             bool exists = fd_file != NULL;
             vfs_file_put(fd_file);

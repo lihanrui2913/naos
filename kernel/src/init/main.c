@@ -74,12 +74,12 @@ static void signal_fill_signalfd_siginfo(struct signalfd_siginfo *sinfo,
 }
 
 void signal_notify_signalfd(task_t *task, int sig, const siginfo_t *info) {
-    if (!task || !task->fd_info) {
+    if (!task) {
         return;
     }
 
     for (int i = 0; i < MAX_FD_NUM; i++) {
-        fd_t *fd = task_get_file(task, i);
+        struct vfs_file *fd = task_get_file(task, i);
         if (!fd || !signalfd_is_file(fd)) {
             vfs_file_put(fd);
             continue;

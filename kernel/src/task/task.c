@@ -45,32 +45,130 @@ struct vfs_process_fs *task_current_vfs_fs(void) {
     return current_task ? task_vfs_fs(current_task) : NULL;
 }
 
-struct vfs_file *task_get_file(task_t *task, int fd) {
-    if (!task || !task->fd_info || fd < 0 || fd >= MAX_FD_NUM)
+fd_info_t *task_fd_info_get(task_t *task) {
+    fd_info_t *fd_info = NULL;
+
+    if (!task)
         return NULL;
 
-    return vfs_file_get(task->fd_info->fds[fd].file);
+    spin_lock(&task->fd_info_lock);
+    fd_info = task->fd_info;
+    if (fd_info)
+        task_fd_info_ref_get(fd_info);
+    spin_unlock(&task->fd_info_lock);
+
+    return fd_info;
+}
+
+fd_info_t *task_fd_info_replace(task_t *task, fd_info_t *new_info) {
+    fd_info_t *old = NULL;
+
+    if (!task)
+        return NULL;
+
+    spin_lock(&task->fd_info_lock);
+    old = task->fd_info;
+    task->fd_info = new_info;
+    spin_unlock(&task->fd_info_lock);
+
+    return old;
+}
+
+fd_info_t *task_fd_info_detach(task_t *task) {
+    return task_fd_info_replace(task, NULL);
+}
+
+struct vfs_file *task_get_file(task_t *task, int fd) {
+    struct vfs_file *file = NULL;
+    fd_info_t *fd_info;
+
+    if (!task || fd < 0 || fd >= MAX_FD_NUM)
+        return NULL;
+
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return NULL;
+
+    with_fd_info_lock(fd_info, { file = vfs_file_get(fd_info->fds[fd].file); });
+
+    task_fd_info_put(fd_info, task);
+
+    return file;
+}
+
+int task_get_fd_flags_for_file(task_t *task, int fd, struct vfs_file *file,
+                               unsigned int *flags) {
+    fd_info_t *fd_info;
+    int ret = -EBADF;
+
+    if (!task || fd < 0 || fd >= MAX_FD_NUM || !file || !flags)
+        return -EBADF;
+
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return -EBADF;
+
+    with_fd_info_lock(fd_info, {
+        if (fd_info->fds[fd].file != file)
+            break;
+        *flags = fd_info->fds[fd].flags;
+        ret = 0;
+    });
+
+    task_fd_info_put(fd_info, task);
+    return ret;
+}
+
+int task_set_fd_flags_mask_for_file(task_t *task, int fd, struct vfs_file *file,
+                                    unsigned int set, unsigned int clear) {
+    fd_info_t *fd_info;
+    int ret = -EBADF;
+
+    if (!task || fd < 0 || fd >= MAX_FD_NUM || !file)
+        return -EBADF;
+
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return -EBADF;
+
+    with_fd_info_lock(fd_info, {
+        if (fd_info->fds[fd].file != file)
+            break;
+        fd_info->fds[fd].flags &= ~clear;
+        fd_info->fds[fd].flags |= set;
+        ret = 0;
+    });
+
+    task_fd_info_put(fd_info, task);
+    return ret;
 }
 
 int task_install_file(task_t *task, struct vfs_file *file,
                       unsigned int fd_flags, int min_fd) {
+    fd_info_t *fd_info;
     int newfd = -EMFILE;
 
-    if (!task || !task->fd_info || !file)
+    if (!task || !file)
         return -EINVAL;
     if (min_fd < 0)
         min_fd = 0;
 
-    with_fd_info_lock(task->fd_info, {
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return -EINVAL;
+
+    with_fd_info_lock(fd_info, {
         for (int i = min_fd; i < MAX_FD_NUM; ++i) {
-            if (task->fd_info->fds[i].file)
+            if (fd_info->fds[i].file)
                 continue;
-            task->fd_info->fds[i].file = vfs_file_get(file);
-            task->fd_info->fds[i].flags = fd_flags;
+            fd_info->fds[i].file = vfs_file_get(file);
+            fd_info->fds[i].flags = fd_flags;
             newfd = i;
             break;
         }
     });
+
+    task_fd_info_put(fd_info, task);
 
     if (newfd >= 0)
         on_open_file_call(task, newfd);
@@ -79,16 +177,23 @@ int task_install_file(task_t *task, struct vfs_file *file,
 
 int task_replace_file(task_t *task, int fd, struct vfs_file *file,
                       unsigned int fd_flags) {
+    fd_info_t *fd_info;
     struct vfs_file *old = NULL;
 
-    if (!task || !task->fd_info || !file || fd < 0 || fd >= MAX_FD_NUM)
+    if (!task || !file || fd < 0 || fd >= MAX_FD_NUM)
         return -EINVAL;
 
-    with_fd_info_lock(task->fd_info, {
-        old = task->fd_info->fds[fd].file;
-        task->fd_info->fds[fd].file = vfs_file_get(file);
-        task->fd_info->fds[fd].flags = fd_flags;
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return -EINVAL;
+
+    with_fd_info_lock(fd_info, {
+        old = fd_info->fds[fd].file;
+        fd_info->fds[fd].file = vfs_file_get(file);
+        fd_info->fds[fd].flags = fd_flags;
     });
+
+    task_fd_info_put(fd_info, task);
 
     if (old) {
         on_close_file_call(task, fd, old);
@@ -101,16 +206,23 @@ int task_replace_file(task_t *task, int fd, struct vfs_file *file,
 }
 
 int task_close_file_descriptor(task_t *task, int fd) {
+    fd_info_t *fd_info;
     struct vfs_file *file = NULL;
 
-    if (!task || !task->fd_info || fd < 0 || fd >= MAX_FD_NUM)
+    if (!task || fd < 0 || fd >= MAX_FD_NUM)
         return -EBADF;
 
-    with_fd_info_lock(task->fd_info, {
-        file = task->fd_info->fds[fd].file;
-        task->fd_info->fds[fd].file = NULL;
-        task->fd_info->fds[fd].flags = 0;
+    fd_info = task_fd_info_get(task);
+    if (!fd_info)
+        return -EBADF;
+
+    with_fd_info_lock(fd_info, {
+        file = fd_info->fds[fd].file;
+        fd_info->fds[fd].file = NULL;
+        fd_info->fds[fd].flags = 0;
     });
+
+    task_fd_info_put(fd_info, task);
 
     if (!file)
         return -EBADF;
@@ -864,6 +976,7 @@ task_t *get_free_task() {
             llist_init_head(&task->pgid_node);
             llist_init_head(&task->tick_work_node);
             spin_init(&task->block_lock);
+            spin_init(&task->fd_info_lock);
             task->tick_work_queue_id = UINT32_MAX;
             task->state = TASK_CREATING;
             task->pid = 0;
@@ -889,6 +1002,7 @@ task_t *get_free_task() {
     llist_init_head(&task->pgid_node);
     llist_init_head(&task->tick_work_node);
     spin_init(&task->block_lock);
+    spin_init(&task->fd_info_lock);
     task->tick_work_queue_id = UINT32_MAX;
     task->state = TASK_CREATING;
     task->pid = pid;
@@ -976,7 +1090,8 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task->fd_info = calloc(1, sizeof(fd_info_t));
     if (!task->fd_info)
         goto fail;
-    mutex_init(&task->fd_info->fdt_lock);
+    spin_init(&task->fd_info->fdt_lock);
+    task_fd_info_ref_init(task->fd_info, 1);
     {
         struct vfs_open_how in_how = {.flags = O_RDONLY};
         struct vfs_open_how out_how = {.flags = O_WRONLY};
@@ -1000,7 +1115,6 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
         if (stderr_file)
             vfs_file_put(stderr_file);
     }
-    task->fd_info->ref_count++;
     strncpy(task->name, name, TASK_NAME_MAX);
     task->shm_ids = NULL;
 
@@ -1270,23 +1384,9 @@ ret:
 }
 
 void task_cleanup_fd_info(task_t *task) {
-    if (task->fd_info) {
-        if (--task->fd_info->ref_count <= 0) {
-            with_fd_info_lock(task->fd_info, {
-                for (uint64_t i = 0; i < MAX_FD_NUM; i++) {
-                    if (task->fd_info->fds[i].file) {
-                        struct vfs_file *entry = task->fd_info->fds[i].file;
-                        task->fd_info->fds[i].file = NULL;
-                        task->fd_info->fds[i].flags = 0;
-                        on_close_file_call(task, i, entry);
-                        vfs_close_file(entry);
-                    }
-                }
-            });
-            free(task->fd_info);
-            task->fd_info = NULL;
-        }
-    }
+    fd_info_t *fd_info = task_fd_info_detach(task);
+    if (fd_info)
+        task_fd_info_put(fd_info, task);
 }
 
 void task_exit_inner(task_t *task, int64_t code) {
@@ -1322,8 +1422,6 @@ void task_exit_inner(task_t *task, int64_t code) {
 
     task->current_state = TASK_DIED;
     task->state = TASK_DIED;
-
-    task->fd_info = NULL;
 
     task->status = (uint64_t)code;
 

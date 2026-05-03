@@ -302,7 +302,7 @@ static int pty_open_peer_fd(pty_pair_t *pair, uint64_t flags) {
     struct vfs_open_how how = {0};
     int ret;
 
-    if (!pair || !current_task || !current_task->fd_info)
+    if (!pair || !current_task)
         return -EINVAL;
     if (flags & ~allowed_flags)
         return -EINVAL;

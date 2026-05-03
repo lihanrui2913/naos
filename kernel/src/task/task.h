@@ -233,12 +233,20 @@ void sched_wake_worker(uint32_t cpu_id);
 void sched_check_wakeup();
 
 struct vfs_process_fs *task_current_vfs_fs(void);
+fd_info_t *task_fd_info_get(task_t *task);
+fd_info_t *task_fd_info_replace(task_t *task, fd_info_t *new_info);
+fd_info_t *task_fd_info_detach(task_t *task);
 struct vfs_file *task_get_file(task_t *task, int fd);
+int task_get_fd_flags_for_file(task_t *task, int fd, struct vfs_file *file,
+                               unsigned int *flags);
+int task_set_fd_flags_mask_for_file(task_t *task, int fd, struct vfs_file *file,
+                                    unsigned int set, unsigned int clear);
 int task_install_file(task_t *task, struct vfs_file *file,
                       unsigned int fd_flags, int min_fd);
 int task_replace_file(task_t *task, int fd, struct vfs_file *file,
                       unsigned int fd_flags);
 int task_close_file_descriptor(task_t *task, int fd);
+void task_fd_info_put(fd_info_t *fd_info, task_t *task);
 void task_refresh_tick_work_state(task_t *task);
 void task_schedule_reap(void);
 void task_detach_children_from_parent_locked(task_t *owner);

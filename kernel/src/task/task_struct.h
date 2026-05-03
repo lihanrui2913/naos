@@ -119,20 +119,44 @@ typedef struct fd_entry {
 
 typedef struct fd_info {
     fd_entry_t fds[MAX_FD_NUM];
-    mutex_t fdt_lock;
-    int ref_count;
+    spinlock_t fdt_lock;
+    volatile int ref_count;
 } fd_info_t;
 
 #define with_fd_info_lock(fd_info, op)                                         \
     do {                                                                       \
         if (!fd_info)                                                          \
             break;                                                             \
-        mutex_lock(&fd_info->fdt_lock);                                        \
+        spin_lock(&fd_info->fdt_lock);                                         \
         do {                                                                   \
             op;                                                                \
         } while (0);                                                           \
-        mutex_unlock(&fd_info->fdt_lock);                                      \
+        spin_unlock(&fd_info->fdt_lock);                                       \
     } while (0)
+
+static inline void task_fd_info_ref_init(fd_info_t *fd_info, int refs) {
+    if (!fd_info)
+        return;
+    __atomic_store_n(&fd_info->ref_count, refs, __ATOMIC_RELEASE);
+}
+
+static inline int task_fd_info_ref_get(fd_info_t *fd_info) {
+    if (!fd_info)
+        return 0;
+    return __atomic_add_fetch(&fd_info->ref_count, 1, __ATOMIC_ACQ_REL);
+}
+
+static inline int task_fd_info_ref_put(fd_info_t *fd_info) {
+    if (!fd_info)
+        return 0;
+    return __atomic_sub_fetch(&fd_info->ref_count, 1, __ATOMIC_ACQ_REL);
+}
+
+static inline int task_fd_info_ref_read(fd_info_t *fd_info) {
+    if (!fd_info)
+        return 0;
+    return __atomic_load_n(&fd_info->ref_count, __ATOMIC_ACQUIRE);
+}
 
 #define TASK_NAME_MAX 128
 
@@ -340,6 +364,7 @@ typedef struct task {
     task_signal_info_t *signal;
     task_keyring_t *session_keyring;
     task_fs_t *fs;
+    spinlock_t fd_info_lock;
     fd_info_t *fd_info;
     shm_mapping_t *shm_ids;
     struct vfs_path *procfs_path;
