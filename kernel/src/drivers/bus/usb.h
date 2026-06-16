@@ -262,7 +262,6 @@ struct usb_config_descriptor {
 struct usb_interface_descriptor {
     uint8_t bLength;
     uint8_t bDescriptorType;
-
     uint8_t bInterfaceNumber;
     uint8_t bAlternateSetting;
     uint8_t bNumEndpoints;
@@ -275,7 +274,6 @@ struct usb_interface_descriptor {
 struct usb_endpoint_descriptor {
     uint8_t bLength;
     uint8_t bDescriptorType;
-
     uint8_t bEndpointAddress;
     uint8_t bmAttributes;
     uint16_t wMaxPacketSize;
