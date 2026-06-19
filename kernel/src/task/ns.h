@@ -90,8 +90,11 @@ void task_mount_namespace_get(task_mount_namespace_t *mnt_ns);
 void task_mount_namespace_put(task_mount_namespace_t *mnt_ns);
 void task_user_namespace_get(task_user_namespace_t *user_ns);
 void task_user_namespace_put(task_user_namespace_t *user_ns);
+void task_simple_namespace_get(task_simple_namespace_t *ns);
+void task_simple_namespace_put(task_simple_namespace_t *ns);
 int task_setns_mount(task_t *task, task_mount_namespace_t *target_mnt_ns);
 int task_setns_user(task_t *task, task_user_namespace_t *target_user_ns);
+int task_setns_net(task_t *task, task_simple_namespace_t *target_net_ns);
 int task_mount_namespace_pivot_root(task_t *task,
                                     const struct vfs_path *old_root,
                                     const struct vfs_path *new_root);

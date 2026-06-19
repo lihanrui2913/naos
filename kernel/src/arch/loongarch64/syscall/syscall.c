@@ -519,6 +519,8 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_PIPE2, (syscall_handle_t)sys_pipe);
     regist_syscall_handler(SYS_PREADV, (syscall_handle_t)sys_preadv);
     regist_syscall_handler(SYS_PWRITEV, (syscall_handle_t)sys_pwritev);
+    regist_syscall_handler(SYS_VMSPLICE, (syscall_handle_t)sys_vmsplice);
+    regist_syscall_handler(SYS_SPLICE, (syscall_handle_t)sys_splice);
     regist_syscall_handler(SYS_RECVMMSG, (syscall_handle_t)sys_recvmmsg);
     regist_syscall_handler(SYS_PRLIMIT64, (syscall_handle_t)sys_prlimit64);
     regist_syscall_handler(SYS_NAME_TO_HANDLE_AT,

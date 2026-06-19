@@ -283,7 +283,7 @@ static inline bool task_should_index_parent(task_t *task) {
            !task->is_clone && !(task->clone_flags & CLONE_THREAD);
 }
 
-void sched_wake_worker(uint32_t cpu_id);
+void sched_wake_softirqd(uint32_t cpu_id);
 void sched_check_wakeup();
 uint64_t sched_next_wakeup_ns(void);
 void sched_request_resched(task_t *task);

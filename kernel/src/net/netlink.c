@@ -17,6 +17,7 @@ static struct netlink_sock *netlink_sockets[MAX_NETLINK_SOCKETS] = {0};
 static spinlock_t netlink_sockets_lock = SPIN_INIT;
 
 #define MAX_NETLINK_MSG_POOL_SIZE 1024
+#define SIOCGSKNS 0x894C
 
 struct netlink_msg_pool_entry {
     char message[NETLINK_BUFFER_SIZE];
@@ -3584,6 +3585,10 @@ int netlink_socket(int domain, int type, int protocol) {
     nl_sk->portid = (uint32_t)current_task->pid;
     nl_sk->groups = 0;
     nl_sk->passcred = false;
+    nl_sk->net_ns = current_task && current_task->nsproxy
+                        ? current_task->nsproxy->net_ns
+                        : NULL;
+    task_simple_namespace_get(nl_sk->net_ns);
     nl_sk->node = NULL;
     nl_sk->bind_addr = NULL;
     nl_sk->lock = SPIN_INIT;
@@ -3593,6 +3598,7 @@ int netlink_socket(int domain, int type, int protocol) {
     // Initialize buffer structure
     nl_sk->buffer = malloc(sizeof(struct netlink_buffer));
     if (nl_sk->buffer == NULL) {
+        task_simple_namespace_put(nl_sk->net_ns);
         free(nl_sk);
         return -ENOMEM;
     }
@@ -3601,6 +3607,7 @@ int netlink_socket(int domain, int type, int protocol) {
     socket_handle_t *handle = malloc(sizeof(socket_handle_t));
     if (handle == NULL) {
         free(nl_sk->buffer);
+        task_simple_namespace_put(nl_sk->net_ns);
         free(nl_sk);
         return -ENOMEM;
     }
@@ -3629,6 +3636,7 @@ int netlink_socket(int domain, int type, int protocol) {
     if (slot == -1) {
         // No available slot
         free(nl_sk->buffer);
+        task_simple_namespace_put(nl_sk->net_ns);
         free(nl_sk);
         free(handle);
         return -ENOMEM;
@@ -3647,6 +3655,7 @@ int netlink_socket(int domain, int type, int protocol) {
         spin_unlock(&netlink_sockets_lock);
         free(handle);
         free(nl_sk->buffer);
+        task_simple_namespace_put(nl_sk->net_ns);
         free(nl_sk);
         return ret;
     }
@@ -3762,6 +3771,10 @@ int netlink_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
     switch (cmd) {
     case FIONBIO:
         return 0;
+    case SIOCGSKNS:
+        if (!nl_sk || !nl_sk->net_ns)
+            return -EINVAL;
+        return procfs_create_nsfd_for_netns(nl_sk->net_ns);
 
     default:
         printk("Unsupported netlink ioctl cmd = %#010x\n", cmd);
@@ -3797,6 +3810,7 @@ static void netlink_handle_release(socket_handle_t *handle) {
         if (nl_sk->bind_addr != NULL) {
             free(nl_sk->bind_addr);
         }
+        task_simple_namespace_put(nl_sk->net_ns);
         netlink_filter_free(nl_sk->filter);
         skb_queue_purge(&nl_sk->deferred_queue);
         free(nl_sk);

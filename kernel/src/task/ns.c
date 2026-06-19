@@ -368,7 +368,11 @@ void task_user_namespace_put(task_user_namespace_t *user_ns) {
         free(user_ns);
 }
 
-static void task_simple_namespace_put(task_simple_namespace_t *ns) {
+void task_simple_namespace_get(task_simple_namespace_t *ns) {
+    task_ns_common_get(ns ? &ns->common : NULL);
+}
+
+void task_simple_namespace_put(task_simple_namespace_t *ns) {
     if (ns && task_ns_common_put(&ns->common))
         free(ns);
 }
@@ -613,6 +617,31 @@ int task_setns_user(task_t *task, task_user_namespace_t *target_user_ns) {
     task_user_namespace_put(new_nsproxy->user_ns);
     new_nsproxy->user_ns = target_user_ns;
     task_user_namespace_get(new_nsproxy->user_ns);
+
+    old_nsproxy = task->nsproxy;
+    task->nsproxy = new_nsproxy;
+    task_ns_proxy_put(old_nsproxy);
+    return 0;
+}
+
+int task_setns_net(task_t *task, task_simple_namespace_t *target_net_ns) {
+    task_ns_proxy_t *old_nsproxy;
+    task_ns_proxy_t *new_nsproxy;
+
+    if (!task || !task->nsproxy || !target_net_ns)
+        return -EINVAL;
+    if (task->fs && task->fs->ref_count > 1)
+        return -EINVAL;
+    if (task->nsproxy->net_ns == target_net_ns)
+        return 0;
+
+    new_nsproxy = task_ns_proxy_clone(task, 0);
+    if (!new_nsproxy)
+        return -ENOMEM;
+
+    task_simple_namespace_put(new_nsproxy->net_ns);
+    new_nsproxy->net_ns = target_net_ns;
+    task_simple_namespace_get(new_nsproxy->net_ns);
 
     old_nsproxy = task->nsproxy;
     task->nsproxy = new_nsproxy;

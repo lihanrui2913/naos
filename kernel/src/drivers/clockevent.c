@@ -82,5 +82,5 @@ void clockevent_handle_irq(void) {
     __atomic_store_n(&clockevent_deadline_ns, UINT64_MAX, __ATOMIC_RELEASE);
 
     softirq_raise(SOFTIRQ_TIMER);
-    sched_wake_worker(current_cpu_id);
+    sched_wake_softirqd(current_cpu_id);
 }

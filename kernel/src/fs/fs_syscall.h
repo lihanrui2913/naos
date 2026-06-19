@@ -610,6 +610,10 @@ uint64_t sys_write(uint64_t fd, const void *buf, uint64_t len);
  */
 uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
                       size_t count);
+uint64_t sys_splice(uint64_t fd_in, int64_t *off_in, uint64_t fd_out,
+                    int64_t *off_out, size_t len, uint64_t flags);
+uint64_t sys_vmsplice(uint64_t fd, const struct iovec *iov, uint64_t nr_segs,
+                      uint64_t flags);
 /**
  * Linux contract: reposition the file offset.
  * Current kernel: supports SEEK_SET/CUR/END and simplified SEEK_DATA/HOLE.

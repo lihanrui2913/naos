@@ -4,6 +4,7 @@
 #include <fs/fs_syscall.h>
 #include <net/real_socket.h>
 #include <libs/skb_buff.h>
+#include <task/ns.h>
 
 #define MAX_SOCKETS 256
 
@@ -77,6 +78,7 @@ typedef struct socket {
     int domain;
     int type;
     int protocol;
+    task_simple_namespace_t *net_ns;
 
     // 接收队列（统一 skb 缓冲）
     spinlock_t lock;

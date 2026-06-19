@@ -3708,10 +3708,12 @@ fail:
 }
 
 uint64_t sys_setns(int fd, uint64_t nstype) {
-    static const uint64_t supported_types = CLONE_NEWNS | CLONE_NEWUSER;
+    static const uint64_t supported_types =
+        CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWNET;
     struct vfs_file *file = NULL;
     task_mount_namespace_t *target_mnt_ns = NULL;
     task_user_namespace_t *target_user_ns = NULL;
+    task_simple_namespace_t *target_net_ns = NULL;
     uint64_t fd_nstype = 0;
     int ret;
 
@@ -3724,8 +3726,8 @@ uint64_t sys_setns(int fd, uint64_t nstype) {
     if (!file)
         return (uint64_t)-EBADF;
 
-    ret =
-        procfs_nsfd_identify(file, &fd_nstype, &target_mnt_ns, &target_user_ns);
+    ret = procfs_nsfd_identify(file, &fd_nstype, &target_mnt_ns,
+                               &target_user_ns, &target_net_ns);
     vfs_file_put(file);
     if (ret < 0)
         return (uint64_t)ret;
@@ -3739,6 +3741,9 @@ uint64_t sys_setns(int fd, uint64_t nstype) {
         break;
     case CLONE_NEWUSER:
         ret = task_setns_user(current_task, target_user_ns);
+        break;
+    case CLONE_NEWNET:
+        ret = task_setns_net(current_task, target_net_ns);
         break;
     default:
         ret = -EINVAL;
@@ -3899,12 +3904,6 @@ uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4,
         }
         return 0;
     }
-
-    case PR_SET_SECCOMP: // 启用seccomp过滤
-        return 0;
-
-    case PR_GET_SECCOMP: // 查询seccomp状态
-        return 0;
 
     case PR_SET_TIMERSLACK:
         return 0;

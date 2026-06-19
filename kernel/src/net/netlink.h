@@ -2,6 +2,7 @@
 
 #include <libs/klibc.h>
 #include <net/socket.h>
+#include <task/ns.h>
 
 /* Netlink protocol family */
 #ifndef AF_INET
@@ -395,6 +396,7 @@ struct netlink_sock {
     uint32_t portid;
     uint32_t groups;
     bool passcred;
+    task_simple_namespace_t *net_ns;
     vfs_node_t *node;
     struct sockaddr_nl *bind_addr;
     struct netlink_buffer *buffer; // skb-backed receive queue

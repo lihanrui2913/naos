@@ -212,9 +212,8 @@ void sched_watchdog_tick(uint32_t cpu_id, task_t *task, uint64_t now_ns) {
 
     sched_watchdog_arm(cpu_id, now_ns);
 
-    uint32_t online_cpus = MIN((uint32_t)cpu_count, (uint32_t)MAX_CPU_NUM);
-    for (uint32_t scan_cpu = 0; scan_cpu < online_cpus; scan_cpu++)
-        sched_watchdog_check_cpu(scan_cpu, now_ns);
+    uint32_t check_cpu = (cpu_id + 1) % cpu_count;
+    sched_watchdog_check_cpu(check_cpu, now_ns);
 }
 
 void sched_watchdog_park_cpu(uint32_t cpu_id) {

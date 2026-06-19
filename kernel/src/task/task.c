@@ -51,11 +51,7 @@ typedef struct deferred_mm_free {
 } deferred_mm_free_t;
 
 task_t *init_task = NULL;
-task_t *worker_tasks[MAX_WORKER_NUM];
-uint32_t worker_task_count = 0;
-struct llist_header worker_tick_queues[MAX_WORKER_NUM];
-spinlock_t worker_tick_locks[MAX_WORKER_NUM];
-uint32_t worker_slot_by_cpu[MAX_CPU_NUM];
+task_t *softirqd_task = NULL;
 
 static inline void sched_update_preempt_deadline(uint32_t cpu_id, task_t *task,
                                                  uint64_t now_ns) {
@@ -640,56 +636,6 @@ void task_membarrier_checkpoint(task_t *task) {
     __atomic_store_n(&task->membarrier_seen_seq, seq, __ATOMIC_RELEASE);
 }
 
-static inline uint32_t sched_worker_slot_for_cpu(uint32_t cpu_id) {
-    if (!worker_task_count)
-        return 0;
-    if (cpu_id < MAX_CPU_NUM && worker_slot_by_cpu[cpu_id] != UINT32_MAX)
-        return worker_slot_by_cpu[cpu_id];
-    return cpu_id % worker_task_count;
-}
-
-static bool sched_process_tick_work(uint32_t queue_id) {
-    bool did_work = false;
-
-    while (true) {
-        task_t *task = NULL;
-        spin_lock(&worker_tick_locks[queue_id]);
-
-        if (!llist_empty(&worker_tick_queues[queue_id])) {
-            struct llist_header *node = worker_tick_queues[queue_id].next;
-            llist_delete(node);
-            task = list_entry(node, task_t, tick_work_node);
-            task->tick_work_queued = false;
-            task->tick_work_queue_id = UINT32_MAX;
-        }
-        spin_unlock(&worker_tick_locks[queue_id]);
-
-        if (!task) {
-            break;
-        }
-    }
-
-    return did_work;
-}
-
-static void task_tick_work_cancel(task_t *task) {
-    if (!task || !task->tick_work_queued) {
-        return;
-    }
-
-    uint32_t queue_id = task->tick_work_queue_id;
-    if (queue_id >= worker_task_count)
-        queue_id = sched_worker_slot_for_cpu(task->cpu_id);
-
-    spin_lock(&worker_tick_locks[queue_id]);
-    if (task->tick_work_queued) {
-        llist_delete(&task->tick_work_node);
-        task->tick_work_queued = false;
-        task->tick_work_queue_id = UINT32_MAX;
-    }
-    spin_unlock(&worker_tick_locks[queue_id]);
-}
-
 static void task_init_default_rlimits(task_t *task) {
     size_t infinity = (size_t)-1;
 
@@ -1108,7 +1054,7 @@ static bool task_should_free_pending(void) {
 
 static void task_schedule_reap_softirq(void) {
     softirq_raise(SOFTIRQ_TASK_REAP);
-    sched_wake_worker(current_cpu_id);
+    sched_wake_softirqd(current_cpu_id);
 }
 
 void task_schedule_reap(void) { task_schedule_reap_softirq(); }
@@ -1910,33 +1856,26 @@ extern void init_thread(uint64_t arg);
 
 extern bool system_initialized;
 
-spinlock_t do_softirq_lock = SPIN_INIT;
-
-void worker_thread(uint64_t arg) {
+void softirqd_thread(uint64_t arg) {
     uint32_t queue_id = (uint32_t)arg;
     while (true) {
         arch_enable_interrupt();
 
-        bool did_work = sched_process_tick_work(queue_id);
+        bool did_work = false;
 
-        if (softirq_has_pending() && spin_trylock(&do_softirq_lock)) {
+        if (softirq_has_pending()) {
             softirq_handle_pending();
             did_work = true;
-            spin_unlock(&do_softirq_lock);
         }
 
         if (!did_work) {
-            task_block(current_task, TASK_BLOCKING, -1,
-                       "worker_wait_for_event");
+            task_block(current_task, TASK_BLOCKING, -1, "waiting_for_softirq");
         }
     }
 }
 
 void task_init() {
     memset(idle_tasks, 0, sizeof(idle_tasks));
-    memset(worker_tasks, 0, sizeof(worker_tasks));
-    for (uint32_t i = 0; i < MAX_CPU_NUM; i++)
-        worker_slot_by_cpu[i] = UINT32_MAX;
     ASSERT(hashmap_init(&task_pid_map, 512) == 0);
     ASSERT(hashmap_init(&task_parent_map, 512) == 0);
     ASSERT(hashmap_init(&task_pgid_map, 512) == 0);
@@ -1974,10 +1913,6 @@ void task_init() {
         schedulers[cpu].nr_queued = 0;
         spin_init(&schedulers[cpu].lock);
     }
-    for (uint32_t i = 0; i < MAX_WORKER_NUM; i++) {
-        llist_init_head(&worker_tick_queues[i]);
-        spin_init(&worker_tick_locks[i]);
-    }
 
     for (uint64_t cpu = 0; cpu < cpu_count; cpu++) {
         task_t *idle_task = task_create("idle", NULL, 0, IDLE_PRIORITY);
@@ -1996,22 +1931,12 @@ void task_init() {
 
     init_task = task_create("init", init_thread, 0, NORMAL_PRIORITY);
 
-    worker_task_count = MIN((uint32_t)cpu_count, (uint32_t)MAX_WORKER_NUM);
-    if (worker_task_count == 0)
-        worker_task_count = 1;
-
-    for (uint32_t i = 0; i < worker_task_count; i++) {
-        char name[32];
-        snprintf(name, sizeof(name), "worker%d", i);
-        worker_tasks[i] = task_create(name, worker_thread, i, KTHREAD_PRIORITY);
-        task_set_flag(worker_tasks[i], TASK_FLAG_CPU_PINNED);
-        remove_sched_entity(worker_tasks[i],
-                            &schedulers[worker_tasks[i]->cpu_id]);
-        worker_tasks[i]->state = TASK_BLOCKING;
-        worker_tasks[i]->blocking_reason = "worker_wait_for_event";
-        if (worker_tasks[i]->cpu_id < MAX_CPU_NUM)
-            worker_slot_by_cpu[worker_tasks[i]->cpu_id] = i;
-    }
+    softirqd_task =
+        task_create("softirqd", softirqd_thread, 0, KTHREAD_PRIORITY);
+    task_set_flag(softirqd_task, TASK_FLAG_CPU_PINNED);
+    remove_sched_entity(softirqd_task, &schedulers[softirqd_task->cpu_id]);
+    softirqd_task->state = TASK_BLOCKING;
+    softirqd_task->blocking_reason = "waiting_for_softirq";
 
     arch_set_current(idle_tasks[current_cpu_id]);
     task_mark_on_cpu(idle_tasks[current_cpu_id], true);
@@ -2299,7 +2224,6 @@ void task_exit_inner(task_t *task, int64_t code) {
 
     task_timeout_cancel(task);
     task_signal_timer_cancel(task);
-    task_tick_work_cancel(task);
 
     if (task->exec_file) {
         vfs_close_file(task->exec_file);
@@ -2519,18 +2443,12 @@ static void sched_update_itimer_task(task_t *task, uint64_t now_ms) {
     task_refresh_tick_work_state(task);
 }
 
-void sched_wake_worker(uint32_t cpu_id) {
-    if (!worker_task_count) {
-        return;
-    }
-
-    uint32_t slot = sched_worker_slot_for_cpu(cpu_id);
-    task_t *worker = worker_tasks[slot];
-    if (!worker)
+void sched_wake_softirqd(uint32_t cpu_id) {
+    if (!softirqd_task)
         return;
 
-    uint32_t worker_cpu = worker->cpu_id;
-    task_unblock(worker, EOK);
+    uint32_t worker_cpu = softirqd_task->cpu_id;
+    task_unblock(softirqd_task, EOK);
     if (worker_cpu < cpu_count && worker_cpu != current_cpu_id) {
         irq_trigger_sched_ipi(worker_cpu);
     }
@@ -2547,7 +2465,7 @@ void sched_check_wakeup() {
         return;
 
     softirq_raise(SOFTIRQ_TIMER);
-    sched_wake_worker(current_cpu_id);
+    sched_wake_softirqd(current_cpu_id);
 }
 
 uint64_t sched_next_wakeup_ns(void) {

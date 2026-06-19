@@ -202,4 +202,7 @@ void procfs_on_exit_task(task_t *task);
 void proc_init();
 int procfs_nsfd_identify(struct vfs_file *file, uint64_t *nstype_out,
                          task_mount_namespace_t **mnt_ns_out,
-                         task_user_namespace_t **user_ns_out);
+                         task_user_namespace_t **user_ns_out,
+                         task_simple_namespace_t **net_ns_out);
+int procfs_create_nsfd_for_task(task_t *task, uint64_t nstype);
+int procfs_create_nsfd_for_netns(task_simple_namespace_t *net_ns);

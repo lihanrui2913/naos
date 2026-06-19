@@ -4,6 +4,8 @@
 #include <fs/pipe.h>
 #include <fs/vfs/vfs.h>
 #include <init/callbacks.h>
+#include <mm/mm.h>
+#include <mm/page.h>
 
 #define PIPEFS_MAGIC 0x50495045ULL
 
@@ -46,18 +48,11 @@ static pipe_info_t *pipefs_named_info(struct vfs_inode *inode) {
 }
 
 static pipe_info_t *pipefs_alloc_info(void) {
-    pipe_info_t *info = calloc(1, sizeof(*info));
+    pipe_info_t *info =
+        calloc(1, sizeof(*info) + sizeof(pipe_buffer_t) * PIPE_MAX_BUFFERS);
 
     if (!info)
         return NULL;
-
-    info->buf = malloc(PIPE_BUFF);
-    if (!info->buf) {
-        free(info);
-        return NULL;
-    }
-
-    memset(info->buf, 0, PIPE_BUFF);
     spin_init(&info->lock);
     return info;
 }
@@ -79,44 +74,220 @@ static void pipefs_update_size_locked(pipe_info_t *pipe,
         pipe->read_node->i_size = pipe->ptr;
 }
 
-static void pipefs_ring_read_locked(pipe_info_t *pipe, void *addr, size_t len) {
-    size_t first;
-    size_t second;
-
-    first = MIN(len, (size_t)PIPE_BUFF - pipe->read_pos);
-    memcpy(addr, pipe->buf + pipe->read_pos, first);
-
-    second = len - first;
-    if (second)
-        memcpy((char *)addr + first, pipe->buf, second);
-
-    pipe->read_pos = (pipe->read_pos + len) % PIPE_BUFF;
-    pipe->ptr -= (uint32_t)len;
-    if (pipe->ptr == 0)
-        pipe->read_pos = 0;
+static pipe_buffer_t *pipefs_buffers(pipe_info_t *pipe) {
+    return pipe ? (pipe_buffer_t *)(pipe + 1) : NULL;
 }
 
-static void pipefs_ring_write_locked(pipe_info_t *pipe, const void *addr,
+static uint32_t pipefs_buffer_index(pipe_info_t *pipe, uint32_t off) {
+    return (pipe->head + off) % PIPE_MAX_BUFFERS;
+}
+
+static pipe_buffer_t *pipefs_front_buffer(pipe_info_t *pipe) {
+    if (!pipe || !pipe->nr_buffers)
+        return NULL;
+    return &pipefs_buffers(pipe)[pipe->head];
+}
+
+static pipe_buffer_t *pipefs_back_buffer(pipe_info_t *pipe) {
+    if (!pipe || !pipe->nr_buffers)
+        return NULL;
+    pipe_buffer_t *buffers = pipefs_buffers(pipe);
+    return &buffers[pipefs_buffer_index(pipe, pipe->nr_buffers - 1)];
+}
+
+static pipe_buffer_t *pipefs_push_buffer_locked(pipe_info_t *pipe) {
+    if (!pipe || pipe->nr_buffers >= PIPE_MAX_BUFFERS)
+        return NULL;
+    pipe_buffer_t *buf =
+        &pipefs_buffers(pipe)[pipefs_buffer_index(pipe, pipe->nr_buffers++)];
+    memset(buf, 0, sizeof(*buf));
+    return buf;
+}
+
+static uint64_t pipefs_alloc_owned_page_locked(pipe_info_t *pipe) {
+    if (pipe && pipe->nr_cached_pages)
+        return pipe->cached_pages[--pipe->nr_cached_pages];
+    return alloc_frames(1);
+}
+
+static void pipefs_release_owned_page_locked(pipe_info_t *pipe, uint64_t phys) {
+    if (!phys)
+        return;
+    if (pipe && pipe->nr_cached_pages < PIPE_PAGE_CACHE_MAX) {
+        pipe->cached_pages[pipe->nr_cached_pages++] = phys;
+        return;
+    }
+    free_frames(phys, 1);
+}
+
+static void pipefs_drop_buffer_locked(pipe_info_t *pipe, pipe_buffer_t *buf) {
+    if (!buf)
+        return;
+    if (buf->page_ref)
+        address_release(buf->phys);
+    else if (buf->phys)
+        pipefs_release_owned_page_locked(pipe, buf->phys);
+    memset(buf, 0, sizeof(*buf));
+}
+
+static void pipefs_pop_front_locked(pipe_info_t *pipe) {
+    if (!pipe || !pipe->nr_buffers)
+        return;
+    pipefs_drop_buffer_locked(pipe, pipefs_front_buffer(pipe));
+    pipe->head = (pipe->head + 1) % PIPE_MAX_BUFFERS;
+    pipe->nr_buffers--;
+    if (!pipe->nr_buffers)
+        pipe->head = 0;
+}
+
+static void pipefs_discard_locked(pipe_info_t *pipe) {
+    while (pipe && pipe->nr_buffers)
+        pipefs_pop_front_locked(pipe);
+    if (pipe)
+        pipe->ptr = 0;
+}
+
+static void pipefs_buffer_consume_locked(pipe_info_t *pipe, pipe_buffer_t *buf,
+                                         size_t len) {
+    if (!pipe || !buf || !len)
+        return;
+    if (len >= buf->len) {
+        pipe->ptr -= buf->len;
+        pipefs_pop_front_locked(pipe);
+        return;
+    }
+    buf->offset += (uint16_t)len;
+    buf->len -= (uint16_t)len;
+    pipe->ptr -= (uint32_t)len;
+}
+
+static size_t pipefs_copy_out_locked(pipe_info_t *pipe, void *addr,
                                      size_t len) {
-    size_t write_pos;
-    size_t first;
-    size_t second;
+    size_t copied = 0;
 
-    write_pos = (pipe->read_pos + pipe->ptr) % PIPE_BUFF;
-    first = MIN(len, (size_t)PIPE_BUFF - write_pos);
-    memcpy(pipe->buf + write_pos, addr, first);
+    while (copied < len && pipe->nr_buffers) {
+        pipe_buffer_t *buf = pipefs_front_buffer(pipe);
+        size_t chunk = MIN(len - copied, (size_t)buf->len);
 
-    second = len - first;
-    if (second)
-        memcpy(pipe->buf, (const char *)addr + first, second);
+        memcpy((char *)addr + copied,
+               (const void *)((uintptr_t)phys_to_virt(buf->phys) + buf->offset),
+               chunk);
+        copied += chunk;
+        pipefs_buffer_consume_locked(pipe, buf, chunk);
+    }
+
+    return copied;
+}
+
+static ssize_t pipefs_append_page_locked(pipe_info_t *pipe, uint64_t phys,
+                                         size_t offset, size_t len,
+                                         bool page_ref) {
+    if (!pipe || !phys || !len || offset >= PAGE_SIZE ||
+        len > PAGE_SIZE - offset)
+        return -EINVAL;
+    if (pipe->ptr + len > PIPE_BUFF)
+        return 0;
+
+    pipe_buffer_t *buf = pipefs_push_buffer_locked(pipe);
+    if (!buf)
+        return 0;
+    buf->phys = phys;
+    buf->offset = (uint16_t)offset;
+    buf->len = (uint16_t)len;
+    buf->page_ref = page_ref;
+    buf->can_merge = !page_ref && offset == 0 && len < PAGE_SIZE;
 
     pipe->ptr += (uint32_t)len;
+    return (ssize_t)len;
+}
+
+static size_t pipefs_ring_write_locked(pipe_info_t *pipe, const void *addr,
+                                       size_t len) {
+    size_t copied = 0;
+
+    while (copied < len) {
+        pipe_buffer_t *tail = pipefs_back_buffer(pipe);
+
+        if (tail && tail->can_merge) {
+            size_t tail_end = (size_t)tail->offset + tail->len;
+            size_t chunk = MIN(len - copied, (size_t)PAGE_SIZE - tail_end);
+
+            if (chunk) {
+                void *tail_addr =
+                    (void *)((uintptr_t)phys_to_virt(tail->phys) + tail_end);
+                memcpy(tail_addr, (const char *)addr + copied, chunk);
+                tail->len += (uint16_t)chunk;
+                tail->can_merge = (tail_end + chunk) < PAGE_SIZE;
+                pipe->ptr += (uint32_t)chunk;
+                copied += chunk;
+                continue;
+            }
+            tail->can_merge = false;
+        }
+
+        uint64_t phys = pipefs_alloc_owned_page_locked(pipe);
+        size_t chunk = MIN(len - copied, (size_t)PAGE_SIZE);
+
+        if (!phys)
+            break;
+        memcpy((void *)phys_to_virt(phys), (const char *)addr + copied, chunk);
+        if (pipefs_append_page_locked(pipe, phys, 0, chunk, false) <= 0) {
+            pipefs_release_owned_page_locked(pipe, phys);
+            break;
+        }
+        copied += chunk;
+    }
+    return copied;
+}
+
+static bool pipefs_move_one_locked(pipe_info_t *dst, pipe_info_t *src,
+                                   size_t max_len, size_t *moved) {
+    pipe_buffer_t *in;
+    pipe_buffer_t *out;
+    size_t chunk;
+
+    if (moved)
+        *moved = 0;
+    if (!dst || !src || !src->nr_buffers || dst->nr_buffers >= PIPE_MAX_BUFFERS)
+        return false;
+    if (dst->ptr >= PIPE_BUFF)
+        return false;
+
+    in = pipefs_front_buffer(src);
+    chunk = MIN(max_len, (size_t)in->len);
+    chunk = MIN(chunk, (size_t)PIPE_BUFF - dst->ptr);
+    if (!chunk)
+        return false;
+
+    out = pipefs_push_buffer_locked(dst);
+    if (!out)
+        return false;
+
+    *out = *in;
+    out->len = (uint16_t)chunk;
+    if (!address_ref(out->phys)) {
+        memset(out, 0, sizeof(*out));
+        dst->nr_buffers--;
+        return false;
+    }
+    out->page_ref = true;
+    out->can_merge = false;
+    in->page_ref = true;
+    in->can_merge = false;
+
+    dst->ptr += (uint32_t)chunk;
+    pipefs_buffer_consume_locked(src, in, chunk);
+    if (moved)
+        *moved = chunk;
+    return true;
 }
 
 static void pipefs_free_info(pipe_info_t *pipe) {
     if (!pipe)
         return;
-    free(pipe->buf);
+    pipefs_discard_locked(pipe);
+    while (pipe->nr_cached_pages)
+        free_frames(pipe->cached_pages[--pipe->nr_cached_pages], 1);
     free(pipe);
 }
 
@@ -383,7 +554,7 @@ static ssize_t pipe_read_inner(struct vfs_file *file, void *addr, size_t size,
 
         if (pipe->ptr > 0) {
             size_t to_read = MIN(size, pipe->ptr);
-            pipefs_ring_read_locked(pipe, addr, to_read);
+            to_read = pipefs_copy_out_locked(pipe, addr, to_read);
             pipefs_update_size_locked(pipe, file);
             vfs_node_t *write_node = pipe->write_node;
             if (write_node)
@@ -461,7 +632,11 @@ static ssize_t pipe_write_inner(struct vfs_file *file, const void *addr,
         if (available > 0 && (!atomic || available >= size)) {
             bool was_empty = pipe->ptr == 0;
             size_t to_write = atomic ? size : MIN(size, available);
-            pipefs_ring_write_locked(pipe, addr, to_write);
+            to_write = pipefs_ring_write_locked(pipe, addr, to_write);
+            if (!to_write) {
+                spin_unlock(&pipe->lock);
+                return -ENOMEM;
+            }
             pipefs_update_size_locked(pipe, file);
             vfs_node_t *read_node = pipe->read_node;
             if (was_empty && read_node)
@@ -792,9 +967,277 @@ void pipefs_named_evict_inode(struct vfs_inode *inode) {
 
     pipe->read_node = NULL;
     pipe->write_node = NULL;
-    free(pipe->buf);
-    free(pipe);
+    pipefs_free_info(pipe);
     inode->i_private = NULL;
+}
+
+bool pipefs_is_pipe(struct vfs_file *file) {
+    pipe_specific_t *spec = pipefs_spec_from_file(file);
+    return spec && spec->info;
+}
+
+static int pipefs_wait_readable(struct vfs_file *file, bool nonblock) {
+    if (nonblock || (file->f_flags & O_NONBLOCK))
+        return -EWOULDBLOCK;
+    return vfs_poll_wait_interruptible(file, EPOLLIN | EPOLLERR | EPOLLHUP |
+                                                 EPOLLNVAL);
+}
+
+static int pipefs_wait_writable(struct vfs_file *file, bool nonblock) {
+    if (nonblock || (file->f_flags & O_NONBLOCK))
+        return -EWOULDBLOCK;
+    return vfs_poll_wait_interruptible(file, EPOLLOUT | EPOLLERR | EPOLLHUP |
+                                                 EPOLLNVAL);
+}
+
+static ssize_t pipefs_splice_pipe_to_pipe(struct vfs_file *in,
+                                          struct vfs_file *out, size_t count,
+                                          bool nonblock) {
+    pipe_specific_t *ispec = pipefs_spec_from_file(in);
+    pipe_specific_t *ospec = pipefs_spec_from_file(out);
+    pipe_info_t *ipipe;
+    pipe_info_t *opipe;
+    size_t moved_total = 0;
+
+    if (!ispec || !ospec || !ispec->read || !ospec->write)
+        return -EBADF;
+    ipipe = ispec->info;
+    opipe = ospec->info;
+    if (!ipipe || !opipe || ipipe == opipe)
+        return -EINVAL;
+
+    while (moved_total < count) {
+        bool was_empty;
+        size_t moved = 0;
+        vfs_node_t *read_node = NULL;
+        vfs_node_t *write_node = NULL;
+
+        if ((uintptr_t)ipipe < (uintptr_t)opipe) {
+            spin_lock(&ipipe->lock);
+            spin_lock(&opipe->lock);
+        } else {
+            spin_lock(&opipe->lock);
+            spin_lock(&ipipe->lock);
+        }
+
+        if (opipe->read_fds == 0) {
+            spin_unlock(&ipipe->lock);
+            spin_unlock(&opipe->lock);
+            task_commit_signal(current_task, SIGPIPE, NULL);
+            return moved_total ? (ssize_t)moved_total : -EPIPE;
+        }
+        if (ipipe->ptr == 0) {
+            bool closed = ipipe->write_fds == 0;
+            spin_unlock(&ipipe->lock);
+            spin_unlock(&opipe->lock);
+            if (closed)
+                break;
+            if (moved_total)
+                break;
+            int ret = pipefs_wait_readable(in, nonblock);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+        if (opipe->ptr >= PIPE_BUFF || opipe->nr_buffers >= PIPE_MAX_BUFFERS) {
+            spin_unlock(&ipipe->lock);
+            spin_unlock(&opipe->lock);
+            if (moved_total)
+                break;
+            int ret = pipefs_wait_writable(out, nonblock);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
+        was_empty = opipe->ptr == 0;
+        if (!pipefs_move_one_locked(opipe, ipipe, count - moved_total,
+                                    &moved)) {
+            spin_unlock(&ipipe->lock);
+            spin_unlock(&opipe->lock);
+            if (moved_total)
+                break;
+            return -ENOMEM;
+        }
+        pipefs_update_size_locked(ipipe, in);
+        pipefs_update_size_locked(opipe, out);
+        if (ipipe->write_node)
+            write_node = vfs_igrab(ipipe->write_node);
+        if (was_empty && opipe->read_node)
+            read_node = vfs_igrab(opipe->read_node);
+        spin_unlock(&ipipe->lock);
+        spin_unlock(&opipe->lock);
+
+        if (write_node) {
+            pipefs_notify_node(write_node, EPOLLOUT | EPOLLWRNORM);
+            vfs_iput(write_node);
+        }
+        if (read_node) {
+            pipefs_notify_node(read_node, EPOLLIN | EPOLLRDNORM);
+            vfs_iput(read_node);
+        }
+        moved_total += moved;
+    }
+
+    return (ssize_t)moved_total;
+}
+
+ssize_t pipefs_splice_to(struct vfs_file *in, struct vfs_file *out,
+                         size_t count, bool nonblock) {
+    pipe_specific_t *spec = pipefs_spec_from_file(in);
+    pipe_info_t *pipe;
+    size_t moved_total = 0;
+
+    if (!spec || !spec->read || !spec->info)
+        return -EBADF;
+    if (pipefs_is_pipe(out))
+        return pipefs_splice_pipe_to_pipe(in, out, count, nonblock);
+    pipe = spec->info;
+
+    while (moved_total < count) {
+        pipe_buffer_t local;
+        size_t chunk;
+        ssize_t wr;
+        vfs_node_t *write_node = NULL;
+
+        spin_lock(&pipe->lock);
+        if (pipe->ptr == 0) {
+            bool closed = pipe->write_fds == 0;
+            spin_unlock(&pipe->lock);
+            if (closed || moved_total)
+                break;
+            int ret = pipefs_wait_readable(in, nonblock);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
+        local = *pipefs_front_buffer(pipe);
+        chunk = MIN(count - moved_total, (size_t)local.len);
+        local.len = (uint16_t)chunk;
+        if (!address_ref(local.phys)) {
+            spin_unlock(&pipe->lock);
+            return moved_total ? (ssize_t)moved_total : -EFAULT;
+        }
+        local.page_ref = true;
+        spin_unlock(&pipe->lock);
+
+        wr = vfs_write_kernel_file(
+            out,
+            (const void *)((uintptr_t)phys_to_virt(local.phys) + local.offset),
+            chunk, NULL);
+        address_release(local.phys);
+        if (wr <= 0) {
+            if (wr < 0)
+                return moved_total ? (ssize_t)moved_total : wr;
+            break;
+        }
+
+        spin_lock(&pipe->lock);
+        pipefs_buffer_consume_locked(pipe, pipefs_front_buffer(pipe),
+                                     (size_t)wr);
+        pipefs_update_size_locked(pipe, in);
+        if (pipe->write_node)
+            write_node = vfs_igrab(pipe->write_node);
+        spin_unlock(&pipe->lock);
+
+        if (write_node) {
+            pipefs_notify_node(write_node, EPOLLOUT | EPOLLWRNORM);
+            vfs_iput(write_node);
+        }
+        moved_total += (size_t)wr;
+        if ((size_t)wr < chunk)
+            break;
+    }
+
+    return (ssize_t)moved_total;
+}
+
+ssize_t pipefs_splice_from_user(struct vfs_file *file, const struct iovec *iov,
+                                size_t nr_segs, size_t count, bool nonblock) {
+    pipe_specific_t *spec = pipefs_spec_from_file(file);
+    pipe_info_t *pipe;
+    size_t done = 0;
+    size_t iov_off = 0;
+
+    if (!spec || !spec->write || !spec->info)
+        return -EBADF;
+    pipe = spec->info;
+
+    for (size_t i = 0; i < nr_segs && done < count; i++) {
+        uintptr_t base = (uintptr_t)iov[i].iov_base;
+        size_t len = MIN((size_t)iov[i].len, count - done);
+        iov_off = 0;
+
+        while (iov_off < len) {
+            uintptr_t uaddr = base + iov_off;
+            uint64_t *pgdir = get_current_page_dir(true);
+            uint64_t pa = user_translate_or_fault(pgdir, uaddr, false);
+            uint64_t page_phys;
+            size_t page_off;
+            size_t chunk;
+            vfs_node_t *read_node = NULL;
+            bool was_empty;
+
+            if (!pa)
+                return done ? (ssize_t)done : -EFAULT;
+
+            page_phys = PADDING_DOWN(pa, PAGE_SIZE);
+            page_off = pa - page_phys;
+            chunk = MIN(len - iov_off, PAGE_SIZE - page_off);
+
+            spin_lock(&pipe->lock);
+            if (pipe->read_fds == 0) {
+                spin_unlock(&pipe->lock);
+                task_commit_signal(current_task, SIGPIPE, NULL);
+                return done ? (ssize_t)done : -EPIPE;
+            }
+            if (pipe->ptr >= PIPE_BUFF ||
+                pipe->nr_buffers >= PIPE_MAX_BUFFERS) {
+                spin_unlock(&pipe->lock);
+                if (done)
+                    return (ssize_t)done;
+                int ret = pipefs_wait_writable(file, nonblock);
+                if (ret < 0)
+                    return ret;
+                continue;
+            }
+
+            chunk = MIN(chunk, (size_t)PIPE_BUFF - pipe->ptr);
+            was_empty = pipe->ptr == 0;
+            if (!address_ref(page_phys)) {
+                spin_unlock(&pipe->lock);
+                return done ? (ssize_t)done : -EFAULT;
+            }
+            ssize_t ret = pipefs_append_page_locked(pipe, page_phys, page_off,
+                                                    chunk, true);
+            if (ret <= 0) {
+                address_release(page_phys);
+                spin_unlock(&pipe->lock);
+                if (done)
+                    return (ssize_t)done;
+                if (ret < 0)
+                    return ret;
+                ret = pipefs_wait_writable(file, nonblock);
+                if (ret < 0)
+                    return ret;
+                continue;
+            }
+            pipefs_update_size_locked(pipe, file);
+            if (was_empty && pipe->read_node)
+                read_node = vfs_igrab(pipe->read_node);
+            spin_unlock(&pipe->lock);
+
+            if (read_node) {
+                pipefs_notify_node(read_node, EPOLLIN | EPOLLRDNORM);
+                vfs_iput(read_node);
+            }
+            done += (size_t)ret;
+            iov_off += (size_t)ret;
+        }
+    }
+
+    return (ssize_t)done;
 }
 
 uint64_t sys_pipe(int pipefd[2], uint64_t flags) {
@@ -866,7 +1309,6 @@ out_close_read:
     return ret;
 
 out_free_pipe:
-    free(info->buf);
-    free(info);
+    pipefs_free_info(info);
     return ret;
 }

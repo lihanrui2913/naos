@@ -330,6 +330,10 @@ size_t sys_setitimer(int which, struct itimerval *value, struct itimerval *old);
 #define PR_CAP_AMBIENT_LOWER 3
 #define PR_CAP_AMBIENT_CLEAR_ALL 4
 
+#define SECCOMP_MODE_DISABLED 0
+#define SECCOMP_MODE_STRICT 1
+#define SECCOMP_MODE_FILTER 2
+
 /**
  * Linux contract: multiplex process control features such as PR_SET_NAME,
  * PR_SET_NO_NEW_PRIVS, seccomp state, and parent-death signals.

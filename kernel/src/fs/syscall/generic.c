@@ -3,6 +3,7 @@
 #include <boot/boot.h>
 #include <net/socket.h>
 #include <drivers/logger.h>
+#include <fs/pipe.h>
 #include <fs/vfs/notify.h>
 #include <mm/cache.h>
 #include <task/ns.h>
@@ -28,6 +29,12 @@
 #define RWF_APPEND 0x00000010
 #define RWF_SUPPORTED                                                          \
     (RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND)
+#define SPLICE_F_MOVE 0x01
+#define SPLICE_F_NONBLOCK 0x02
+#define SPLICE_F_MORE 0x04
+#define SPLICE_F_GIFT 0x08
+#define SPLICE_F_SUPPORTED                                                     \
+    (SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT)
 #define POSIX_FADV_NORMAL 0
 #define POSIX_FADV_RANDOM 1
 #define POSIX_FADV_SEQUENTIAL 2
@@ -1989,6 +1996,186 @@ uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, int *offset_ptr,
     vfs_file_put(out_handle);
     vfs_file_put(in_handle);
     return total_sent;
+}
+
+static ssize_t generic_splice_fallback(struct vfs_file *in,
+                                       struct vfs_file *out, size_t len,
+                                       loff_t *in_pos, loff_t *out_pos,
+                                       bool nonblock) {
+    uint8_t *buf = NULL;
+    size_t total = 0;
+
+    if (len == 0)
+        return 0;
+    buf = (uint8_t *)alloc_frames_bytes(MIN(len, (size_t)(1 << 20)));
+    if (!buf)
+        return -ENOMEM;
+
+    while (total < len) {
+        size_t chunk = MIN(len - total, (size_t)(1 << 20));
+        ssize_t rd = vfs_read_file(in, buf, chunk, in_pos);
+        ssize_t wr;
+
+        if (rd <= 0) {
+            if (rd < 0 && total == 0) {
+                free_frames_bytes(buf, MIN(len, (size_t)(1 << 20)));
+                return rd;
+            }
+            break;
+        }
+        wr = vfs_write_kernel_file(out, buf, (size_t)rd, out_pos);
+        if (wr <= 0) {
+            if (total == 0) {
+                free_frames_bytes(buf, MIN(len, (size_t)(1 << 20)));
+                return wr < 0 ? wr : 0;
+            }
+            break;
+        }
+        total += (size_t)wr;
+        if ((size_t)wr < (size_t)rd)
+            break;
+    }
+
+    free_frames_bytes(buf, MIN(len, (size_t)(1 << 20)));
+    (void)nonblock;
+    return (ssize_t)total;
+}
+
+uint64_t sys_splice(uint64_t fd_in, int64_t *off_in, uint64_t fd_out,
+                    int64_t *off_out, size_t len, uint64_t flags) {
+    struct vfs_file *in = NULL;
+    struct vfs_file *out = NULL;
+    ssize_t ret;
+    loff_t in_pos = 0;
+    loff_t out_pos = 0;
+    bool in_pos_valid = false;
+    bool out_pos_valid = false;
+    bool nonblock = !!(flags & SPLICE_F_NONBLOCK);
+
+    if (flags & ~SPLICE_F_SUPPORTED)
+        return -EINVAL;
+
+    in = task_get_file(current_task, (int)fd_in);
+    out = task_get_file(current_task, (int)fd_out);
+    if (!in || !out) {
+        vfs_file_put(in);
+        vfs_file_put(out);
+        return -EBADF;
+    }
+    if (S_ISDIR(in->f_inode->i_mode) || S_ISDIR(out->f_inode->i_mode)) {
+        vfs_file_put(in);
+        vfs_file_put(out);
+        return -EISDIR;
+    }
+
+    if (off_in) {
+        if (check_user_overflow((uint64_t)off_in, sizeof(*off_in)) ||
+            copy_from_user(&in_pos, off_in, sizeof(in_pos))) {
+            vfs_file_put(in);
+            vfs_file_put(out);
+            return -EFAULT;
+        }
+        in_pos_valid = true;
+    }
+    if (off_out) {
+        if (check_user_overflow((uint64_t)off_out, sizeof(*off_out)) ||
+            copy_from_user(&out_pos, off_out, sizeof(out_pos))) {
+            vfs_file_put(in);
+            vfs_file_put(out);
+            return -EFAULT;
+        }
+        out_pos_valid = true;
+    }
+
+    if (pipefs_is_pipe(in)) {
+        if (off_in) {
+            vfs_file_put(in);
+            vfs_file_put(out);
+            return -ESPIPE;
+        }
+        ret = pipefs_splice_to(in, out, len, nonblock);
+    } else if (pipefs_is_pipe(out)) {
+        if (off_out) {
+            vfs_file_put(in);
+            vfs_file_put(out);
+            return -ESPIPE;
+        }
+        ret = generic_splice_fallback(
+            in, out, len, in_pos_valid ? &in_pos : NULL, NULL, nonblock);
+    } else {
+        ret =
+            generic_splice_fallback(in, out, len, in_pos_valid ? &in_pos : NULL,
+                                    out_pos_valid ? &out_pos : NULL, nonblock);
+    }
+
+    if (ret > 0) {
+        if (in_pos_valid) {
+            in_pos += ret;
+            if (copy_to_user(off_in, &in_pos, sizeof(in_pos)))
+                ret = -EFAULT;
+        }
+        if (out_pos_valid) {
+            out_pos += ret;
+            if (copy_to_user(off_out, &out_pos, sizeof(out_pos)))
+                ret = -EFAULT;
+        }
+    }
+
+    vfs_file_put(in);
+    vfs_file_put(out);
+    return (uint64_t)ret;
+}
+
+uint64_t sys_vmsplice(uint64_t fd, const struct iovec *iov, uint64_t nr_segs,
+                      uint64_t flags) {
+    struct vfs_file *file;
+    struct iovec *kiov = NULL;
+    size_t iov_bytes = 0;
+    size_t total_len = 0;
+    ssize_t ret;
+    uint64_t vret;
+
+    if (flags & ~SPLICE_F_SUPPORTED)
+        return -EINVAL;
+    if (!iov && nr_segs)
+        return -EFAULT;
+    if (nr_segs > UIO_MAXIOV)
+        return -EINVAL;
+    if (nr_segs && check_user_array_overflow((uint64_t)iov, (size_t)nr_segs,
+                                             sizeof(struct iovec), &iov_bytes))
+        return -EFAULT;
+
+    if (nr_segs) {
+        kiov = malloc(iov_bytes);
+        if (!kiov)
+            return -ENOMEM;
+        if (copy_from_user(kiov, iov, iov_bytes)) {
+            free(kiov);
+            return -EFAULT;
+        }
+        vret = rw_validate_iovecs(kiov, nr_segs, &total_len);
+        if ((int64_t)vret < 0) {
+            free(kiov);
+            return vret;
+        }
+    }
+
+    file = task_get_file(current_task, (int)fd);
+    if (!file) {
+        free(kiov);
+        return -EBADF;
+    }
+    if (!pipefs_is_pipe(file)) {
+        vfs_file_put(file);
+        free(kiov);
+        return -EINVAL;
+    }
+
+    ret = pipefs_splice_from_user(file, kiov, nr_segs, total_len,
+                                  !!(flags & SPLICE_F_NONBLOCK));
+    vfs_file_put(file);
+    free(kiov);
+    return (uint64_t)ret;
 }
 
 uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {

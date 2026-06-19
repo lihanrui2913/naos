@@ -659,11 +659,11 @@ void syscall_handler_init() {
         (syscall_handle_t)sys_set_robust_list;
     syscall_handlers[SYS_GET_ROBUST_LIST] =
         (syscall_handle_t)sys_get_robust_list;
-    // syscall_handlers[SYS_SPLICE] = (syscall_handle_t)sys_splice;
+    syscall_handlers[SYS_SPLICE] = (syscall_handle_t)sys_splice;
     // syscall_handlers[SYS_TEE] = (syscall_handle_t)sys_tee;
     // syscall_handlers[SYS_SYNC_FILE_RANGE] =
     //     (syscall_handle_t)sys_sync_file_range;
-    // syscall_handlers[SYS_VMSPLICE] = (syscall_handle_t)sys_vmsplice;
+    syscall_handlers[SYS_VMSPLICE] = (syscall_handle_t)sys_vmsplice;
     // syscall_handlers[SYS_MOVE_PAGES] = (syscall_handle_t)sys_move_pages;
     syscall_handlers[SYS_UTIMENSAT_] = (syscall_handle_t)sys_utimensat;
     syscall_handlers[SYS_UTIMENSAT] = (syscall_handle_t)sys_utimensat;

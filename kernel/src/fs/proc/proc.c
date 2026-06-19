@@ -31,6 +31,7 @@ typedef struct procfs_inode_info {
     uint64_t ns_type;
     task_mount_namespace_t *mnt_ns;
     task_user_namespace_t *user_ns;
+    task_simple_namespace_t *net_ns;
     char *dispatch_name;
 } procfs_inode_info_t;
 
@@ -47,6 +48,8 @@ static const struct vfs_file_operations procfs_dir_file_ops;
 static const struct vfs_file_operations procfs_file_ops;
 
 spinlock_t procfs_oplock;
+static spinlock_t procfs_mount_lock;
+static struct vfs_mount *procfs_internal_mnt;
 
 static inline procfs_inode_info_t *procfs_i(vfs_node_t *inode) {
     return inode ? container_of(inode, procfs_inode_info_t, vfs_inode) : NULL;
@@ -112,6 +115,12 @@ static uint64_t procfs_task_user_ns_inum(task_t *task) {
     return task->nsproxy->user_ns->common.inum;
 }
 
+static uint64_t procfs_task_net_ns_inum(task_t *task) {
+    if (!task || !task->nsproxy || !task->nsproxy->net_ns)
+        return 0;
+    return task->nsproxy->net_ns->common.inum;
+}
+
 static int procfs_parse_decimal(const char *name, int *out) {
     uint64_t value = 0;
 
@@ -137,7 +146,8 @@ static bool procfs_lookup_wants_nofollow_inode(unsigned int flags) {
 
 static bool procfs_is_ns_symlink_name(const char *name) {
     return name &&
-           (!strcmp(name, "proc_ns_mnt") || !strcmp(name, "proc_ns_user"));
+           (!strcmp(name, "proc_ns_mnt") || !strcmp(name, "proc_ns_user") ||
+            !strcmp(name, "proc_ns_net"));
 }
 
 static bool procfs_is_ns_link_inode(const procfs_inode_info_t *info) {
@@ -230,14 +240,31 @@ static void procfs_evict_inode(struct vfs_inode *inode) {
     free(info->dispatch_name);
     task_mount_namespace_put(info->mnt_ns);
     task_user_namespace_put(info->user_ns);
+    task_simple_namespace_put(info->net_ns);
     info->mnt_ns = NULL;
     info->user_ns = NULL;
+    info->net_ns = NULL;
     info->dispatch_name = NULL;
 }
 
 static int procfs_init_fs_context(struct vfs_fs_context *fc) {
     (void)fc;
     return 0;
+}
+
+static struct vfs_mount *procfs_get_internal_mount(void) {
+    int ret;
+
+    spin_lock(&procfs_mount_lock);
+    if (!procfs_internal_mnt) {
+        ret = vfs_kern_mount("proc", 0, NULL, NULL, &procfs_internal_mnt);
+        if (ret < 0)
+            procfs_internal_mnt = NULL;
+    }
+    if (procfs_internal_mnt)
+        vfs_mntget(procfs_internal_mnt);
+    spin_unlock(&procfs_mount_lock);
+    return procfs_internal_mnt;
 }
 
 static uint64_t procfs_ino_for_pid(procfs_inode_kind_t kind, uint64_t pid,
@@ -300,8 +327,10 @@ static vfs_node_t *procfs_new_ns_inode(struct vfs_super_block *sb, task_t *task,
                                        unsigned int lookup_flags) {
     bool want_symlink = procfs_lookup_wants_nofollow_inode(lookup_flags);
     bool is_user_ns = name && !strcmp(name, "user");
-    uint64_t ns_inum = is_user_ns ? procfs_task_user_ns_inum(task)
-                                  : procfs_task_mnt_ns_inum(task);
+    bool is_net_ns = name && !strcmp(name, "net");
+    uint64_t ns_inum = is_user_ns  ? procfs_task_user_ns_inum(task)
+                       : is_net_ns ? procfs_task_net_ns_inum(task)
+                                   : procfs_task_mnt_ns_inum(task);
     vfs_node_t *inode;
 
     if (!procfs_task_is_alive(task))
@@ -310,7 +339,9 @@ static vfs_node_t *procfs_new_ns_inode(struct vfs_super_block *sb, task_t *task,
     if (want_symlink) {
         return procfs_new_inode(sb, S_IFLNK | 0777, PROCFS_INO_SYMLINK, task,
                                 -1,
-                                is_user_ns ? "proc_ns_user" : "proc_ns_mnt");
+                                is_user_ns  ? "proc_ns_user"
+                                : is_net_ns ? "proc_ns_net"
+                                            : "proc_ns_mnt");
     }
 
     inode = procfs_new_inode(sb, S_IFREG | 0444, PROCFS_INO_NS_HANDLE, task, -1,
@@ -318,11 +349,17 @@ static vfs_node_t *procfs_new_ns_inode(struct vfs_super_block *sb, task_t *task,
     if (!inode)
         return NULL;
 
-    procfs_i(inode)->ns_type = is_user_ns ? CLONE_NEWUSER : CLONE_NEWNS;
+    procfs_i(inode)->ns_type = is_user_ns  ? CLONE_NEWUSER
+                               : is_net_ns ? CLONE_NEWNET
+                                           : CLONE_NEWNS;
     if (is_user_ns) {
         procfs_i(inode)->user_ns =
             task && task->nsproxy ? task->nsproxy->user_ns : NULL;
         task_user_namespace_get(procfs_i(inode)->user_ns);
+    } else if (is_net_ns) {
+        procfs_i(inode)->net_ns =
+            task && task->nsproxy ? task->nsproxy->net_ns : NULL;
+        task_simple_namespace_get(procfs_i(inode)->net_ns);
     } else {
         procfs_i(inode)->mnt_ns =
             task && task->nsproxy ? task->nsproxy->mnt_ns : NULL;
@@ -338,7 +375,8 @@ static vfs_node_t *procfs_new_ns_inode(struct vfs_super_block *sb, task_t *task,
 
 int procfs_nsfd_identify(struct vfs_file *file, uint64_t *nstype_out,
                          task_mount_namespace_t **mnt_ns_out,
-                         task_user_namespace_t **user_ns_out) {
+                         task_user_namespace_t **user_ns_out,
+                         task_simple_namespace_t **net_ns_out) {
     procfs_inode_info_t *info;
 
     if (!file || !file->f_inode || !file->f_inode->i_sb ||
@@ -356,7 +394,135 @@ int procfs_nsfd_identify(struct vfs_file *file, uint64_t *nstype_out,
         *mnt_ns_out = info->mnt_ns;
     if (user_ns_out)
         *user_ns_out = info->user_ns;
+    if (net_ns_out)
+        *net_ns_out = info->net_ns;
     return 0;
+}
+
+int procfs_create_nsfd_for_task(task_t *task, uint64_t nstype) {
+    struct vfs_mount *mnt;
+    struct vfs_super_block *sb;
+    struct vfs_inode *inode;
+    struct vfs_dentry *dentry;
+    struct vfs_qstr name = {0};
+    struct vfs_file *file;
+    const char *ns_name;
+    char namebuf[64];
+    int ret;
+
+    if (!procfs_task_is_alive(task))
+        return -ESRCH;
+
+    switch (nstype) {
+    case CLONE_NEWNS:
+        ns_name = "mnt";
+        break;
+    case CLONE_NEWUSER:
+        ns_name = "user";
+        break;
+    case CLONE_NEWNET:
+        ns_name = "net";
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    mnt = procfs_get_internal_mount();
+    if (!mnt)
+        return -ENODEV;
+
+    sb = mnt->mnt_sb;
+    inode = procfs_new_ns_inode(sb, task, ns_name, 0);
+    if (!inode) {
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    snprintf(namebuf, sizeof(namebuf), "pidfd-%llu-%s-ns",
+             (unsigned long long)task->pid, ns_name);
+    vfs_qstr_make(&name, namebuf);
+    dentry = vfs_d_alloc(sb, sb->s_root, &name);
+    if (!dentry) {
+        vfs_iput(inode);
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    vfs_d_instantiate(dentry, inode);
+    file = vfs_alloc_file(&(struct vfs_path){.mnt = mnt, .dentry = dentry},
+                          O_RDONLY);
+    if (!file) {
+        vfs_dput(dentry);
+        vfs_iput(inode);
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    ret = task_install_file(current_task, file, FD_CLOEXEC, 0);
+    vfs_file_put(file);
+    vfs_dput(dentry);
+    vfs_iput(inode);
+    vfs_mntput(mnt);
+    return ret;
+}
+
+int procfs_create_nsfd_for_netns(task_simple_namespace_t *net_ns) {
+    struct vfs_mount *mnt;
+    struct vfs_super_block *sb;
+    struct vfs_inode *inode;
+    struct vfs_dentry *dentry;
+    struct vfs_qstr name = {0};
+    struct vfs_file *file;
+    char namebuf[64];
+    int ret;
+
+    if (!net_ns)
+        return -EINVAL;
+
+    mnt = procfs_get_internal_mount();
+    if (!mnt)
+        return -ENODEV;
+
+    sb = mnt->mnt_sb;
+    inode = procfs_new_inode(sb, S_IFREG | 0444, PROCFS_INO_NS_HANDLE, NULL, -1,
+                             NULL);
+    if (!inode) {
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    procfs_i(inode)->ns_type = CLONE_NEWNET;
+    procfs_i(inode)->net_ns = net_ns;
+    task_simple_namespace_get(procfs_i(inode)->net_ns);
+    inode->i_ino = net_ns->common.inum;
+    inode->inode = net_ns->common.inum;
+
+    snprintf(namebuf, sizeof(namebuf), "socket-net-ns-%llu",
+             (unsigned long long)net_ns->common.inum);
+    vfs_qstr_make(&name, namebuf);
+    dentry = vfs_d_alloc(sb, sb->s_root, &name);
+    if (!dentry) {
+        vfs_iput(inode);
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    vfs_d_instantiate(dentry, inode);
+    file = vfs_alloc_file(&(struct vfs_path){.mnt = mnt, .dentry = dentry},
+                          O_RDONLY);
+    if (!file) {
+        vfs_dput(dentry);
+        vfs_iput(inode);
+        vfs_mntput(mnt);
+        return -ENOMEM;
+    }
+
+    ret = task_install_file(current_task, file, FD_CLOEXEC, 0);
+    vfs_file_put(file);
+    vfs_dput(dentry);
+    vfs_iput(inode);
+    vfs_mntput(mnt);
+    return ret;
 }
 
 static vfs_node_t *procfs_lookup_path(const char *path) {
@@ -578,6 +744,14 @@ static ssize_t procfs_dynamic_readlink(procfs_inode_info_t *info, void *addr,
 
             snprintf(nslink, sizeof(nslink), "user:[%llu]",
                      (unsigned long long)procfs_task_user_ns_inum(
+                         procfs_handle_task(&handle)));
+            return procfs_copy_string(nslink, addr, offset, size);
+        }
+        if (!strcmp(info->dispatch_name, "proc_ns_net")) {
+            char nslink[64];
+
+            snprintf(nslink, sizeof(nslink), "net:[%llu]",
+                     (unsigned long long)procfs_task_net_ns_inum(
                          procfs_handle_task(&handle)));
             return procfs_copy_string(nslink, addr, offset, size);
         }
@@ -994,7 +1168,10 @@ static int procfs_iterate_shared(struct vfs_file *file,
                                              "proc_ns_mnt")) != 0 ||
             procfs_emit_entry(ctx, &index, "user", DT_LNK,
                               procfs_ino_for(PROCFS_INO_SYMLINK, task, -1,
-                                             "proc_ns_user")) != 0) {
+                                             "proc_ns_user")) != 0 ||
+            procfs_emit_entry(ctx, &index, "net", DT_LNK,
+                              procfs_ino_for(PROCFS_INO_SYMLINK, task, -1,
+                                             "proc_ns_net")) != 0) {
             break;
         }
         break;
@@ -1265,7 +1442,8 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         if (!strcmp(dentry->d_name.name, "mnt")) {
             inode = procfs_new_ns_inode(dir->i_sb, task, dentry->d_name.name,
                                         flags);
-        } else if (!strcmp(dentry->d_name.name, "user")) {
+        } else if (!strcmp(dentry->d_name.name, "user") ||
+                   !strcmp(dentry->d_name.name, "net")) {
             inode = procfs_new_ns_inode(dir->i_sb, task, dentry->d_name.name,
                                         flags);
         }
@@ -1455,6 +1633,7 @@ size_t proc_fdinfo_read(proc_handle_t *handle, void *addr, size_t offset,
 
 void proc_init() {
     spin_init(&procfs_oplock);
+    spin_init(&procfs_mount_lock);
     vfs_register_filesystem(&procfs_fs_type);
     procfs_nodes_init();
 }

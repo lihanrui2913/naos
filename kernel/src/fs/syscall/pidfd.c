@@ -1,5 +1,6 @@
 #include <init/callbacks.h>
 #include <fs/fs_syscall.h>
+#include <fs/proc/proc.h>
 #include <libs/hashmap.h>
 #include <task/task.h>
 
@@ -161,6 +162,8 @@ static long pidfd_ioctl(struct vfs_file *file, unsigned long cmd,
         return -ESRCH;
 
     switch (cmd) {
+    case PIDFD_GET_USER_NAMESPACE:
+        return procfs_create_nsfd_for_task(task, CLONE_NEWUSER);
     case PIDFD_GET_INFO: {
         pidfd_info_t info;
         if (copy_from_user(&info, (const void *)arg, sizeof(info)))

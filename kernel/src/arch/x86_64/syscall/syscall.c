@@ -754,11 +754,11 @@ void syscall_handler_init() {
                            (syscall_handle_t)sys_set_robust_list);
     regist_syscall_handler(SYS_GET_ROBUST_LIST,
                            (syscall_handle_t)sys_get_robust_list);
-    // regist_syscall_handler(SYS_SPLICE, (syscall_handle_t)sys_splice);
+    regist_syscall_handler(SYS_SPLICE, (syscall_handle_t)sys_splice);
     // regist_syscall_handler(SYS_TEE, (syscall_handle_t)sys_tee);
     // regist_syscall_handler(SYS_SYNC_FILE_RANGE,
     // (syscall_handle_t)sys_sync_file_range);
-    // regist_syscall_handler(SYS_VMSPLICE, (syscall_handle_t)sys_vmsplice);
+    regist_syscall_handler(SYS_VMSPLICE, (syscall_handle_t)sys_vmsplice);
     // regist_syscall_handler(SYS_MOVE_PAGES,
     // (syscall_handle_t)sys_move_pages);
     regist_syscall_handler(SYS_UTIMENSAT, (syscall_handle_t)sys_utimensat);

@@ -1533,6 +1533,10 @@ void setup_console_symlinks() {
     ttydev_bind_path(kernel_session, "/dev/tty1");
 
     vfs_iput(tty_node);
+
+    vfs_symlinkat("/proc/self/fd/0", AT_FDCWD, "/dev/stdin", true);
+    vfs_symlinkat("/proc/self/fd/1", AT_FDCWD, "/dev/stdout", true);
+    vfs_symlinkat("/proc/self/fd/2", AT_FDCWD, "/dev/stderr", true);
 }
 
 ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,

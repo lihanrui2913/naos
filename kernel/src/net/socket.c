@@ -49,6 +49,7 @@ typedef struct unix_socket_bind_bucket {
 #define SIOCSIFFLAGS 0x8914
 #define SIOCGIFHWADDR 0x8927
 #define SIOCGIFMTU 0x8921
+#define SIOCGSKNS 0x894C
 
 typedef struct naos_sockaddr {
     uint16_t sa_family;
@@ -1542,6 +1543,10 @@ socket_t *unix_socket_alloc() {
 
     // 设置凭据
     unix_socket_fill_cred_from_task(&sock->cred, current_task);
+    sock->net_ns = current_task && current_task->nsproxy
+                       ? current_task->nsproxy->net_ns
+                       : NULL;
+    task_simple_namespace_get(sock->net_ns);
 
     // 加入链表
     spin_lock(&unix_socket_list_lock);
@@ -1578,6 +1583,7 @@ static void unix_socket_destroy(socket_t *sock) {
         free(sock->backlog);
     if (sock->filter)
         free(sock->filter);
+    task_simple_namespace_put(sock->net_ns);
     if (sock->node) {
         vfs_iput(sock->node);
         sock->node = NULL;
@@ -2491,6 +2497,9 @@ int socket_connect(uint64_t fd, const struct sockaddr_un *addr,
     server_sock->domain = listen_sock->domain;
     server_sock->type = listen_sock->type;
     server_sock->protocol = listen_sock->protocol;
+    task_simple_namespace_put(server_sock->net_ns);
+    server_sock->net_ns = listen_sock->net_ns;
+    task_simple_namespace_get(server_sock->net_ns);
     server_sock->cred = listen_sock->cred;
     server_sock->passcred = listen_sock->passcred;
     server_sock->timestamp_legacy = listen_sock->timestamp_legacy;
@@ -3189,6 +3198,10 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         }
     case FIONBIO:
         return 0;
+    case SIOCGSKNS:
+        if (!sock->net_ns)
+            return -EINVAL;
+        return procfs_create_nsfd_for_netns(sock->net_ns);
     default:
         printk("Unsupported unix socket ioctl cmd = %#010x\n", cmd);
         return -ENOTTY;
