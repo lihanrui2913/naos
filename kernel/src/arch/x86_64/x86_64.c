@@ -1,5 +1,4 @@
 #include <arch/x86_64/x86_64.h>
-#include <task/watchdog.h>
 
 extern void sse_init();
 
@@ -32,7 +31,6 @@ void arch_early_init() {
 void arch_init() {
     syscall_init();
     syscall_handler_init();
-    sched_watchdog_init_cpu(current_cpu_id);
 }
 
 void arch_init_after_thread() {}

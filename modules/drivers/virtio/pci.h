@@ -1,6 +1,8 @@
 #pragma once
 
 #include <drivers/bus/pci.h>
+#include <drivers/bus/pci_msi.h>
+#include <task/wait.h>
 #include "virtio.h"
 
 typedef struct virtio_cap_info_t {
@@ -39,8 +41,17 @@ typedef struct virtio_pci_device {
     virtio_pci_common_cfg_t *common_cfg_bar;
     uint16_t *notify_regions;
     uint32_t notify_off_multiplier;
+    volatile uint8_t *isr_status;
     virtio_cap_info_t *device_cfg;
     uint64_t config_space_vaddr;
     uint64_t host_visible_shm_paddr;
     uint64_t host_visible_shm_size;
+    struct msi_desc_t msi;
+    wait_queue_head_t irq_wait;
+    spinlock_t irq_lock;
+    uint32_t irq_seq;
+    bool irq_enabled;
+    bool irq_msix;
+    virtio_interrupt_handler_t irq_handler;
+    void *irq_handler_opaque;
 } virtio_pci_device_t;

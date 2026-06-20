@@ -189,6 +189,18 @@ static void virtio_mmio_write_config_space(void *data, uint32_t offset,
     virtio_mmio_write32(dev, VIRTIO_MMIO_CONFIG + offset, value);
 }
 
+static bool virtio_mmio_supports_interrupts(void *data) {
+    (void)data;
+    return false;
+}
+
+static void virtio_mmio_set_interrupt_handler(
+    void *data, virtio_interrupt_handler_t handler, void *opaque) {
+    (void)data;
+    (void)handler;
+    (void)opaque;
+}
+
 virtio_driver_op_t virtio_mmio_ops = {
     .init = virtio_mmio_init,
     .get_device_type = virtio_mmio_get_device_type,
@@ -203,4 +215,6 @@ virtio_driver_op_t virtio_mmio_ops = {
     .requires_legacy_layout = virtio_mmio_requires_legacy_layout,
     .read_config_space = virtio_mmio_read_config_space,
     .write_config_space = virtio_mmio_write_config_space,
+    .supports_interrupts = virtio_mmio_supports_interrupts,
+    .set_interrupt_handler = virtio_mmio_set_interrupt_handler,
 };

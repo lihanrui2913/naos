@@ -8,6 +8,7 @@
 #include "arch/aarch64/drivers/chars/mouse.h"
 #include "arch/aarch64/drivers/chars/serial.h"
 #include "arch/aarch64/drivers/gic.h"
+#include "arch/aarch64/drivers/msi.h"
 #include "arch/aarch64/drivers/timer.h"
 #include "arch/aarch64/drivers/pci/pci-brcmstb.h"
 #include "arch/aarch64/irq/ptrace.h"

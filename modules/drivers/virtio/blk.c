@@ -38,6 +38,18 @@ static void virtio_blk_reap_completed_locked(virtio_blk_device_t *blk_dev) {
     }
 }
 
+static void virtio_blk_irq_handler(void *opaque, uint8_t isr_status) {
+    virtio_blk_device_t *blk_dev = (virtio_blk_device_t *)opaque;
+
+    if (!blk_dev || !(isr_status & 0x1))
+        return;
+
+    spin_lock(&blk_dev->request_lock);
+    virtio_blk_reap_completed_locked(blk_dev);
+    spin_unlock(&blk_dev->request_lock);
+    wait_queue_wake_all(&blk_dev->request_wait, 0, EOK);
+}
+
 static virtio_blk_req_slot_t *
 virtio_blk_alloc_slot_locked(virtio_blk_device_t *blk_dev) {
     for (;;) {
@@ -94,6 +106,30 @@ static int virtio_blk_wait_slot(virtio_blk_device_t *blk_dev,
         spin_unlock(&blk_dev->request_lock);
         if (done) {
             return 0;
+        }
+
+        if (blk_dev->driver->op->supports_interrupts &&
+            blk_dev->driver->op->supports_interrupts(blk_dev->driver->data) &&
+            current_task) {
+            wait_queue_entry_t wait;
+
+            task_prepare_block(current_task);
+            wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+            wait_queue_add(&blk_dev->request_wait, &wait);
+
+            if (__atomic_load_n(&slot->completed, __ATOMIC_ACQUIRE)) {
+                wait_queue_remove(&blk_dev->request_wait, &wait);
+                task_cancel_block_prepare(current_task);
+                return 0;
+            }
+
+            int reason =
+                task_block(current_task, TASK_BLOCKING, -1, "virtio_blk_wait");
+            wait_queue_remove(&blk_dev->request_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            if (reason < 0 && reason != EOK)
+                return reason;
+            continue;
         }
 
         schedule(0);
@@ -304,8 +340,6 @@ int virtio_blk_init(virtio_driver_t *driver) {
         return -1;
     }
 
-    virtio_finish_init(driver);
-
     // Create block device structure
     virtio_blk_device_t *blk_device =
         (virtio_blk_device_t *)malloc(sizeof(virtio_blk_device_t));
@@ -325,6 +359,7 @@ int virtio_blk_init(virtio_driver_t *driver) {
         blk_device->slot_count = 1;
     }
     spin_init(&blk_device->request_lock);
+    wait_queue_init(&blk_device->request_wait);
 
     blk_device->slots =
         calloc(blk_device->slot_count, sizeof(virtio_blk_req_slot_t));
@@ -335,6 +370,13 @@ int virtio_blk_init(virtio_driver_t *driver) {
 
     for (uint16_t i = 0; i < SIZE; i++) {
         blk_device->pending_slot_by_desc[i] = -1;
+    }
+
+    if (driver->op->supports_interrupts &&
+        driver->op->supports_interrupts(driver->data) &&
+        driver->op->set_interrupt_handler) {
+        driver->op->set_interrupt_handler(driver->data, virtio_blk_irq_handler,
+                                          blk_device);
     }
 
     for (uint16_t i = 0; i < blk_device->slot_count; i++) {
@@ -373,6 +415,8 @@ int virtio_blk_init(virtio_driver_t *driver) {
            config.capacity,
            (config.capacity * blk_device->sector_size) / (1024 * 1024),
            blk_device->block_size);
+
+    virtio_finish_init(driver);
 
     // Store device in global array
     if (virtio_blk_idx < MAX_BLKDEV_NUM) {

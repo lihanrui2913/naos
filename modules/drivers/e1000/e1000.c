@@ -388,9 +388,15 @@ e1000_device_t *e1000_get_device(uint32_t index) {
 uint32_t e1000_get_device_count(void) { return e1000_device_count; }
 
 // PCI Driver Interface
+static bool e1000_pci_match(pci_device_t *pci_dev, const pci_driver_t *driver) {
+    (void)driver;
+    return pci_dev && pci_dev->vendor_id == 0x8086 &&
+           (pci_dev->device_id == 0x100e || pci_dev->device_id == 0x100f);
+}
+
 static int e1000_pci_probe(pci_device_t *pci_dev) {
     if (pci_dev->device_id != 0x100e && pci_dev->device_id != 0x100f) {
-        return 0;
+        return -ENODEV;
     }
 
     printk("e1000: Found Intel E1000 network controller\n");
@@ -477,8 +483,8 @@ static void e1000_pci_shutdown(pci_device_t *pci_dev) {
 // PCI Driver Structure
 static pci_driver_t e1000_driver = {
     .name = "e1000",
-    .class_id = 0x00020000, // Network controller class
-    .match = NULL,
+    .class_id = 0,
+    .match = e1000_pci_match,
     .probe = e1000_pci_probe,
     .remove = e1000_pci_remove,
     .shutdown = e1000_pci_shutdown,

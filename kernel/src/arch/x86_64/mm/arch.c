@@ -5,9 +5,24 @@
 #include <task/task.h>
 #include <irq/irq_manager.h>
 
-typedef struct x64_tlb_shootdown_state {
+#define X64_TLB_SHOOTDOWN_QUEUE_SIZE 32
+
+typedef struct x64_tlb_shootdown_req {
     uint64_t seq;
-    uint64_t ack_seq;
+    uint64_t mm_pgdir;
+    uint64_t vaddr;
+    bool all;
+} x64_tlb_shootdown_req_t;
+
+typedef struct x64_tlb_shootdown_state {
+    spinlock_t lock;
+    uint32_t head;
+    uint32_t tail;
+    bool force_all;
+    uint64_t force_seq;
+    uint64_t next_seq;
+    uint64_t completed_seq;
+    x64_tlb_shootdown_req_t queue[X64_TLB_SHOOTDOWN_QUEUE_SIZE];
 } x64_tlb_shootdown_state_t;
 
 static x64_tlb_shootdown_state_t x64_tlb_shootdown[MAX_CPU_NUM];
@@ -103,9 +118,45 @@ void arch_flush_tlb_all() {
     asm volatile("movq %0, %%cr3" ::"r"(cr3) : "memory");
 }
 
+static uint64_t x64_tlb_current_pgdir(void) {
+    uint64_t cr3;
+    asm volatile("movq %%cr3, %0" : "=r"(cr3)::"memory");
+    return ARCH_READ_PTE(cr3);
+}
+
 static bool x64_tlb_shootdown_should_wait(void) {
     task_t *self = current_task;
     return arch_interrupt_enabled() && (!self || self->preempt_count == 0);
+}
+
+static uint64_t x64_tlb_shootdown_enqueue_cpu(uint32_t cpu_id,
+                                              uint64_t mm_pgdir, uint64_t vaddr,
+                                              bool all) {
+    x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu_id];
+
+    spin_lock(&state->lock);
+
+    uint64_t seq = ++state->next_seq;
+    uint32_t next_tail =
+        (uint32_t)((state->tail + 1) % X64_TLB_SHOOTDOWN_QUEUE_SIZE);
+
+    if (next_tail == state->head) {
+        /* Queue overflow falls back to a full local flush on the target CPU. */
+        state->force_all = true;
+        if (seq > state->force_seq)
+            state->force_seq = seq;
+    } else {
+        state->queue[state->tail] = (x64_tlb_shootdown_req_t){
+            .seq = seq,
+            .mm_pgdir = mm_pgdir,
+            .vaddr = vaddr,
+            .all = all,
+        };
+        state->tail = next_tail;
+    }
+
+    spin_unlock(&state->lock);
+    return seq;
 }
 
 static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
@@ -113,13 +164,67 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
         return;
 
     x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu_id];
-    uint64_t seq = __atomic_load_n(&state->seq, __ATOMIC_ACQUIRE);
-    uint64_t ack = __atomic_load_n(&state->ack_seq, __ATOMIC_ACQUIRE);
-    if (ack == seq)
-        return;
+    x64_tlb_shootdown_req_t queue[X64_TLB_SHOOTDOWN_QUEUE_SIZE];
+    size_t count = 0;
+    bool force_all = false;
+    uint64_t complete_seq = 0;
 
-    arch_flush_tlb_all();
-    __atomic_store_n(&state->ack_seq, seq, __ATOMIC_RELEASE);
+    spin_lock(&state->lock);
+
+    while (state->head != state->tail && count < X64_TLB_SHOOTDOWN_QUEUE_SIZE) {
+        queue[count++] = state->queue[state->head];
+        state->head =
+            (uint32_t)((state->head + 1) % X64_TLB_SHOOTDOWN_QUEUE_SIZE);
+    }
+
+    force_all = state->force_all;
+    if (state->force_seq > complete_seq)
+        complete_seq = state->force_seq;
+    state->force_all = false;
+    state->force_seq = 0;
+
+    if (count == 0 && !force_all) {
+        spin_unlock(&state->lock);
+        return;
+    }
+
+    spin_unlock(&state->lock);
+
+    if (force_all) {
+        arch_flush_tlb_all();
+    } else {
+        uint64_t current_pgdir = x64_tlb_current_pgdir();
+        bool flush_all = false;
+
+        for (size_t i = 0; i < count; i++) {
+            if (queue[i].seq > complete_seq)
+                complete_seq = queue[i].seq;
+
+            /*
+             * Requests for a non-current mm are already covered by the CR3
+             * reload that happened when this CPU left that address space.
+             */
+            if (queue[i].mm_pgdir != current_pgdir)
+                continue;
+
+            if (queue[i].all) {
+                flush_all = true;
+                break;
+            }
+        }
+
+        if (flush_all) {
+            arch_flush_tlb_all();
+        } else {
+            for (size_t i = 0; i < count; i++) {
+                if (queue[i].mm_pgdir != current_pgdir)
+                    continue;
+                arch_flush_tlb(queue[i].vaddr);
+            }
+        }
+    }
+
+    __atomic_store_n(&state->completed_seq, complete_seq, __ATOMIC_RELEASE);
 }
 
 void apic_tlb_shootdown_handle(void) {
@@ -128,14 +233,11 @@ void apic_tlb_shootdown_handle(void) {
 
 static bool x64_tlb_shootdown_wait_cpu(uint32_t self_cpu, uint32_t cpu,
                                        uint64_t seq) {
-    uint64_t spins = 1000000;
     x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu];
 
-    while (__atomic_load_n(&state->ack_seq, __ATOMIC_ACQUIRE) != seq) {
+    while (__atomic_load_n(&state->completed_seq, __ATOMIC_ACQUIRE) < seq) {
         x64_tlb_shootdown_process_cpu(self_cpu);
         arch_pause();
-        if (spins-- == 0)
-            return false;
     }
 
     return true;
@@ -154,7 +256,10 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
     bool wait = x64_tlb_shootdown_should_wait();
     bool any_target = false;
     bool targets[MAX_CPU_NUM];
+    uint64_t target_seq[MAX_CPU_NUM];
+    uint64_t mm_pgdir = mm->page_table_addr;
     memset(targets, 0, sizeof(targets));
+    memset(target_seq, 0, sizeof(target_seq));
 
     if (all)
         arch_flush_tlb_all();
@@ -172,8 +277,8 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
             if (cpu >= cpu_count || cpu >= MAX_CPU_NUM || cpu == self_cpu)
                 continue;
 
-            x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu];
-            __atomic_add_fetch(&state->seq, 1, __ATOMIC_RELEASE);
+            target_seq[cpu] =
+                x64_tlb_shootdown_enqueue_cpu(cpu, mm_pgdir, vaddr, all);
             targets[cpu] = true;
             any_target = true;
             irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR);
@@ -191,9 +296,7 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
         if (!targets[cpu])
             continue;
 
-        x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu];
-        uint64_t seq = __atomic_load_n(&state->seq, __ATOMIC_ACQUIRE);
-        if (!x64_tlb_shootdown_wait_cpu(self_cpu, cpu, seq))
+        if (!x64_tlb_shootdown_wait_cpu(self_cpu, cpu, target_seq[cpu]))
             complete = false;
     }
 

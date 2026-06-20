@@ -5,6 +5,7 @@
 
 #include <libs/klibc.h>
 #include <arch/loongarch64/csr.h>
+#include <arch/loongarch64/drivers/msi.h>
 #include <arch/loongarch64/irq/ptrace.h>
 #include <arch/loongarch64/irq/irq.h>
 #include <arch/loongarch64/mm/arch.h>

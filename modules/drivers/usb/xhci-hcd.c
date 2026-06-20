@@ -7,11 +7,7 @@
 #include <drivers/logger.h>
 #include <irq/irq_manager.h>
 #include <task/task.h>
-
-#ifdef __x86_64__
-#include <arch/x86_64/core/normal.h>
-extern uint32_t cpuid_to_lapicid[MAX_CPU_NUM];
-#endif
+#include <task/wait.h>
 
 #define XHCI_RING_ITEMS 128
 #define XHCI_RING_SIZE (XHCI_RING_ITEMS * sizeof(struct xhci_trb))
@@ -240,6 +236,7 @@ struct usb_xhci {
 
     spinlock_t event_lock;
     spinlock_t callback_lock;
+    wait_queue_head_t irq_wait;
     task_t *event_task;
     task_t *callback_task;
     struct xhci_deferred_cb callback_queue[XHCI_CALLBACK_QUEUE_ITEMS];
@@ -247,6 +244,7 @@ struct usb_xhci {
     uint32_t callback_tail;
     uint32_t callback_count;
     uint64_t callback_dropped;
+    volatile uint32_t irq_seq;
     bool running;
 
     bool irq_enabled;
@@ -736,16 +734,52 @@ static uint32_t xhci_process_events(usb_xhci_t *xhci) {
     return processed;
 }
 
+static void xhci_signal_irq(usb_xhci_t *xhci) {
+    if (!xhci)
+        return;
+
+    __atomic_fetch_add(&xhci->irq_seq, 1, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&xhci->irq_wait, 0, EOK);
+}
+
 static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
                            uint32_t timeout_ms) {
     uint64_t timeout = nano_time() + (uint64_t)timeout_ms * 1000000ULL;
 
     while (nano_time() < timeout) {
         xhci_process_events(xhci);
-        if (!xhci_ring_busy(ring)) {
+        if (!xhci_ring_busy(ring))
             return TRB_CC(ring->evt.status);
+
+        if (!xhci->irq_enabled || !current_task) {
+            arch_pause();
+            continue;
         }
-        arch_pause();
+
+        wait_queue_entry_t wait;
+        uint32_t observed_seq =
+            __atomic_load_n(&xhci->irq_seq, __ATOMIC_ACQUIRE);
+        int64_t remain_ns = (int64_t)(timeout - nano_time());
+        if (remain_ns <= 0)
+            break;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&xhci->irq_wait, &wait);
+
+        if (__atomic_load_n(&xhci->irq_seq, __ATOMIC_ACQUIRE) != observed_seq ||
+            !xhci_ring_busy(ring)) {
+            wait_queue_remove(&xhci->irq_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            continue;
+        }
+
+        int reason =
+            task_block(current_task, TASK_BLOCKING, remain_ns, "xhci_event");
+        wait_queue_remove(&xhci->irq_wait, &wait);
+        task_cancel_block_prepare(current_task);
+        if (reason < 0 && reason != EOK && reason != ETIMEDOUT)
+            break;
     }
 
     ring->eidx = ring->nidx;
@@ -1172,13 +1206,16 @@ static void xhci_irq_handler(uint64_t irq_num, void *data,
                              struct pt_regs *regs) {
     xhci_event_ring_t *ring = (xhci_event_ring_t *)data;
     usb_xhci_t *xhci = ring->xhci;
+    uint32_t processed;
 
     writel(&xhci->op->usbsts, XHCI_STS_EINT);
 
     spin_lock(&xhci->event_lock);
-    xhci_process_event_ring(ring);
-    xhci_commit_erdp(xhci, ring);
+    processed = xhci_process_event_ring(ring);
     spin_unlock(&xhci->event_lock);
+
+    if (processed)
+        xhci_signal_irq(xhci);
 }
 
 static int xhci_alloc_runtime_state(usb_xhci_t *xhci) {
@@ -1241,27 +1278,6 @@ static void xhci_program_interrupters(usb_xhci_t *xhci) {
     }
 }
 
-#ifdef __x86_64__
-static bool xhci_pick_msi_target(uint32_t index, uint32_t *cpu_id,
-                                 uint32_t *lapic_id) {
-    if (cpu_count == 0)
-        return false;
-
-    uint32_t usable = 0;
-    for (uint32_t cpu = 0; cpu < cpu_count; cpu++) {
-        uint32_t id = cpuid_to_lapicid[cpu];
-        if (x2apic_mode || id <= 0xff) {
-            if (usable++ != index)
-                continue;
-            *cpu_id = cpu;
-            *lapic_id = id;
-            return true;
-        }
-    }
-
-    return false;
-}
-
 static int xhci_setup_msi_interrupts(usb_xhci_t *xhci) {
     bool use_msix = pci_enumerate_capability_list(xhci->pci_dev, 0x11) != 0;
     uint32_t intr_count =
@@ -1278,42 +1294,17 @@ static int xhci_setup_msi_interrupts(usb_xhci_t *xhci) {
     for (uint32_t i = 0; i < intr_count; i++) {
         struct xhci_event_ring *evt = &xhci->evt[i];
         struct msi_desc_t *desc = &evt->msi;
-        uint32_t cpu_id;
-        uint32_t lapic_id;
 
-        if (!xhci_pick_msi_target(i, &cpu_id, &lapic_id)) {
-            if (i == 0)
-                return -ENOSYS;
-            break;
-        }
-
-        int irq_num = irq_allocate_irqnum();
-        if (irq_num < 0 || irq_num >= ARCH_MAX_IRQ_NUM)
-            return -ENOSPC;
-
-        memset(desc, 0, sizeof(*desc));
-        desc->irq_num = (uint16_t)irq_num;
-        desc->processor = lapic_id;
-        desc->pci_dev = xhci->pci_dev;
-        desc->assert = false;
-        desc->edge_trigger = true;
-        desc->msi_index = i;
-        desc->pci.msi_attribute.can_mask = false;
-        desc->pci.msi_attribute.is_64 = true;
-        desc->pci.msi_attribute.is_msix = use_msix;
-
-        int ret = msi_enable(desc);
+        int ret = msi_setup_irq(desc, xhci->pci_dev, i, use_msix,
+                                xhci_irq_handler, evt, "xhci_irq_handler");
         if (ret != 0) {
-            irq_deallocate_irqnum(desc->irq_num);
             if (i == 0)
                 return ret;
             break;
         }
 
-        irq_regist_irq(desc->irq_num, xhci_irq_handler, 0, evt,
-                       &apic_controller, "xhci_irq_handler", IRQ_FLAGS_MSIX);
-
-        xhci->cpu_intr_map[cpu_id] = i;
+        if (desc->target_cpu < MAX_CPU_NUM)
+            xhci->cpu_intr_map[desc->target_cpu] = i;
         xhci->enabled_intrs++;
 
         if (!desc->pci.msi_attribute.is_msix)
@@ -1330,7 +1321,6 @@ static int xhci_setup_msi_interrupts(usb_xhci_t *xhci) {
            xhci->enabled_intrs);
     return 0;
 }
-#endif
 
 static int xhci_setup_scratchpad(usb_xhci_t *xhci) {
     uint32_t spb = xhci_max_scratchpad(readl(&xhci->caps->hcsparams2));
@@ -1390,12 +1380,10 @@ static int xhci_start_controller(usb_xhci_t *xhci) {
     if (!xhci->callback_task)
         return -ENOMEM;
 
-#ifdef __x86_64__
     if (xhci_setup_msi_interrupts(xhci) != 0) {
         printk("xhci: MSI/MSI-X unavailable\n");
         return -ENOTSUP;
     }
-#endif
     xhci_program_interrupters(xhci);
 
     if (xhci_setup_scratchpad(xhci) != 0)
@@ -1474,6 +1462,7 @@ static usb_xhci_t *xhci_controller_setup(void *baseaddr) {
     xhci->usb.flags = 0;
     spin_init(&xhci->event_lock);
     spin_init(&xhci->callback_lock);
+    wait_queue_init(&xhci->irq_wait);
 
     xhci->mmio = baseaddr;
     xhci->caps = xhci->mmio;

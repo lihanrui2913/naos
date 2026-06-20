@@ -84,6 +84,7 @@ extern gic_version_t gic_version;
 #define GIC_RESCHED_SGI 1
 
 struct irq_controller;
+struct msi_msg_t;
 extern struct irq_controller gic_controller;
 
 /* 公共API */
@@ -93,8 +94,13 @@ void gic_init_percpu(void);
 void gic_enable_irq(uint32_t irq);
 void gic_disable_irq(uint32_t irq);
 void gic_configure_irq(uint32_t irq, uint32_t flags);
+void gic_route_irq(uint32_t irq, uint32_t cpu_id);
 void gic_send_eoi(uint32_t irq);
 uint64_t gic_get_current_irq(void);
+bool gic_msi_supported(void);
+int gic_msi_alloc_irq(uint32_t cpu_id, uint16_t *irq_num,
+                      struct msi_msg_t *msg);
+void gic_msi_free_irq(uint16_t irq_num);
 
 /* 版本检测 */
 gic_version_t gic_detect_version(void);

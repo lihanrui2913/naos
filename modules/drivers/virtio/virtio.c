@@ -48,30 +48,46 @@ static bool virtio_match(pci_device_t *dev, const pci_driver_t *driver) {
 }
 
 int virtio_probe(pci_device_t *dev) {
+    int ret = -ENODEV;
     virtio_driver_t *driver = virtio_pci_driver_op.init(dev);
-    if (driver) {
-        printk("Found virtio pci device. type = %d\n",
-               ((virtio_pci_device_t *)driver->data)->device_type);
-        switch (((virtio_pci_device_t *)driver->data)->device_type) {
-        case VIRTIO_DEVICE_TYPE_NETWORK:
-            virtio_net_init(driver);
-            break;
-        case VIRTIO_DEVICE_TYPE_BLOCK:
-            virtio_blk_init(driver);
-            break;
-        case VIRTIO_DEVICE_TYPE_SOUND:
-            virtio_sound_init(driver);
-            break;
-        case VIRTIO_DEVICE_TYPE_GPU:
-            virtio_gpu_init(driver);
-            break;
-
-        default:
-            break;
-        }
-        dev->desc = driver;
+    if (!driver) {
+        printk("virtio: probe init failed for %04x:%02x:%02x.%u\n",
+               dev->segment, dev->bus, dev->slot, dev->func);
+        return -ENODEV;
     }
 
+    printk("Found virtio pci device. type = %d\n",
+           ((virtio_pci_device_t *)driver->data)->device_type);
+    switch (((virtio_pci_device_t *)driver->data)->device_type) {
+    case VIRTIO_DEVICE_TYPE_NETWORK:
+        ret = virtio_net_init(driver);
+        break;
+    case VIRTIO_DEVICE_TYPE_BLOCK:
+        ret = virtio_blk_init(driver);
+        break;
+    case VIRTIO_DEVICE_TYPE_SOUND:
+        ret = virtio_sound_init(driver);
+        break;
+    case VIRTIO_DEVICE_TYPE_GPU:
+        ret = virtio_gpu_init(driver);
+        break;
+    default:
+        printk("virtio: unsupported device type %u at %04x:%02x:%02x.%u\n",
+               ((virtio_pci_device_t *)driver->data)->device_type, dev->segment,
+               dev->bus, dev->slot, dev->func);
+        ret = -ENODEV;
+        break;
+    }
+
+    if (ret < 0) {
+        if (driver->op && driver->op->get_status && driver->op->set_status) {
+            uint32_t status = driver->op->get_status(driver->data);
+            driver->op->set_status(driver->data, status | VIRTIO_STATUS_FAILED);
+        }
+        return ret;
+    }
+
+    dev->desc = driver;
     return 0;
 }
 
@@ -93,6 +109,7 @@ pci_driver_t virtio_pci_driver = {
 #if !defined(__x86_64__)
 static int virtio_mmio_fdt_probe(fdt_device_t *fdt_dev,
                                  const char *compatible) {
+    int ret = -ENODEV;
     int len;
     const uint32_t *reg_prop;
     const uint32_t *irq_prop;
@@ -135,9 +152,6 @@ static int virtio_mmio_fdt_probe(fdt_device_t *fdt_dev,
     mmio_dev->base = virt; // 或者通过 ioremap 映射
     mmio_dev->irq = irq;
 
-    /* 保存到 FDT 设备的私有数据 */
-    fdt_dev->driver_data = mmio_dev;
-
     /* 初始化 VirtIO 驱动 */
     virtio_driver_t *drv = virtio_mmio_ops.init(mmio_dev);
     if (!drv) {
@@ -147,20 +161,30 @@ static int virtio_mmio_fdt_probe(fdt_device_t *fdt_dev,
 
     switch (((virtio_mmio_device_t *)drv->data)->device_id) {
     case VIRTIO_DEVICE_TYPE_NETWORK:
-        virtio_net_init(drv);
+        ret = virtio_net_init(drv);
         break;
     case VIRTIO_DEVICE_TYPE_BLOCK:
-        virtio_blk_init(drv);
+        ret = virtio_blk_init(drv);
         break;
     case VIRTIO_DEVICE_TYPE_SOUND:
-        virtio_sound_init(drv);
+        ret = virtio_sound_init(drv);
         break;
     case VIRTIO_DEVICE_TYPE_GPU:
-        virtio_gpu_init(drv);
+        ret = virtio_gpu_init(drv);
         break;
     default:
+        ret = -ENODEV;
         break;
     }
+
+    if (ret < 0) {
+        drv->op->set_status(drv->data, VIRTIO_STATUS_FAILED);
+        free(mmio_dev);
+        return ret;
+    }
+
+    /* 保存到 FDT 设备的私有数据 */
+    fdt_dev->driver_data = mmio_dev;
 
     return 0;
 }

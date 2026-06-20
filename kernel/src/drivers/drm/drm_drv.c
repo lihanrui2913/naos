@@ -108,12 +108,16 @@ static vfs_node_t *drm_event_node_get(drm_device_t *dev) {
     return node;
 }
 
-static void drm_notify_event_node(drm_device_t *dev) {
+static void drm_notify_event_node_flags(drm_device_t *dev, uint32_t events) {
     vfs_node_t *event_node = drm_event_node_get(dev);
     if (event_node) {
-        vfs_poll_notify_inode(event_node, EPOLLIN | EPOLLRDNORM);
+        vfs_poll_notify_inode(event_node, events);
         vfs_iput(event_node);
     }
+}
+
+static void drm_notify_event_node(drm_device_t *dev) {
+    drm_notify_event_node_flags(dev, EPOLLIN | EPOLLRDNORM);
 }
 
 static vfs_node_t *drm_lookup_inode(const char *path) {
@@ -314,14 +318,30 @@ ssize_t drm_poll(void *data, size_t event) {
     }
 
     ssize_t revent = 0;
+    bool has_event = false;
+    bool has_hotplug = false;
 
+    if (!(event & (EPOLLIN | EPOLLPRI))) {
+        return 0;
+    }
+
+    spin_lock(&dev->event_lock);
     if (event & EPOLLIN) {
-        spin_lock(&dev->event_lock);
-        bool has_event = (dev->drm_event_count != 0);
-        spin_unlock(&dev->event_lock);
-        if (has_event) {
-            revent |= EPOLLIN;
+        has_event = (dev->drm_event_count != 0);
+    }
+    if (event & EPOLLPRI) {
+        has_hotplug = dev->hotplug_pending;
+        if (has_hotplug) {
+            dev->hotplug_pending = false;
         }
+    }
+    spin_unlock(&dev->event_lock);
+
+    if (has_event) {
+        revent |= EPOLLIN;
+    }
+    if (has_hotplug) {
+        revent |= EPOLLPRI;
     }
 
     return revent;
@@ -1016,6 +1036,19 @@ int drm_defer_event(drm_device_t *dev, uint32_t type, uint64_t user_data) {
 
     spin_unlock(&dev->event_lock);
 
+    return 0;
+}
+
+int drm_notify_hotplug(drm_device_t *dev) {
+    if (!dev) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->event_lock);
+    dev->hotplug_pending = true;
+    spin_unlock(&dev->event_lock);
+
+    drm_notify_event_node_flags(dev, EPOLLPRI);
     return 0;
 }
 

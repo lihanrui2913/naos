@@ -15,7 +15,7 @@
 #include "arch/x86_64/drivers/apic_timer.h"
 #include "arch/x86_64/drivers/rtc_cmos.h"
 #include "arch/x86_64/drivers/chars/ps2.h"
-#include "arch/x86_64/drivers/msi_arch.h"
+#include "arch/x86_64/drivers/msi.h"
 #include "arch/x86_64/task/arch_context.h"
 #include "arch/x86_64/task/fsgsbase.h"
 #include "arch/x86_64/syscall/nr.h"

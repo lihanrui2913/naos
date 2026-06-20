@@ -939,8 +939,9 @@ void pci_scan_bus(pci_device_op_t *op, uint16_t segment_group, uint8_t bus) {
     }
 }
 
-void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group) {
-    pci_scan_bus(op, segment_group, 0);
+void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group,
+                      uint8_t start_bus) {
+    pci_scan_bus(op, segment_group, start_bus);
 }
 
 extern pci_driver_t *pci_drivers[MAX_PCI_DRIVERS];
@@ -967,7 +968,8 @@ void pci_controller_init() {
                            PT_FLAG_R | PT_FLAG_W | PT_FLAG_UNCACHEABLE);
 
             uint16_t segment_group = mcfg_entries[i]->segment;
-            pci_scan_segment(&pcie_device_op, segment_group);
+            pci_scan_segment(&pcie_device_op, segment_group,
+                             mcfg_entries[i]->start_bus);
         }
     }
 
@@ -1003,8 +1005,10 @@ void pci_init() {
                 int ret = pci_drivers[d]->probe(device);
                 pci_current_probe_driver = NULL;
                 if (ret < 0) {
-                    printk("PCI driver %s probe failed!!!\n",
-                           pci_drivers[d]->name);
+                    printk("PCI driver %s probe failed for %04x:%02x:%02x.%u "
+                           "(ret=%d)\n",
+                           pci_drivers[d]->name, device->segment, device->bus,
+                           device->slot, device->func, ret);
                     continue;
                 }
 

@@ -1,7 +1,6 @@
 #include <arch/arch.h>
 #include <drivers/logger.h>
 #include <task/task.h>
-#include <task/watchdog.h>
 #include <boot/boot.h>
 
 uint64_t cpu_count = 0;
@@ -69,8 +68,6 @@ void ap_kmain(struct limine_mp_info *cpu) {
 
     arch_set_current(idle_tasks[current_cpu_id]);
     task_mark_on_cpu(idle_tasks[current_cpu_id], true);
-    sched_watchdog_note_current(current_cpu_id, idle_tasks[current_cpu_id],
-                                nano_time());
 
     gic_init_percpu();
 

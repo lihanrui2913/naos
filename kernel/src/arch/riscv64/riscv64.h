@@ -4,6 +4,7 @@
 #define SCHED_HZ 250
 
 #include "arch/riscv64/cpu_local.h"
+#include "arch/riscv64/drivers/msi.h"
 #include "arch/riscv64/drivers/rtc-goldfish.h"
 #include "arch/riscv64/drivers/serial.h"
 #include "arch/riscv64/irq/ptrace.h"

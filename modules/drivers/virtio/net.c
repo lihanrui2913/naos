@@ -24,6 +24,15 @@ static void virtio_net_reap_tx(virtio_net_device_t *net_dev) {
     }
 }
 
+static void virtio_net_irq_handler(void *opaque, uint8_t isr_status) {
+    virtio_net_device_t *net_dev = (virtio_net_device_t *)opaque;
+
+    if (!net_dev || !(isr_status & 0x1))
+        return;
+    if (net_dev->netdev && virtio_net_has_packets(net_dev))
+        netdev_notify_rx(net_dev->netdev);
+}
+
 int virtio_net_init(virtio_driver_t *driver) {
     uint64_t features = virtio_begin_init(
         driver, VIRTIO_NET_F_MTU | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF |
@@ -66,8 +75,6 @@ int virtio_net_init(virtio_driver_t *driver) {
         virt_queue_new(driver, 1, !!(features & VIRTIO_F_RING_INDIRECT_DESC),
                        !!(features & VIRTIO_F_RING_EVENT_IDX));
 
-    virtio_finish_init(driver);
-
     virtio_net_device_t *net_device =
         (virtio_net_device_t *)malloc(sizeof(virtio_net_device_t));
     memset(net_device, 0, sizeof(virtio_net_device_t));
@@ -83,6 +90,13 @@ int virtio_net_init(virtio_driver_t *driver) {
             : sizeof(virtio_net_hdr_t);
     net_device->send_queue = send_queue;
     net_device->recv_queue = recv_queue;
+
+    if (driver->op->supports_interrupts &&
+        driver->op->supports_interrupts(driver->data) &&
+        driver->op->set_interrupt_handler) {
+        driver->op->set_interrupt_handler(driver->data, virtio_net_irq_handler,
+                                          net_device);
+    }
 
     // Pre-allocate and populate receive buffers for polling mode
     for (int i = 0; i < RX_BUFFER_COUNT; i++) {
@@ -107,6 +121,8 @@ int virtio_net_init(virtio_driver_t *driver) {
 
     // Notify device about the receive buffers
     virt_queue_notify(driver, recv_queue);
+
+    virtio_finish_init(driver);
 
     net_device->netdev = netdev_register_full(
         NULL, NETDEV_TYPE_ETHERNET, net_device, net_device->mac,

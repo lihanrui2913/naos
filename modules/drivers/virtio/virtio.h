@@ -32,6 +32,7 @@ struct virtio_driver;
 typedef struct virtio_driver virtio_driver_t;
 struct netdev;
 typedef struct netdev netdev_t;
+typedef void (*virtio_interrupt_handler_t)(void *opaque, uint8_t isr_status);
 
 typedef struct virtio_driver_op {
     virtio_driver_t *(*init)(
@@ -50,6 +51,10 @@ typedef struct virtio_driver_op {
     bool (*requires_legacy_layout)(void *data);
     uint32_t (*read_config_space)(void *data, uint32_t offset);
     void (*write_config_space)(void *data, uint32_t offset, uint32_t value);
+    bool (*supports_interrupts)(void *data);
+    void (*set_interrupt_handler)(void *data,
+                                  virtio_interrupt_handler_t handler,
+                                  void *opaque);
 } virtio_driver_op_t;
 
 struct virtio_driver {

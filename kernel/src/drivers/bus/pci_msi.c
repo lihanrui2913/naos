@@ -2,20 +2,7 @@
 #include <mm/mm.h>
 #include <arch/arch.h>
 #include <drivers/logger.h>
-
-struct msi_msg_t *msi_arch_get_msg(struct msi_desc_t *msi_desc) {
-#if defined(__x86_64__)
-    msi_desc->msg.address_hi =
-        x2apic_mode ? (msi_desc->processor & 0xffffff00) : 0;
-    msi_desc->msg.address_lo =
-        ia64_pci_get_arch_msi_message_address(msi_desc->processor);
-    msi_desc->msg.data = ia64_pci_get_arch_msi_message_data(
-        msi_desc->irq_num, msi_desc->processor, msi_desc->edge_trigger,
-        msi_desc->assert);
-    msi_desc->msg.vector_control = 0;
-#endif
-    return &(msi_desc->msg);
-}
+#include <irq/irq_manager.h>
 
 static inline struct pci_msi_cap_t
 __msi_read_cap_list(struct msi_desc_t *msi_desc, uint32_t cap_off) {
@@ -126,6 +113,56 @@ static inline void __msix_clear_entry(pci_device_t *pci_dev,
     entry_ptr[1] = 0;
 }
 
+int msi_prepare_desc(struct msi_desc_t *msi_desc, pci_device_t *pci_dev,
+                     uint16_t msi_index, bool prefer_msix) {
+    if (!msi_desc || !pci_dev)
+        return -EINVAL;
+
+    memset(msi_desc, 0, sizeof(*msi_desc));
+    msi_desc->pci_dev = pci_dev;
+    msi_desc->msi_index = msi_index;
+    msi_desc->edge_trigger = true;
+    msi_desc->assert = false;
+    msi_desc->pci.msi_attribute.is_msix = prefer_msix;
+
+    return arch_pci_msi_prepare(msi_desc, msi_index);
+}
+
+void msi_release_desc(struct msi_desc_t *msi_desc) {
+    if (!msi_desc)
+        return;
+
+    if (msi_desc->pci_dev && msi_desc->pci.msi_attribute.is_msix &&
+        msi_desc->pci_dev->msix_mmio_vaddr &&
+        msi_desc->msi_index < msi_desc->pci_dev->msix_table_size) {
+        __msix_clear_entry(msi_desc->pci_dev, msi_desc->msi_index);
+    }
+
+    arch_pci_msi_free(msi_desc);
+    memset(msi_desc, 0, sizeof(*msi_desc));
+}
+
+int msi_setup_irq(struct msi_desc_t *msi_desc, pci_device_t *pci_dev,
+                  uint16_t msi_index, bool prefer_msix,
+                  void (*handler)(uint64_t irq_num, void *data,
+                                  struct pt_regs *regs),
+                  void *handler_data, char *name) {
+    int ret = msi_prepare_desc(msi_desc, pci_dev, msi_index, prefer_msix);
+    if (ret < 0)
+        return ret;
+
+    ret = msi_enable(msi_desc);
+    if (ret < 0) {
+        msi_release_desc(msi_desc);
+        return ret;
+    }
+
+    irq_regist_irq(msi_desc->irq_num, handler, 0, handler_data,
+                   arch_pci_msi_controller(), name,
+                   IRQ_FLAGS_MSIX | IRQ_FLAGS_EDGE);
+    return 0;
+}
+
 int msi_enable(struct msi_desc_t *msi_desc) {
     pci_device_t *ptr;
     uint32_t cap_ptr;
@@ -152,7 +189,7 @@ int msi_enable(struct msi_desc_t *msi_desc) {
         msi_desc->pci.msi_attribute.is_msix = 0;
     }
 
-    msi_arch_get_msg(msi_desc);
+    arch_pci_msi_compose_msg(msi_desc);
 
     command = ptr->op->read16(ptr->bus, ptr->slot, ptr->func, ptr->segment,
                               PCI_CONF_COMMAND);

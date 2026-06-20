@@ -23,6 +23,7 @@ typedef struct irq_action {
 typedef void (*irq_ipi_send_fn_t)(uint32_t cpu_id, uint64_t irq_num);
 
 #define IRQ_FLAGS_MSIX (1UL << 0)
+#define IRQ_FLAGS_EDGE (1UL << 1)
 #if defined(__x86_64__)
 #define IRQ_FLAGS_LAPIC IRQ_FLAGS_MSIX
 #endif

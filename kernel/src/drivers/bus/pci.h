@@ -145,7 +145,8 @@ pci_device_t *pci_find_bdfs(uint8_t bus, uint8_t slot, uint8_t func,
  * should run before driver probing for that segment, otherwise probe code ends
  * up depending on partially populated global state.
  */
-void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group);
+void pci_scan_segment(pci_device_op_t *op, uint16_t segment_group,
+                      uint8_t start_bus);
 /**
  * Enumerate one PCI bus and the functions reachable beneath it.
  * Notes: bridge recursion lives under this path. Bus scanning is not just a
@@ -197,7 +198,7 @@ typedef struct pci_driver {
     void *private_data;
 } pci_driver_t;
 
-#define MAX_PCI_DRIVERS 256
+#define MAX_PCI_DRIVERS 64
 
 /**
  * Register a PCI driver with the PCI core.

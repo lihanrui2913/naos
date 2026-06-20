@@ -7,7 +7,6 @@
 #include <irq/softirq.h>
 #include <init/callbacks.h>
 #include <drivers/deadline.h>
-#include <task/watchdog.h>
 
 irq_action_t actions[ARCH_MAX_IRQ_NUM] = {0};
 irq_ipi_send_fn_t ipi_send_fns[ARCH_MAX_IRQ_NUM] = {0};

@@ -2,6 +2,8 @@
 
 #include <drivers/bus/pci.h>
 
+struct pt_regs;
+
 /**
  * @brief msi消息内容结构体
  *
@@ -72,6 +74,7 @@ struct pci_msix_cap_t {
  */
 struct msi_desc_t {
     uint16_t irq_num;          // 中断向量号
+    uint32_t target_cpu;       // 逻辑目标CPU
     uint32_t processor;        // 定向投递的处理器
     uint16_t edge_trigger;     // 是否边缘触发
     uint16_t assert;           // 是否高电平触发
@@ -93,3 +96,11 @@ struct msi_desc_t {
  * @return 返回码
  */
 int msi_enable(struct msi_desc_t *msi_desc);
+int msi_prepare_desc(struct msi_desc_t *msi_desc, pci_device_t *pci_dev,
+                     uint16_t msi_index, bool prefer_msix);
+int msi_setup_irq(struct msi_desc_t *msi_desc, pci_device_t *pci_dev,
+                  uint16_t msi_index, bool prefer_msix,
+                  void (*handler)(uint64_t irq_num, void *data,
+                                  struct pt_regs *regs),
+                  void *handler_data, char *name);
+void msi_release_desc(struct msi_desc_t *msi_desc);

@@ -12,6 +12,7 @@
 
 #define VIRTIO_GPU_DEFAULT_WIDTH 1024
 #define VIRTIO_GPU_DEFAULT_HEIGHT 768
+#define VIRTIO_GPU_DISPLAY_POLL_NS 100000000LL
 #define VIRTIO_GPU_SUPPORTED_FEATURES                                          \
     (VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_CONTEXT_INIT |      \
      VIRTIO_GPU_F_SUPPORTED_CAPSET_IDS | VIRTIO_F_RING_INDIRECT_DESC |         \
@@ -170,9 +171,93 @@ static int virtio_gpu_simple_cmd(virtio_gpu_device_t *gpu, const void *req,
     return virtio_gpu_resp_type(&resp) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -EIO;
 }
 
-static int virtio_gpu_get_display_info(virtio_gpu_device_t *gpu) {
+static void virtio_gpu_build_mode(const virtio_gpu_device_t *gpu,
+                                  struct drm_mode_modeinfo *mode) {
+    if (!gpu || !mode) {
+        return;
+    }
+
+    memset(mode, 0, sizeof(*mode));
+    mode->clock = gpu->width * HZ;
+    mode->hdisplay = gpu->width;
+    mode->hsync_start = gpu->width + 16;
+    mode->hsync_end = gpu->width + 16 + 96;
+    mode->htotal = gpu->width + 16 + 96 + 48;
+    mode->vdisplay = gpu->height;
+    mode->vsync_start = gpu->height + 10;
+    mode->vsync_end = gpu->height + 10 + 2;
+    mode->vtotal = gpu->height + 10 + 2 + 33;
+    mode->vrefresh = HZ;
+    mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+    snprintf(mode->name, sizeof(mode->name), "%dx%d", gpu->width, gpu->height);
+}
+
+static void virtio_gpu_update_modeset(virtio_gpu_device_t *gpu) {
+    if (!gpu) {
+        return;
+    }
+
+    spin_lock(&gpu->resource_mgr.lock);
+
+    drm_connector_t *connector = gpu->connectors[0];
+    drm_crtc_t *crtc = gpu->crtcs[0];
+    drm_encoder_t *encoder = gpu->encoders[0];
+
+    if (connector) {
+        connector->connection =
+            gpu->display_valid ? DRM_MODE_CONNECTED : DRM_MODE_DISCONNECTED;
+        connector->mm_width = (gpu->width * 264UL) / 1000UL;
+        connector->mm_height = (gpu->height * 264UL) / 1000UL;
+        if (connector->mm_width == 0) {
+            connector->mm_width = 1;
+        }
+        if (connector->mm_height == 0) {
+            connector->mm_height = 1;
+        }
+
+        if (!connector->modes) {
+            connector->modes = malloc(sizeof(*connector->modes));
+        }
+        if (gpu->display_valid && connector->modes) {
+            virtio_gpu_build_mode(gpu, &connector->modes[0]);
+            connector->count_modes = 1;
+        } else if (!gpu->display_valid) {
+            connector->count_modes = 0;
+        }
+    }
+
+    if (crtc) {
+        crtc->x = 0;
+        crtc->y = 0;
+        crtc->w = gpu->width;
+        crtc->h = gpu->height;
+        if (gpu->display_valid) {
+            virtio_gpu_build_mode(gpu, &crtc->mode);
+            crtc->mode_valid = 1;
+        } else {
+            crtc->mode_valid = 0;
+        }
+    }
+
+    if (encoder) {
+        encoder->crtc_id = crtc ? crtc->id : 0;
+    }
+    if (connector) {
+        connector->encoder_id = encoder ? encoder->id : 0;
+        connector->crtc_id = crtc ? crtc->id : 0;
+    }
+
+    spin_unlock(&gpu->resource_mgr.lock);
+}
+
+static int virtio_gpu_refresh_display_info(virtio_gpu_device_t *gpu,
+                                           bool *changed) {
     virtio_gpu_ctrl_hdr_t req;
     virtio_gpu_resp_display_info_t resp;
+    uint32_t scanout_id = 0;
+    uint32_t width = VIRTIO_GPU_DEFAULT_WIDTH;
+    uint32_t height = VIRTIO_GPU_DEFAULT_HEIGHT;
+    bool display_valid = false;
 
     virtio_gpu_hdr_init(&req, VIRTIO_GPU_CMD_GET_DISPLAY_INFO);
     memset(&resp, 0, sizeof(resp));
@@ -186,29 +271,33 @@ static int virtio_gpu_get_display_info(virtio_gpu_device_t *gpu) {
         return -EIO;
     }
 
-    gpu->display_valid = false;
     for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
         uint32_t enabled = le32toh(resp.pmodes[i].enabled);
-        uint32_t width = le32toh(resp.pmodes[i].rect.width);
-        uint32_t height = le32toh(resp.pmodes[i].rect.height);
-        if (!enabled || width == 0 || height == 0) {
+        uint32_t scanout_width = le32toh(resp.pmodes[i].rect.width);
+        uint32_t scanout_height = le32toh(resp.pmodes[i].rect.height);
+        if (!enabled || scanout_width == 0 || scanout_height == 0) {
             continue;
         }
 
-        gpu->scanout_id = i;
-        gpu->width = width;
-        gpu->height = height;
-        gpu->display_valid = true;
+        scanout_id = i;
+        width = scanout_width;
+        height = scanout_height;
+        display_valid = true;
         break;
     }
 
-    if (!gpu->display_valid) {
-        gpu->scanout_id = 0;
-        gpu->width = VIRTIO_GPU_DEFAULT_WIDTH;
-        gpu->height = VIRTIO_GPU_DEFAULT_HEIGHT;
+    if (changed) {
+        *changed = gpu->display_valid != display_valid ||
+                   gpu->scanout_id != scanout_id || gpu->width != width ||
+                   gpu->height != height || gpu->bpp != 32;
     }
 
+    gpu->display_valid = display_valid;
+    gpu->scanout_id = scanout_id;
+    gpu->width = width;
+    gpu->height = height;
     gpu->bpp = 32;
+    virtio_gpu_update_modeset(gpu);
     return 0;
 }
 
@@ -421,6 +510,7 @@ static int virtio_gpu_present(virtio_gpu_device_t *gpu, virtio_gpu_buffer_t *bo,
         gpu->width = bo->width;
         gpu->height = bo->height;
         gpu->display_valid = true;
+        virtio_gpu_update_modeset(gpu);
     }
 
     if (bo->kind == VIRTIO_GPU_OBJECT_DUMB_2D) {
@@ -866,10 +956,27 @@ static int virtio_gpu_drm_get_display_info(drm_device_t *drm_dev,
         return -ENODEV;
     }
 
+    (void)virtio_gpu_refresh_display_info(gpu, NULL);
     *width = gpu->width;
     *height = gpu->height;
     *bpp = gpu->bpp;
     return 0;
+}
+
+static void virtio_gpu_display_worker(uint64_t arg) {
+    virtio_gpu_device_t *gpu = (virtio_gpu_device_t *)arg;
+
+    while (true) {
+        bool changed = false;
+
+        if (virtio_gpu_refresh_display_info(gpu, &changed) == 0 && changed &&
+            gpu->drm_dev) {
+            drm_notify_hotplug(gpu->drm_dev);
+        }
+
+        task_block(current_task, TASK_BLOCKING, VIRTIO_GPU_DISPLAY_POLL_NS,
+                   "virtio_gpu_display");
+    }
 }
 
 static int virtio_gpu_drm_open(drm_device_t *drm_dev, drm_file_t *file) {
@@ -2011,8 +2118,6 @@ static drm_device_op_t virtio_gpu_drm_device_op = {
 };
 
 static int virtio_gpu_setup_modeset(virtio_gpu_device_t *gpu) {
-    drm_resource_manager_init(&gpu->resource_mgr);
-
     gpu->connectors[0] = drm_connector_alloc(&gpu->resource_mgr,
                                              DRM_MODE_CONNECTOR_VIRTUAL, gpu);
     if (!gpu->connectors[0]) {
@@ -2034,20 +2139,8 @@ static int virtio_gpu_setup_modeset(virtio_gpu_device_t *gpu) {
         return -ENOMEM;
     }
 
-    struct drm_mode_modeinfo mode = {
-        .clock = gpu->width * HZ,
-        .hdisplay = gpu->width,
-        .hsync_start = gpu->width + 16,
-        .hsync_end = gpu->width + 16 + 96,
-        .htotal = gpu->width + 16 + 96 + 48,
-        .vdisplay = gpu->height,
-        .vsync_start = gpu->height + 10,
-        .vsync_end = gpu->height + 10 + 2,
-        .vtotal = gpu->height + 10 + 2 + 33,
-        .vrefresh = HZ,
-        .type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
-    };
-    sprintf(mode.name, "%dx%d", gpu->width, gpu->height);
+    struct drm_mode_modeinfo mode;
+    virtio_gpu_build_mode(gpu, &mode);
     memcpy(gpu->connectors[0]->modes, &mode, sizeof(mode));
     gpu->connectors[0]->count_modes = 1;
 
@@ -2096,6 +2189,7 @@ int virtio_gpu_init(virtio_driver_t *driver) {
     gpu->next_resource_id = 1;
     gpu->next_context_id = 1;
     spin_init(&gpu->control_lock);
+    drm_resource_manager_init(&gpu->resource_mgr);
     if ((features & VIRTIO_GPU_F_VIRGL) == 0) {
         printk("virtio_gpu: host did not offer virgl; Mesa will use software "
                "rendering\n");
@@ -2123,7 +2217,7 @@ int virtio_gpu_init(virtio_driver_t *driver) {
             "virtio_gpu: host offered virgl but no virgl capset was found\n");
     }
 
-    int ret = virtio_gpu_get_display_info(gpu);
+    int ret = virtio_gpu_refresh_display_info(gpu, NULL);
     if (ret != 0) {
         printk("virtio_gpu: failed to get display info: %d\n", ret);
         free(gpu);
@@ -2152,5 +2246,7 @@ int virtio_gpu_init(virtio_driver_t *driver) {
 
     printk("virtio_gpu: initialized %ux%u scanout %u\n", gpu->width,
            gpu->height, gpu->scanout_id);
+    task_create("virtio_gpu", virtio_gpu_display_worker, (uint64_t)gpu,
+                KTHREAD_PRIORITY);
     return 0;
 }

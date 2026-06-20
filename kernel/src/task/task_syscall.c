@@ -1899,6 +1899,7 @@ static void task_execve_switch_mm(task_t *task, task_mm_info_t *from,
     spin_unlock(&task_queue_lock);
     task_mm_mark_cpu_active(to, task->cpu_id);
     set_current_page_dir(true, to->page_table_addr);
+    apic_tlb_shootdown_handle();
     task_mm_mark_cpu_inactive(from, task->cpu_id);
 
     if (irq_state)

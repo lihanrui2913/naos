@@ -1488,6 +1488,7 @@ struct drm_device {
     uint64_t vblank_counter;
     uint64_t vblank_period_ns;
     uint64_t next_vblank_ns;
+    bool hotplug_pending;
     drm_resource_manager_t resource_mgr;
     spinlock_t lease_lock;
     uint32_t next_lease_id;
@@ -1569,4 +1570,5 @@ ssize_t drm_close(void *data, void *arg);
 /* Event handling */
 int drm_post_event(drm_device_t *dev, uint32_t type, uint64_t user_data);
 int drm_defer_event(drm_device_t *dev, uint32_t type, uint64_t user_data);
+int drm_notify_hotplug(drm_device_t *dev);
 void drm_handle_vblank_tick(void);

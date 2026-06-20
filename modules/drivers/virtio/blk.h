@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <block/block.h>
+#include <task/wait.h>
 
 // Virtio block device configuration structure
 typedef struct virtio_blk_config {
@@ -81,6 +82,7 @@ typedef struct virtio_blk_device {
     uint32_t max_transfer_sectors;
     uint16_t slot_count;
     spinlock_t request_lock;
+    wait_queue_head_t request_wait;
     virtio_blk_req_slot_t *slots;
     int16_t pending_slot_by_desc[SIZE];
 } virtio_blk_device_t;

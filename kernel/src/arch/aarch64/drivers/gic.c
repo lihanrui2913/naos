@@ -1,8 +1,10 @@
 #include <acpi/uacpi/acpi.h>
 #include <acpi/uacpi/tables.h>
 #include <arch/arch.h>
+#include <drivers/bus/pci_msi.h>
 #include <irq/irq_manager.h>
 #include <mm/mm.h>
+#include <mm/bitmap.h>
 #include <boot/boot.h>
 #include <drivers/fdt/fdt.h>
 
@@ -18,6 +20,22 @@ static bool gic_ipi_initialized = false;
 static uint8_t gic_v2_cpu_sgi_target_mask[MAX_CPU_NUM];
 static uint32_t gic_v2_active_iar[MAX_CPU_NUM];
 
+#define GIC_V2M_MAX_FRAMES 8
+typedef struct gic_v2m_frame {
+    uint64_t phys_base;
+    uint64_t virt_base;
+    uint64_t setspi_phys;
+    uint32_t spi_start;
+    uint32_t nr_spis;
+    uint32_t spi_offset;
+    uint32_t flags;
+    Bitmap bitmap;
+    uint8_t *bitmap_buffer;
+} gic_v2m_frame_t;
+
+static gic_v2m_frame_t gic_v2m_frames[GIC_V2M_MAX_FRAMES];
+static uint32_t gic_v2m_frame_count = 0;
+
 // 内存屏障
 #define dsb(op) asm volatile("dsb " #op : : : "memory")
 #define isb() asm volatile("isb" : : : "memory")
@@ -26,7 +44,21 @@ static uint32_t gic_v2_active_iar[MAX_CPU_NUM];
 #define ICC_SRE_SRE (1UL << 0)
 #define ICC_SRE_DFB (1UL << 1)
 #define ICC_SRE_DIB (1UL << 2)
-#define GIC_IRQ_FLAG_MODE_EDGE (1U << 0)
+#define V2M_MSI_TYPER 0x008
+#define V2M_MSI_TYPER_BASE_SHIFT 16
+#define V2M_MSI_TYPER_BASE_MASK 0x3FF
+#define V2M_MSI_TYPER_NUM_MASK 0x3FF
+#define V2M_MSI_SETSPI_NS 0x040
+#define V2M_MSI_IIDR 0xFCC
+#define V2M_MIN_SPI 32
+#define V2M_MAX_SPI 1019
+#define GICV2M_NEEDS_SPI_OFFSET (1U << 0)
+#define XGENE_GICV2M_MSI_IIDR 0x06000170
+#define BCM_NS2_GICV2M_MSI_IIDR 0x0000013F
+
+#define V2M_MSI_TYPER_BASE_SPI(x)                                              \
+    (((x) >> V2M_MSI_TYPER_BASE_SHIFT) & V2M_MSI_TYPER_BASE_MASK)
+#define V2M_MSI_TYPER_NUM_SPI(x) ((x) & V2M_MSI_TYPER_NUM_MASK)
 
 static inline void gic_cpu_relax(void) { asm volatile("yield" : : : "memory"); }
 
@@ -98,6 +130,66 @@ static uint64_t gicr_v3_cpu_base(void) {
     printk("GICv3: fallback MPIDR=0x%llx affinity=0x%x uses GICR=0x%llx\n",
            current_mpidr(), affinity, fallback);
     return fallback;
+}
+
+static bool gic_v2m_spi_range_valid(uint32_t spi_start, uint32_t nr_spis) {
+    if (spi_start < V2M_MIN_SPI)
+        return false;
+    if (nr_spis == 0 || spi_start + nr_spis - 1 > V2M_MAX_SPI)
+        return false;
+    return true;
+}
+
+static int gic_v2m_add_frame(uint64_t phys_base, uint64_t size,
+                             uint32_t spi_start, uint32_t nr_spis) {
+    if (gic_v2m_frame_count >= GIC_V2M_MAX_FRAMES || !phys_base || size == 0)
+        return -ENOSPC;
+
+    gic_v2m_frame_t *frame = &gic_v2m_frames[gic_v2m_frame_count];
+    memset(frame, 0, sizeof(*frame));
+
+    frame->phys_base = phys_base;
+    frame->virt_base = (uint64_t)phys_to_virt(phys_base);
+    map_page_range(get_current_page_dir(false), frame->virt_base, phys_base,
+                   size, PT_FLAG_R | PT_FLAG_W | PT_FLAG_DEVICE);
+
+    if (!spi_start || !nr_spis) {
+        uint32_t typer =
+            *(volatile uint32_t *)(frame->virt_base + V2M_MSI_TYPER);
+        spi_start = V2M_MSI_TYPER_BASE_SPI(typer);
+        nr_spis = V2M_MSI_TYPER_NUM_SPI(typer);
+    }
+
+    if (!gic_v2m_spi_range_valid(spi_start, nr_spis))
+        return -EINVAL;
+
+    frame->spi_start = spi_start;
+    frame->nr_spis = nr_spis;
+    frame->setspi_phys = phys_base + V2M_MSI_SETSPI_NS;
+
+    switch (*(volatile uint32_t *)(frame->virt_base + V2M_MSI_IIDR)) {
+    case XGENE_GICV2M_MSI_IIDR:
+        frame->flags |= GICV2M_NEEDS_SPI_OFFSET;
+        frame->spi_offset = frame->spi_start;
+        break;
+    case BCM_NS2_GICV2M_MSI_IIDR:
+        frame->flags |= GICV2M_NEEDS_SPI_OFFSET;
+        frame->spi_offset = 32;
+        break;
+    default:
+        break;
+    }
+
+    size_t bitmap_bytes = (frame->nr_spis + 7) / 8;
+    frame->bitmap_buffer = calloc(bitmap_bytes, sizeof(uint8_t));
+    if (!frame->bitmap_buffer)
+        return -ENOMEM;
+    bitmap_init(&frame->bitmap, frame->bitmap_buffer, frame->nr_spis);
+
+    printk("GICv2m: frame @ 0x%llx, SPI [%u-%u]\n", frame->phys_base,
+           frame->spi_start, frame->spi_start + frame->nr_spis - 1);
+    gic_v2m_frame_count++;
+    return 0;
 }
 
 gic_version_t gic_detect_version(void) {
@@ -208,6 +300,28 @@ static void gic_parse_acpi(void) {
         map_page_range(get_current_page_dir(false), gicr_base_virt,
                        gicr_base_address, gicr_region_size,
                        PT_FLAG_R | PT_FLAG_W | PT_FLAG_DEVICE);
+    }
+
+    current = 0;
+    while (current + sizeof(struct acpi_madt) < madt->hdr.length) {
+        struct acpi_entry_hdr *header =
+            (struct acpi_entry_hdr *)((uint64_t)(&madt->entries) + current);
+
+        if (header->type == ACPI_MADT_ENTRY_TYPE_GIC_MSI_FRAME) {
+            struct acpi_madt_gic_msi_frame *frame =
+                (struct acpi_madt_gic_msi_frame *)header;
+            uint32_t spi_start = 0;
+            uint32_t nr_spis = 0;
+
+            if (frame->flags & ACPI_SPI_SELECT) {
+                spi_start = frame->spi_base;
+                nr_spis = frame->spi_count;
+            }
+
+            gic_v2m_add_frame(frame->address, PAGE_SIZE, spi_start, nr_spis);
+        }
+
+        current += header->length;
     }
 }
 
@@ -448,6 +562,32 @@ static void gic_parse_dtb() {
             map_page_range(get_current_page_dir(false), gicr_base_virt,
                            gicr_base_address, gicr_region_size,
                            PT_FLAG_R | PT_FLAG_W | PT_FLAG_DEVICE);
+        }
+
+        for (node = fdt_next_node(fdt, -1, NULL); node >= 0;
+             node = fdt_next_node(fdt, node, NULL)) {
+            int len;
+            const char *compatible = fdt_getprop(fdt, node, "compatible", &len);
+            uint64_t frame_addr = 0;
+            uint64_t frame_size = 0;
+            uint32_t spi_start = 0;
+            uint32_t nr_spis = 0;
+
+            if (!compatible || !strstr(compatible, "arm,gic-v2m-frame"))
+                continue;
+            if (fdt_get_reg(fdt, node, 0, &frame_addr, &frame_size) != 0)
+                continue;
+
+            const uint32_t *prop =
+                fdt_getprop(fdt, node, "arm,msi-base-spi", &len);
+            if (prop && len >= (int)sizeof(uint32_t))
+                spi_start = fdt32_to_cpu(*prop);
+            prop = fdt_getprop(fdt, node, "arm,msi-num-spis", &len);
+            if (prop && len >= (int)sizeof(uint32_t))
+                nr_spis = fdt32_to_cpu(*prop);
+
+            gic_v2m_add_frame(frame_addr, frame_size ? frame_size : PAGE_SIZE,
+                              spi_start, nr_spis);
         }
     }
 }
@@ -777,7 +917,7 @@ static void gic_v3_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
 }
 
 void gic_configure_irq(uint32_t irq, uint32_t flags) {
-    bool edge_triggered = (flags & GIC_IRQ_FLAG_MODE_EDGE) != 0;
+    bool edge_triggered = (flags & IRQ_FLAGS_EDGE) != 0;
 
     // SGI 固定为边沿触发，不需要软件配置。
     if (irq < PPI_INTR_BASE) {
@@ -798,6 +938,96 @@ void gic_configure_irq(uint32_t irq, uint32_t flags) {
         gic_configure_icfgr(gicr_addr, GICR_ICFGR0, irq, edge_triggered);
     } else {
         gic_configure_icfgr(gicd_base_virt, GICD_ICFGR, irq, edge_triggered);
+    }
+}
+
+void gic_route_irq(uint32_t irq, uint32_t cpu_id) {
+    if (irq < SPI_INTR_BASE || cpu_id >= cpu_count)
+        return;
+
+    if (gic_version == GIC_VERSION_V2) {
+        uint32_t target_mask = 0;
+        uint32_t reg = irq & ~0x3U;
+        uint32_t shift = (irq & 0x3U) * 8;
+        volatile uint32_t *targets =
+            (volatile uint32_t *)(gicd_base_virt + GICD_ITARGETSR + reg);
+        uint32_t value = *targets;
+
+        if (cpu_id < MAX_CPU_NUM)
+            target_mask = gic_v2_cpu_sgi_target_mask[cpu_id];
+        if (!target_mask && cpu_id < 8)
+            target_mask = 1U << cpu_id;
+        if (!target_mask)
+            return;
+
+        value &= ~(0xFFU << shift);
+        value |= ((uint32_t)target_mask << shift);
+        *targets = value;
+        dsb(sy);
+        return;
+    }
+
+    volatile uint64_t *route_reg =
+        (volatile uint64_t *)(gicd_base_virt + GICD_IROUTER + irq * 8);
+    uint64_t mpidr = cpuid_to_mpidr[cpu_id];
+    *route_reg = ((uint64_t)gic_mpidr_aff3(mpidr) << 32) |
+                 ((uint64_t)gic_mpidr_aff2(mpidr) << 16) |
+                 ((uint64_t)gic_mpidr_aff1(mpidr) << 8) |
+                 (uint64_t)gic_mpidr_aff0(mpidr);
+    dsb(sy);
+}
+
+bool gic_msi_supported(void) { return gic_v2m_frame_count != 0; }
+
+int gic_msi_alloc_irq(uint32_t cpu_id, uint16_t *irq_num,
+                      struct msi_msg_t *msg) {
+    for (uint32_t i = 0; i < gic_v2m_frame_count; i++) {
+        gic_v2m_frame_t *frame = &gic_v2m_frames[i];
+        size_t offset = (size_t)-1;
+
+        spin_lock(&frame->bitmap.lock);
+        for (size_t bit = 0; bit < frame->nr_spis; bit++) {
+            if (bitmap_get(&frame->bitmap, bit))
+                continue;
+            bitmap_set(&frame->bitmap, bit, true);
+            offset = bit;
+            break;
+        }
+        spin_unlock(&frame->bitmap.lock);
+
+        if (offset >= frame->nr_spis)
+            continue;
+        uint32_t spi = frame->spi_start + offset;
+
+        if (irq_num)
+            *irq_num = (uint16_t)spi;
+        if (msg) {
+            msg->address_lo = (uint32_t)frame->setspi_phys;
+            msg->address_hi = (uint32_t)(frame->setspi_phys >> 32);
+            msg->data = spi;
+            if (frame->flags & GICV2M_NEEDS_SPI_OFFSET)
+                msg->data -= frame->spi_offset;
+            msg->vector_control = 0;
+        }
+
+        gic_route_irq(spi, cpu_id);
+        return 0;
+    }
+
+    return -ENOSPC;
+}
+
+void gic_msi_free_irq(uint16_t irq_num) {
+    for (uint32_t i = 0; i < gic_v2m_frame_count; i++) {
+        gic_v2m_frame_t *frame = &gic_v2m_frames[i];
+        if (irq_num < frame->spi_start ||
+            irq_num >= frame->spi_start + frame->nr_spis)
+            continue;
+
+        spin_lock(&frame->bitmap.lock);
+        bitmap_set(&frame->bitmap, irq_num - frame->spi_start, false);
+        spin_unlock(&frame->bitmap.lock);
+        return;
     }
 }
 

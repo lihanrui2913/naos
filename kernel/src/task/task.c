@@ -19,7 +19,6 @@
 #include <init/callbacks.h>
 #include <task/keyring.h>
 #include <task/ns.h>
-#include <task/watchdog.h>
 
 volatile unsigned long jiffies;
 
@@ -72,7 +71,6 @@ void sched_refresh_preempt_deadline(uint32_t cpu_id, task_t *task,
         return;
 
     sched_update_preempt_deadline(cpu_id, task, now_ns);
-    sched_watchdog_tick(cpu_id, task, now_ns);
 }
 
 struct vfs_process_fs *task_current_vfs_fs(void) {
@@ -1895,7 +1893,6 @@ void task_init() {
         spin_init(&task_timeout_locks[cpu]);
         spin_init(&task_signal_timer_locks[cpu]);
     }
-    sched_watchdog_init();
     llist_init_head(&should_free_tasks);
     spin_init(&should_free_lock);
     llist_init_head(&should_free_mms);
@@ -1941,18 +1938,13 @@ void task_init() {
     arch_set_current(idle_tasks[current_cpu_id]);
     task_mark_on_cpu(idle_tasks[current_cpu_id], true);
     task_mm_mark_cpu_active(idle_tasks[current_cpu_id]->mm, current_cpu_id);
-    sched_watchdog_note_current(current_cpu_id, idle_tasks[current_cpu_id],
-                                nano_time());
 
     __atomic_store_n(&task_initialized, true, __ATOMIC_RELEASE);
 
     can_schedule = true;
 }
 
-void sched_request_resched(task_t *task) {
-    task_set_need_resched(task);
-    sched_watchdog_note_resched(task, nano_time());
-}
+void sched_request_resched(task_t *task) { task_set_need_resched(task); }
 
 void sched_resched_if_needed(void) {
     task_t *self = current_task;
@@ -2581,7 +2573,6 @@ void schedule(uint64_t sched_flags) {
     next->current_state = TASK_RUNNING;
     next->last_sched_in_ns = now_ns;
     sched_update_preempt_deadline(cpu_id, next, now_ns);
-    sched_watchdog_task_switch(cpu_id, next, now_ns);
 
     if (prev->mm != next->mm) {
         task_mm_mark_cpu_active(next->mm, cpu_id);
