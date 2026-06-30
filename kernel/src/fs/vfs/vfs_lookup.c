@@ -353,6 +353,63 @@ static int __vfs_filename_lookup(struct vfs_path *start,
                                  unsigned int lookup_flags, unsigned int depth,
                                  struct vfs_path *out);
 
+static int vfs_lookup_apply_scope(struct vfs_path *path,
+                                  const struct vfs_path *root,
+                                  unsigned int lookup_flags) {
+    if (!path || !root)
+        return -EINVAL;
+
+    if ((lookup_flags & (LOOKUP_BENEATH | LOOKUP_IN_ROOT)) &&
+        !vfs_path_is_ancestor(root, path)) {
+        if (lookup_flags & LOOKUP_IN_ROOT) {
+            vfs_path_replace(path, root->mnt, root->dentry);
+        } else {
+            return -EXDEV;
+        }
+    }
+
+    return 0;
+}
+
+static int vfs_walk_dotdot(struct vfs_path *path, const struct vfs_path *root,
+                           unsigned int lookup_flags) {
+    struct vfs_mount *next_mnt = NULL;
+    struct vfs_dentry *next_dentry = NULL;
+
+    if (!path || !path->mnt || !path->dentry || !root)
+        return -EINVAL;
+
+    if (vfs_path_equal(path, root))
+        return 0;
+
+    if (path->dentry == path->mnt->mnt_root && path->mnt->mnt_parent &&
+        path->mnt->mnt_parent != path->mnt && path->mnt->mnt_mountpoint) {
+        next_mnt = vfs_mntget(path->mnt->mnt_parent);
+        next_dentry = vfs_dget(path->mnt->mnt_mountpoint);
+        if (!next_mnt || !next_dentry) {
+            if (next_dentry)
+                vfs_dput(next_dentry);
+            if (next_mnt)
+                vfs_mntput(next_mnt);
+            return -ENOENT;
+        }
+
+        vfs_path_replace(path, next_mnt, next_dentry);
+        vfs_dput(next_dentry);
+        vfs_mntput(next_mnt);
+    } else if (path->dentry->d_parent &&
+               path->dentry != path->dentry->d_parent) {
+        next_dentry = vfs_dget(path->dentry->d_parent);
+        if (!next_dentry)
+            return -ENOENT;
+
+        vfs_path_replace(path, path->mnt, next_dentry);
+        vfs_dput(next_dentry);
+    }
+
+    return vfs_lookup_apply_scope(path, root, lookup_flags);
+}
+
 static int vfs_follow_symlink(struct vfs_path *parent,
                               const struct vfs_path *root,
                               struct vfs_dentry *link_dentry,
@@ -512,6 +569,20 @@ static int __vfs_filename_lookup(struct vfs_path *start,
             goto out;
         }
 
+        if (streq(component, ".")) {
+            ret = vfs_lookup_apply_scope(&path, root, lookup_flags);
+            if (ret < 0)
+                goto out;
+            continue;
+        }
+
+        if (streq(component, "..")) {
+            ret = vfs_walk_dotdot(&path, root, lookup_flags);
+            if (ret < 0)
+                goto out;
+            continue;
+        }
+
         next = vfs_lookup_component(&path, component, lookup_flags);
         if (IS_ERR(next)) {
             ret = (int)PTR_ERR(next);
@@ -541,29 +612,17 @@ static int __vfs_filename_lookup(struct vfs_path *start,
 
         vfs_path_replace(&path, path.mnt, next);
         vfs_dput(next);
-        if ((lookup_flags & (LOOKUP_BENEATH | LOOKUP_IN_ROOT)) &&
-            !vfs_path_is_ancestor(root, &path)) {
-            if (lookup_flags & LOOKUP_IN_ROOT) {
-                vfs_path_replace(&path, root->mnt, root->dentry);
-            } else {
-                ret = -EXDEV;
-                goto out;
-            }
-        }
+        ret = vfs_lookup_apply_scope(&path, root, lookup_flags);
+        if (ret < 0)
+            goto out;
         if (!(lookup_flags & LOOKUP_NO_LAST_MOUNT) || has_remaining) {
             ret = vfs_follow_mount_checked(&path, lookup_flags);
             if (ret < 0)
                 goto out;
         }
-        if ((lookup_flags & (LOOKUP_BENEATH | LOOKUP_IN_ROOT)) &&
-            !vfs_path_is_ancestor(root, &path)) {
-            if (lookup_flags & LOOKUP_IN_ROOT) {
-                vfs_path_replace(&path, root->mnt, root->dentry);
-            } else {
-                ret = -EXDEV;
-                goto out;
-            }
-        }
+        ret = vfs_lookup_apply_scope(&path, root, lookup_flags);
+        if (ret < 0)
+            goto out;
     }
 
     if ((lookup_flags & LOOKUP_DIRECTORY) && path.dentry &&

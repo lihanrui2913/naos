@@ -2,7 +2,6 @@
 #include <fs/fs_syscall.h>
 #include <boot/boot.h>
 #include <net/socket.h>
-#include <drivers/logger.h>
 #include <fs/pipe.h>
 #include <fs/vfs/notify.h>
 #include <mm/cache.h>
@@ -1007,6 +1006,8 @@ uint64_t sys_mount_setattr(int dfd, const char *path, uint64_t flags,
     mount_attr_t attr;
     char pathname[512] = {0};
     struct vfs_path target = {0};
+    struct vfs_mount *mnt = NULL;
+    unsigned long current_flags, new_flags, attr_mask;
     int ret;
 
     if (!attr_user || size < MOUNT_ATTR_SIZE_VER0)
@@ -1033,6 +1034,66 @@ uint64_t sys_mount_setattr(int dfd, const char *path, uint64_t flags,
     if (ret < 0)
         return (uint64_t)ret;
 
+    mnt = vfs_path_mount(&target);
+    if (!mnt && target.mnt)
+        mnt = vfs_mntget(target.mnt);
+    if (!mnt) {
+        vfs_path_put(&target);
+        return (uint64_t)-EINVAL;
+    }
+
+    attr_mask = 0;
+    if (attr.attr_set & MOUNT_ATTR_RDONLY)
+        attr_mask |= VFS_MNT_READONLY;
+    if (attr.attr_set & MOUNT_ATTR_NOSUID)
+        attr_mask |= VFS_MNT_NOSUID;
+    if (attr.attr_set & MOUNT_ATTR_NODEV)
+        attr_mask |= VFS_MNT_NODEV;
+    if (attr.attr_set & MOUNT_ATTR_NOEXEC)
+        attr_mask |= VFS_MNT_NOEXEC;
+    if (attr.attr_set & MOUNT_ATTR_NOSYMFOLLOW)
+        attr_mask |= VFS_MNT_NOSYMFOLLOW;
+
+    if (attr.attr_clr & MOUNT_ATTR_RDONLY)
+        attr_mask |= VFS_MNT_READONLY;
+    if (attr.attr_clr & MOUNT_ATTR_NOSUID)
+        attr_mask |= VFS_MNT_NOSUID;
+    if (attr.attr_clr & MOUNT_ATTR_NODEV)
+        attr_mask |= VFS_MNT_NODEV;
+    if (attr.attr_clr & MOUNT_ATTR_NOEXEC)
+        attr_mask |= VFS_MNT_NOEXEC;
+    if (attr.attr_clr & MOUNT_ATTR_NOSYMFOLLOW)
+        attr_mask |= VFS_MNT_NOSYMFOLLOW;
+
+    if (attr_mask != 0) {
+        spin_lock(&mnt->mnt_lock);
+        current_flags = mnt->mnt_flags;
+        new_flags = current_flags & ~attr_mask;
+        if (attr.attr_set & MOUNT_ATTR_RDONLY)
+            new_flags |= VFS_MNT_READONLY;
+        if (attr.attr_set & MOUNT_ATTR_NOSUID)
+            new_flags |= VFS_MNT_NOSUID;
+        if (attr.attr_set & MOUNT_ATTR_NODEV)
+            new_flags |= VFS_MNT_NODEV;
+        if (attr.attr_set & MOUNT_ATTR_NOEXEC)
+            new_flags |= VFS_MNT_NOEXEC;
+        if (attr.attr_set & MOUNT_ATTR_NOSYMFOLLOW)
+            new_flags |= VFS_MNT_NOSYMFOLLOW;
+        mnt->mnt_flags = new_flags;
+        spin_unlock(&mnt->mnt_lock);
+    }
+
+    if (attr.propagation != 0) {
+        ret = vfs_mount_set_propagation(mnt, (unsigned long)attr.propagation,
+                                        (flags & AT_RECURSIVE) != 0);
+        if (ret < 0) {
+            vfs_mntput(mnt);
+            vfs_path_put(&target);
+            return (uint64_t)ret;
+        }
+    }
+
+    vfs_mntput(mnt);
     vfs_path_put(&target);
     return 0;
 }
@@ -3699,46 +3760,6 @@ uint64_t do_link(const char *name, const char *new) {
     return (uint64_t)vfs_linkat(AT_FDCWD, name, AT_FDCWD, new, 0, false);
 }
 
-static int parse_proc_self_fd_path(const char *path, int *fd_out) {
-    if (!path || !fd_out)
-        return 0;
-
-    const char *fd_part = NULL;
-    if (!strncmp(path, "/proc/self/fd/", strlen("/proc/self/fd/"))) {
-        fd_part = path + strlen("/proc/self/fd/");
-    } else if (!strncmp(path, "/proc/", strlen("/proc/"))) {
-        const char *pid_part = path + strlen("/proc/");
-        uint64_t pid = 0;
-        if (!*pid_part)
-            return 0;
-        while (is_digit(*pid_part)) {
-            pid = pid * 10 + (uint64_t)(*pid_part - '0');
-            pid_part++;
-        }
-        if (pid != task_effective_tgid(current_task) ||
-            strncmp(pid_part, "/fd/", strlen("/fd/"))) {
-            return 0;
-        }
-        fd_part = pid_part + strlen("/fd/");
-    } else {
-        return 0;
-    }
-
-    if (!fd_part || !*fd_part)
-        return 0;
-
-    int fd = 0;
-    while (is_digit(*fd_part)) {
-        fd = fd * 10 + (*fd_part - '0');
-        fd_part++;
-    }
-    if (*fd_part != '\0')
-        return 0;
-
-    *fd_out = fd;
-    return 1;
-}
-
 static int resolve_linkat_source_path(uint64_t olddirfd, const char *oldpath,
                                       int flags, struct vfs_path *source_out) {
     if (!source_out)
@@ -3757,19 +3778,12 @@ static int resolve_linkat_source_path(uint64_t olddirfd, const char *oldpath,
         return 1;
     }
 
-    if (flags & AT_SYMLINK_FOLLOW) {
-        int fd = -1;
-        if (parse_proc_self_fd_path(oldpath, &fd)) {
-            fd_t *file = task_get_file(current_task, fd);
-            if (fd < 0 || !file)
-                return -ENOENT;
-            if (!vfs_path_copy(source_out, &file->f_path)) {
-                vfs_file_put(file);
-                return -ENOENT;
-            }
-            vfs_file_put(file);
-            return 1;
-        }
+    if ((flags & AT_SYMLINK_FOLLOW) && oldpath) {
+        int ret = vfs_filename_lookup((int)olddirfd, oldpath, LOOKUP_FOLLOW,
+                                      source_out);
+        if (ret < 0)
+            return ret;
+        return 1;
     }
 
     return 0;

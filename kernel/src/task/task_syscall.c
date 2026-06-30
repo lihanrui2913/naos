@@ -1897,10 +1897,9 @@ static void task_execve_switch_mm(task_t *task, task_mm_info_t *from,
     spin_lock(&task_queue_lock);
     task->mm = to;
     spin_unlock(&task_queue_lock);
-    task_mm_mark_cpu_active(to, task->cpu_id);
     set_current_page_dir(true, to->page_table_addr);
-    apic_tlb_shootdown_handle();
     task_mm_mark_cpu_inactive(from, task->cpu_id);
+    task_mm_mark_cpu_active(to, task->cpu_id);
 
     if (irq_state)
         arch_enable_interrupt();
@@ -3079,7 +3078,7 @@ uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
             if (target->state == TASK_DIED) {
                 if (target->status >= 128) {
                     info.si_code = CLD_KILLED;
-                    info._sifields._sigchld._status = target->status - 128;
+                    info._sifields._sigchld._status = target->status;
                 } else {
                     info.si_code = CLD_EXITED;
                     info._sifields._sigchld._status = target->status;

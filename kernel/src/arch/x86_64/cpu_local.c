@@ -45,3 +45,24 @@ uint32_t x64_current_cpu_id(void) {
         return local->cpu_id;
     return get_cpuid_by_lapic_id((uint32_t)lapic_id());
 }
+
+void x64_irq_context_enter(void) {
+    x64_cpu_local_t *local = x64_get_cpu_local();
+    if (!local)
+        return;
+
+    local->irq_nesting++;
+}
+
+void x64_irq_context_exit(void) {
+    x64_cpu_local_t *local = x64_get_cpu_local();
+    if (!local || local->irq_nesting == 0)
+        return;
+
+    local->irq_nesting--;
+}
+
+bool x64_in_irq_context(void) {
+    x64_cpu_local_t *local = x64_get_cpu_local();
+    return local && local->irq_nesting != 0;
+}

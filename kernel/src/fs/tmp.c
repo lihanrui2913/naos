@@ -680,7 +680,8 @@ static int tmpfs_setattr(struct vfs_dentry *dentry,
         return -EINVAL;
 
     if (stat->mode)
-        dentry->d_inode->i_mode = stat->mode;
+        dentry->d_inode->i_mode =
+            (dentry->d_inode->i_mode & S_IFMT) | (stat->mode & 07777);
     dentry->d_inode->i_uid = stat->uid;
     dentry->d_inode->i_gid = stat->gid;
     if (!S_ISDIR(dentry->d_inode->i_mode) &&

@@ -510,6 +510,7 @@ uint64_t general_ap_entry() {
 
     uint32_t local_apic_id = (uint32_t)lapic_id();
     x64_cpu_local_init(get_cpuid_by_lapic_id(local_apic_id), local_apic_id);
+    x64_tlb_note_loaded_pgdir();
 
     tss_init();
 

@@ -134,7 +134,7 @@ static void fsfd_destroy_object(void *ptr) {
         mount_handle_t *mnt = (mount_handle_t *)obj;
 
         free(mnt->source);
-        if (mnt->mnt)
+        if (mnt->mnt && !mnt->attached)
             vfs_mntput(mnt->mnt);
         free(mnt);
     }
@@ -616,6 +616,19 @@ static int fsconfig_cmd_reconfigure(fs_context_t *ctx) {
     return 0;
 }
 
+static void fsconfig_note_parameter_update(fs_context_t *ctx) {
+    if (!ctx)
+        return;
+
+    /* Parameter updates before FSCONFIG_CMD_CREATE transition the context into
+     * the configuration phase. Once the filesystem has been created or mounted,
+     * preserve that state so callers can update parameters and then issue
+     * FSCONFIG_CMD_RECONFIGURE, which is exactly how systemd flips credential
+     * tmpfs mounts read-only. */
+    if (ctx->state == FC_STATE_INIT || ctx->state == FC_STATE_CONFIG)
+        ctx->state = FC_STATE_CONFIG;
+}
+
 static struct vfs_mount *fsfd_path_mount(const struct vfs_path *path) {
     return vfs_path_mount(path);
 }
@@ -736,7 +749,7 @@ uint64_t sys_fsconfig(int fd, uint32_t cmd, const char *key_user,
             ret = -EFAULT;
             break;
         }
-        ctx->state = FC_STATE_CONFIG;
+        fsconfig_note_parameter_update(ctx);
         ret = fsconfig_set_flag(ctx, key);
         break;
 
@@ -757,7 +770,7 @@ uint64_t sys_fsconfig(int fd, uint32_t cmd, const char *key_user,
         } else {
             value[0] = '\0';
         }
-        ctx->state = FC_STATE_CONFIG;
+        fsconfig_note_parameter_update(ctx);
         ret = fsconfig_set_string(ctx, key, value);
         break;
 
@@ -782,7 +795,7 @@ uint64_t sys_fsconfig(int fd, uint32_t cmd, const char *key_user,
         } else {
             value[0] = '\0';
         }
-        ctx->state = FC_STATE_CONFIG;
+        fsconfig_note_parameter_update(ctx);
         ret = fsconfig_set_string(ctx, key, value);
         break;
 
@@ -807,7 +820,7 @@ uint64_t sys_fsconfig(int fd, uint32_t cmd, const char *key_user,
             ret = -EINVAL;
             break;
         }
-        ctx->state = FC_STATE_CONFIG;
+        fsconfig_note_parameter_update(ctx);
         if (!strcmp(key, "source")) {
             char *resolved = at_resolve_pathname(aux, value);
 
@@ -831,7 +844,7 @@ uint64_t sys_fsconfig(int fd, uint32_t cmd, const char *key_user,
             ret = -EBADF;
             break;
         }
-        ctx->state = FC_STATE_CONFIG;
+        fsconfig_note_parameter_update(ctx);
         if (!strcmp(key, "source")) {
             struct vfs_file *source_file = task_get_file(current_task, aux);
             char *source_path;
@@ -1038,6 +1051,8 @@ uint64_t sys_move_mount(int from_dfd, const char *from_pathname_user,
     }
 
     ret = vfs_reconfigure_mount(source_mnt, &to_path, false);
+    if (ret == 0 && from_file)
+        mountfd_mark_attached(from_file);
 
 out:
     if (source_mnt)

@@ -14,6 +14,7 @@ void arch_early_init() {
     apic_init();
     x64_cpu_local_init(get_cpuid_by_lapic_id((uint32_t)lapic_id()),
                        (uint32_t)lapic_id());
+    x64_tlb_note_loaded_pgdir();
     tss_init();
 
     apic_timer_init();

@@ -1403,6 +1403,27 @@ static int ext_write_inode(ext_mount_ctx_t *fs, uint32_t ino,
     return ret;
 }
 
+static int ext_write_inode_zeroed(ext_mount_ctx_t *fs, uint32_t ino,
+                                  const ext_inode_disk_t *inode) {
+    if (!fs || !inode || ino == 0 || ino > fs->inodes_count)
+        return -EINVAL;
+
+    uint64_t offset = 0;
+    int ret = ext_inode_offset(fs, ino, &offset);
+    if (ret)
+        return ret;
+
+    uint8_t *raw = calloc(1, fs->inode_size);
+    if (!raw)
+        return -ENOMEM;
+
+    memcpy(raw, inode, MIN((size_t)fs->inode_size, sizeof(*inode)));
+    ext_inode_checksum_set(fs, ino, raw);
+    ret = ext_dev_write(fs, offset, raw, fs->inode_size);
+    free(raw);
+    return ret;
+}
+
 static void ext_copy_runtime_inode_state(ext_inode_disk_t *dst,
                                          const ext_inode_disk_t *src) {
     if (!dst || !src)
@@ -1617,16 +1638,9 @@ static int ext_alloc_inode_locked(ext_mount_ctx_t *fs, uint16_t mode,
                 continue;
             if (ext_bitmap_test_bit(bitmap, bit))
                 continue;
-            uint8_t *empty = calloc(1, fs->inode_size);
-            if (!empty) {
-                free(bitmap);
-                return -ENOMEM;
-            }
-            uint64_t table_block = ext_group_inode_table(gd);
-            uint64_t offset =
-                table_block * fs->block_size + (uint64_t)bit * fs->inode_size;
-            ret = ext_dev_write(fs, offset, empty, fs->inode_size);
-            free(empty);
+            ext_inode_disk_t empty_inode = {0};
+            ext_inode_init_large_fields(fs, &empty_inode);
+            ret = ext_write_inode_zeroed(fs, (uint32_t)ino, &empty_inode);
             if (ret) {
                 free(bitmap);
                 return ret;
@@ -3904,7 +3918,7 @@ static int ext_release_inode_locked(ext_mount_ctx_t *fs, uint32_t ino,
     inode->i_generation = old_generation;
     inode->i_dtime = old_dtime;
     ext_inode_init_large_fields(fs, inode);
-    int ret = ext_write_inode(fs, ino, inode);
+    int ret = ext_write_inode_zeroed(fs, ino, inode);
     if (ret)
         return ret;
     return ext_free_inode_locked(fs, ino, (old_mode & S_IFMT) == EXT2_S_IFDIR);

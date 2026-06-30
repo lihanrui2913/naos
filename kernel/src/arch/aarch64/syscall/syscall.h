@@ -44,7 +44,7 @@ void syscall_init();
 
 #define MAX_SYSCALL_NUM 500
 
-static inline uint64_t dummy_syscall_handler() { return 0; }
+static inline uint64_t dummy_syscall_handler() { return (uint64_t)0; }
 
 typedef uint64_t (*syscall_handle_t)(uint64_t arg1, uint64_t arg2,
                                      uint64_t arg3, uint64_t arg4,

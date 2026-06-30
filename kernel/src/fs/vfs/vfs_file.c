@@ -1,5 +1,6 @@
 #include "fs/vfs/vfs_internal.h"
 #include "fs/vfs/notify.h"
+#include "drivers/logger.h"
 #include "task/task.h"
 #include <arch/arch.h>
 #include <fs/fs_syscall.h>
@@ -345,17 +346,34 @@ static int vfs_open_from_root(struct vfs_path *start, struct vfs_path *root,
                 goto out;
             }
         }
-        if (!dir->i_op || !dir->i_op->create) {
-            ret = -EOPNOTSUPP;
-            goto out;
-        }
         if (!kernel) {
             ret = vfs_inode_permission(dir, VFS_MAY_WRITE | VFS_MAY_EXEC);
             if (ret < 0)
                 goto out;
         }
-        ret = dir->i_op->create(dir, dentry, (umode_t)local_how.mode,
-                                !!(local_how.flags & O_EXCL));
+
+        if (local_how.flags & O_DIRECTORY) {
+            if (!dir->i_op || !dir->i_op->mkdir) {
+                ret = -EOPNOTSUPP;
+                goto out;
+            }
+            if (streq(name, "inaccessible") ||
+                streq(name, "/run/systemd/inaccessible")) {
+                printk("vfs_openat: mkdir via openat path='%s' parent_ino=%llu "
+                       "mode=%#o flags=%#llx\n",
+                       name, dir ? (unsigned long long)dir->i_ino : 0ULL,
+                       (unsigned)local_how.mode,
+                       (unsigned long long)local_how.flags);
+            }
+            ret = dir->i_op->mkdir(dir, dentry, (umode_t)local_how.mode);
+        } else {
+            if (!dir->i_op || !dir->i_op->create) {
+                ret = -EOPNOTSUPP;
+                goto out;
+            }
+            ret = dir->i_op->create(dir, dentry, (umode_t)local_how.mode,
+                                    !!(local_how.flags & O_EXCL));
+        }
         if (ret < 0)
             goto out;
         created = true;

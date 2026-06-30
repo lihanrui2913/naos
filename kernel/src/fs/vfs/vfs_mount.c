@@ -42,6 +42,136 @@ static int vfs_mount_attach_tree(struct vfs_mount *parent,
                                  struct vfs_dentry *mountpoint,
                                  struct vfs_mount *child);
 
+static bool vfs_mountpoint_matches(const struct vfs_dentry *mounted_on,
+                                   const struct vfs_dentry *query) {
+    if (mounted_on == query)
+        return true;
+    if (!mounted_on || !query || !mounted_on->d_inode || !query->d_inode)
+        return false;
+    if (mounted_on->d_inode != query->d_inode)
+        return false;
+
+    if (mounted_on->d_parent == query->d_parent)
+        return true;
+    if (!mounted_on->d_parent || !query->d_parent ||
+        !mounted_on->d_parent->d_inode || !query->d_parent->d_inode) {
+        return false;
+    }
+
+    if (mounted_on->d_parent->d_inode != query->d_parent->d_inode)
+        return false;
+    if (mounted_on->d_name.len != query->d_name.len ||
+        mounted_on->d_name.hash != query->d_name.hash ||
+        !mounted_on->d_name.name || !query->d_name.name) {
+        return false;
+    }
+
+    return strncmp(mounted_on->d_name.name, query->d_name.name,
+                   mounted_on->d_name.len) == 0;
+}
+
+static bool vfs_mount_is_listed_child(const struct vfs_mount *parent,
+                                      const struct vfs_mount *child) {
+    const struct vfs_mount *pos;
+    const struct vfs_mount *tmp;
+
+    if (!parent || !child)
+        return false;
+
+    llist_for_each(pos, tmp, &parent->mnt_mounts, mnt_child) {
+        if (pos == child)
+            return true;
+    }
+
+    return false;
+}
+
+static struct vfs_mount *
+vfs_find_child_mount_on_aliases(struct vfs_mount *parent,
+                                struct vfs_dentry *mountpoint) {
+    struct vfs_dentry *alias;
+    struct vfs_dentry *tmp_alias;
+    struct vfs_mount *best = NULL;
+
+    if (!parent || !mountpoint || !mountpoint->d_inode)
+        return NULL;
+
+    llist_for_each(alias, tmp_alias, &mountpoint->d_inode->i_dentry_aliases,
+                   d_alias) {
+        struct vfs_mount *stack;
+
+        for (stack = alias->d_mounted; stack; stack = stack->mnt_stack_prev) {
+            if (stack->mnt_parent != parent)
+                continue;
+            if (!vfs_mountpoint_matches(stack->mnt_mountpoint, mountpoint))
+                continue;
+            if (!best || stack->mnt_id > best->mnt_id)
+                best = stack;
+        }
+    }
+
+    return best;
+}
+
+static int vfs_collect_missing_direct_child_mounts(struct vfs_mount *src_parent,
+                                                   struct vfs_mount ***out,
+                                                   size_t *out_count) {
+    struct vfs_mount *missing[64];
+    struct vfs_dentry *root_alias;
+    struct vfs_dentry *tmp_root_alias;
+    struct vfs_dentry *child_dentry;
+    struct vfs_dentry *tmp_dentry;
+    size_t count = 0;
+    struct vfs_mount **result;
+    size_t i;
+
+    if (!out || !out_count)
+        return -EINVAL;
+
+    *out = NULL;
+    *out_count = 0;
+
+    if (!src_parent || !src_parent->mnt_root || !src_parent->mnt_root->d_inode)
+        return 0;
+
+    llist_for_each(root_alias, tmp_root_alias,
+                   &src_parent->mnt_root->d_inode->i_dentry_aliases, d_alias) {
+        llist_for_each(child_dentry, tmp_dentry, &root_alias->d_subdirs,
+                       d_child) {
+            struct vfs_mount *stack =
+                vfs_find_child_mount_on_aliases(src_parent, child_dentry);
+
+            if (!stack)
+                continue;
+            if (vfs_mount_is_listed_child(src_parent, stack))
+                continue;
+            if (count >= sizeof(missing) / sizeof(missing[0]))
+                return -EOVERFLOW;
+            for (i = 0; i < count; ++i) {
+                if (missing[i] == stack)
+                    break;
+            }
+            if (i != count)
+                continue;
+            missing[count++] = stack;
+        }
+    }
+
+    if (count == 0)
+        return 0;
+
+    result = calloc(count, sizeof(*result));
+    if (!result)
+        return -ENOMEM;
+
+    for (i = 0; i < count; ++i)
+        result[i] = missing[i];
+
+    *out = result;
+    *out_count = count;
+    return 0;
+}
+
 void vfs_mount_subsys_init(void) { spin_init(&vfs_mount_lock); }
 
 struct vfs_mount *vfs_active_namespace_root_mount(void) {
@@ -57,20 +187,37 @@ struct vfs_mount *vfs_active_namespace_root_mount(void) {
 struct vfs_mount *vfs_child_mount_at(struct vfs_mount *parent,
                                      struct vfs_dentry *mountpoint) {
     struct vfs_mount *mnt;
+    struct vfs_mount *tmp;
+    struct vfs_mount *best = NULL;
 
     if (!parent || !mountpoint)
         return NULL;
 
     spin_lock(&vfs_mount_lock);
     for (mnt = mountpoint->d_mounted; mnt; mnt = mnt->mnt_stack_prev) {
-        if (mnt->mnt_parent == parent) {
-            mnt = vfs_mntget(mnt);
-            spin_unlock(&vfs_mount_lock);
-            return mnt;
-        }
+        if (mnt->mnt_parent != parent)
+            continue;
+        if (!vfs_mountpoint_matches(mnt->mnt_mountpoint, mountpoint))
+            continue;
+        if (!best || mnt->mnt_id > best->mnt_id)
+            best = mnt;
     }
+
+    mnt = vfs_find_child_mount_on_aliases(parent, mountpoint);
+    if (mnt && (!best || mnt->mnt_id > best->mnt_id))
+        best = mnt;
+
+    llist_for_each(mnt, tmp, &parent->mnt_mounts, mnt_child) {
+        if (!vfs_mountpoint_matches(mnt->mnt_mountpoint, mountpoint))
+            continue;
+        if (!best || mnt->mnt_id > best->mnt_id)
+            best = mnt;
+    }
+
+    if (best)
+        best = vfs_mntget(best);
     spin_unlock(&vfs_mount_lock);
-    return NULL;
+    return best;
 }
 
 struct vfs_mount *
@@ -85,9 +232,14 @@ vfs_find_mount_child_by_source(struct vfs_mount *parent,
         return NULL;
     }
 
+    llist_for_each(pos, tmp, &parent->mnt_mounts, mnt_child) {
+        if (pos->mnt_clone_source_id != src_child->mnt_id)
+            continue;
+        return vfs_mntget(pos);
+    }
+
     translated_mountpoint = vfs_translate_dentry_between_mounts(
-        src_child->mnt_parent->mnt_root, src_child->mnt_mountpoint,
-        parent->mnt_root);
+        src_child->mnt_parent->mnt_root, src_child->mnt_mountpoint, parent);
     if (!translated_mountpoint)
         return NULL;
 
@@ -299,6 +451,7 @@ static void vfs_mount_copy_propagation(struct vfs_mount *dst,
     dst->mnt_propagation = src->mnt_propagation;
     dst->mnt_group_id = src->mnt_group_id;
     dst->mnt_master = src->mnt_master;
+    dst->mnt_clone_source_id = 0;
     dst->mnt_propagation_source_id = 0;
 }
 
@@ -314,6 +467,37 @@ static size_t vfs_count_mount_tree_nodes(const struct vfs_mount *root) {
         count += vfs_count_mount_tree_nodes(child);
     }
 
+    return count;
+}
+
+static size_t
+vfs_count_complete_mount_tree_nodes(const struct vfs_mount *root) {
+    const struct vfs_mount *child;
+    const struct vfs_mount *tmp;
+    struct vfs_mount **extra_children = NULL;
+    size_t extra_count = 0;
+    size_t count = 1;
+    size_t i;
+
+    if (!root)
+        return 0;
+
+    llist_for_each(child, tmp, &root->mnt_mounts, mnt_child) {
+        count += vfs_count_complete_mount_tree_nodes(child);
+    }
+
+    if (vfs_collect_missing_direct_child_mounts(
+            (struct vfs_mount *)root, &extra_children, &extra_count) < 0) {
+        return count;
+    }
+
+    for (i = 0; i < extra_count; ++i) {
+        if (!extra_children[i])
+            continue;
+        count += vfs_count_complete_mount_tree_nodes(extra_children[i]);
+    }
+
+    free(extra_children);
     return count;
 }
 
@@ -389,6 +573,7 @@ static void vfs_remap_cloned_tree_metadata(struct vfs_mount_clone_pair *pairs,
             vfs_find_cloned_mount(pairs, count, pairs[i].src->mnt_master);
 
         vfs_mount_copy_propagation(pairs[i].dst, pairs[i].src);
+        pairs[i].dst->mnt_clone_source_id = pairs[i].src->mnt_id;
         if (pairs[i].src->mnt_group_id != 0) {
             remapped_group_id = vfs_remap_cloned_group_id(
                 groups, &group_count, count ? count : 1,
@@ -673,7 +858,7 @@ static int vfs_propagate_attach_locked(struct vfs_mount *parent,
         struct vfs_mount *clone;
 
         translated_mountpoint = vfs_translate_dentry_between_mounts(
-            parent->mnt_root, mountpoint, receiver->mnt_root);
+            parent->mnt_root, mountpoint, receiver);
         if (!translated_mountpoint) {
             ret = -ENOENT;
             goto rollback;
@@ -784,8 +969,7 @@ static void vfs_propagate_detach_locked(struct vfs_mount *mnt) {
         struct vfs_mount *propagated;
 
         translated_mountpoint = vfs_translate_dentry_between_mounts(
-            mnt->mnt_parent->mnt_root, mnt->mnt_mountpoint,
-            receivers[i]->mnt_root);
+            mnt->mnt_parent->mnt_root, mnt->mnt_mountpoint, receivers[i]);
         if (!translated_mountpoint)
             continue;
 
@@ -881,6 +1065,7 @@ void vfs_mntput(struct vfs_mount *mnt) {
     mnt->mnt_mountpoint = NULL;
     mnt->mnt_root = NULL;
     mnt->mnt_sb = NULL;
+    mnt->mnt_clone_source_id = 0;
     mnt->mnt_propagation_source_id = 0;
     free(mnt);
     if (parent)
@@ -1042,16 +1227,17 @@ struct vfs_mount *vfs_path_mount(const struct vfs_path *path) {
 struct vfs_dentry *
 vfs_translate_dentry_between_mounts(const struct vfs_dentry *src_root,
                                     const struct vfs_dentry *src_dentry,
-                                    struct vfs_dentry *dst_root) {
+                                    struct vfs_mount *dst_mnt) {
     const struct vfs_dentry *chain[VFS_MOUNT_TRANSLATE_MAX_DEPTH];
     const struct vfs_dentry *cursor;
+    struct vfs_path translated_path = {0};
     struct vfs_dentry *translated;
     size_t depth = 0;
 
-    if (!src_root || !src_dentry || !dst_root)
+    if (!src_root || !src_dentry || !dst_mnt || !dst_mnt->mnt_root)
         return NULL;
     if (src_dentry == src_root)
-        return vfs_dget(dst_root);
+        return vfs_dget(dst_mnt->mnt_root);
 
     for (cursor = src_dentry; cursor && cursor != src_root;
          cursor = cursor->d_parent) {
@@ -1065,26 +1251,38 @@ vfs_translate_dentry_between_mounts(const struct vfs_dentry *src_root,
     if (cursor != src_root)
         return NULL;
 
-    translated = vfs_dget(dst_root);
-    if (!translated)
+    if (!vfs_path_set(&translated_path, dst_mnt, dst_mnt->mnt_root))
         return NULL;
 
     while (depth > 0) {
-        struct vfs_path parent = {.mnt = NULL, .dentry = translated};
-        struct vfs_dentry *next =
-            vfs_lookup_component(&parent, chain[--depth]->d_name.name, 0);
+        struct vfs_dentry *next;
+        bool has_remaining = depth > 1;
+        struct vfs_path next_path = {0};
+
+        next = vfs_lookup_component(&translated_path,
+                                    chain[--depth]->d_name.name, 0);
 
         if (IS_ERR(next) || !next || !next->d_inode) {
             if (next && !IS_ERR(next))
                 vfs_dput(next);
-            vfs_dput(translated);
+            vfs_path_put(&translated_path);
             return NULL;
         }
 
-        vfs_dput(translated);
-        translated = next;
+        if (!vfs_path_set(&next_path, translated_path.mnt, next)) {
+            vfs_dput(next);
+            vfs_path_put(&translated_path);
+            return NULL;
+        }
+        vfs_path_move(&translated_path, &next_path);
+        vfs_dput(next);
+
+        if (has_remaining)
+            vfs_follow_mount(&translated_path);
     }
 
+    translated = vfs_dget(translated_path.dentry);
+    vfs_path_put(&translated_path);
     return translated;
 }
 
@@ -1151,8 +1349,7 @@ int vfs_translate_path_between_roots(const struct vfs_path *old_root,
         translated_dentry = vfs_dget(translated_mnt->mnt_root);
     } else {
         translated_dentry = vfs_translate_dentry_between_mounts(
-            old_path->mnt->mnt_root, old_path->dentry,
-            translated_mnt->mnt_root);
+            old_path->mnt->mnt_root, old_path->dentry, translated_mnt);
     }
     if (!translated_dentry) {
         vfs_mntput(translated_mnt);
@@ -1263,6 +1460,10 @@ static int vfs_clone_bind_mount_children(struct vfs_mount *src_base,
                                          size_t *pair_count) {
     struct vfs_mount *src_child;
     struct vfs_mount *tmp;
+    struct vfs_mount **extra_children = NULL;
+    size_t extra_count = 0;
+    size_t i;
+    int ret;
 
     if (!src_base || !src_root || !src_parent || !dst_parent)
         return -EINVAL;
@@ -1282,8 +1483,7 @@ static int vfs_clone_bind_mount_children(struct vfs_mount *src_base,
             return -ENOMEM;
 
         dst_mountpoint = vfs_translate_dentry_between_mounts(
-            src_parent->mnt_root, src_child->mnt_mountpoint,
-            dst_parent->mnt_root);
+            src_parent->mnt_root, src_child->mnt_mountpoint, dst_parent);
         if (!dst_mountpoint) {
             vfs_mntput(dst_child);
             return -ENOENT;
@@ -1308,6 +1508,61 @@ static int vfs_clone_bind_mount_children(struct vfs_mount *src_base,
             return ret;
     }
 
+    ret = vfs_collect_missing_direct_child_mounts(src_parent, &extra_children,
+                                                  &extra_count);
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < extra_count; ++i) {
+        struct vfs_mount *dst_child;
+        struct vfs_dentry *dst_mountpoint;
+        int ret;
+
+        src_child = extra_children[i];
+        if (!src_child || !src_child->mnt_mountpoint ||
+            !vfs_dentry_is_descendant(src_root, src_child->mnt_mountpoint)) {
+            continue;
+        }
+
+        dst_child = vfs_bind_single_mount(src_child, src_child->mnt_root);
+        if (!dst_child) {
+            free(extra_children);
+            return -ENOMEM;
+        }
+
+        dst_mountpoint = vfs_translate_dentry_between_mounts(
+            src_parent->mnt_root, src_child->mnt_mountpoint, dst_parent);
+        if (!dst_mountpoint) {
+            vfs_mntput(dst_child);
+            free(extra_children);
+            return -ENOENT;
+        }
+
+        ret = vfs_mount_attach_tree(dst_parent, dst_mountpoint, dst_child);
+        vfs_dput(dst_mountpoint);
+        if (ret < 0) {
+            vfs_mntput(dst_child);
+            free(extra_children);
+            return ret;
+        }
+
+        ret = vfs_mount_clone_pair_add(pairs, pair_capacity, pair_count,
+                                       src_child, dst_child);
+        if (ret < 0) {
+            free(extra_children);
+            return ret;
+        }
+
+        ret = vfs_clone_bind_mount_children(src_base, src_root, src_child,
+                                            dst_child, pairs, pair_capacity,
+                                            pair_count);
+        if (ret < 0) {
+            free(extra_children);
+            return ret;
+        }
+    }
+
+    free(extra_children);
     return 0;
 }
 
@@ -1340,7 +1595,7 @@ struct vfs_mount *vfs_create_bind_mount(const struct vfs_path *from,
     clone->mnt_stack_prev = NULL;
     clone->mnt_stack_next = NULL;
 
-    pair_capacity = vfs_count_mount_tree_nodes(src_mnt);
+    pair_capacity = vfs_count_complete_mount_tree_nodes(src_mnt);
     pairs = calloc(pair_capacity ? pair_capacity : 1, sizeof(*pairs));
     if (!pairs) {
         vfs_mntput(src_mnt);
@@ -1378,18 +1633,20 @@ static int vfs_clone_mount_children(struct vfs_mount *src_parent,
                                     struct vfs_mount_clone_pair *pairs,
                                     size_t pair_capacity, size_t *pair_count) {
     struct vfs_mount *src_child, *tmp;
+    struct vfs_mount **extra_children = NULL;
+    size_t extra_count = 0;
+    size_t i;
+    int ret;
 
     llist_for_each(src_child, tmp, &src_parent->mnt_mounts, mnt_child) {
         struct vfs_mount *dst_child = vfs_clone_single_mount(src_child);
         struct vfs_dentry *dst_mountpoint;
-        int ret;
 
         if (!dst_child)
             return -ENOMEM;
 
         dst_mountpoint = vfs_translate_dentry_between_mounts(
-            src_parent->mnt_root, src_child->mnt_mountpoint,
-            dst_parent->mnt_root);
+            src_parent->mnt_root, src_child->mnt_mountpoint, dst_parent);
         if (!dst_mountpoint) {
             vfs_mntput(dst_child);
             return -ENOENT;
@@ -1412,6 +1669,58 @@ static int vfs_clone_mount_children(struct vfs_mount *src_parent,
         if (ret < 0)
             return ret;
     }
+
+    ret = vfs_collect_missing_direct_child_mounts(src_parent, &extra_children,
+                                                  &extra_count);
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < extra_count; ++i) {
+        struct vfs_mount *dst_child;
+        struct vfs_dentry *dst_mountpoint;
+
+        src_child = extra_children[i];
+        if (!src_child->mnt_mountpoint)
+            continue;
+
+        dst_child = vfs_clone_single_mount(src_child);
+        if (!dst_child) {
+            free(extra_children);
+            return -ENOMEM;
+        }
+
+        dst_mountpoint = vfs_translate_dentry_between_mounts(
+            src_parent->mnt_root, src_child->mnt_mountpoint, dst_parent);
+        if (!dst_mountpoint) {
+            vfs_mntput(dst_child);
+            free(extra_children);
+            return -ENOENT;
+        }
+
+        ret = vfs_mount_attach_tree(dst_parent, dst_mountpoint, dst_child);
+        vfs_dput(dst_mountpoint);
+        if (ret < 0) {
+            vfs_mntput(dst_child);
+            free(extra_children);
+            return ret;
+        }
+
+        ret = vfs_mount_clone_pair_add(pairs, pair_capacity, pair_count,
+                                       src_child, dst_child);
+        if (ret < 0) {
+            free(extra_children);
+            return ret;
+        }
+
+        ret = vfs_clone_mount_children(src_child, dst_child, pairs,
+                                       pair_capacity, pair_count);
+        if (ret < 0) {
+            free(extra_children);
+            return ret;
+        }
+    }
+
+    free(extra_children);
 
     return 0;
 }
@@ -1436,7 +1745,7 @@ static struct vfs_mount *vfs_clone_mount_tree_internal(struct vfs_mount *root,
     clone->mnt_stack_prev = NULL;
     clone->mnt_stack_next = NULL;
 
-    pair_capacity = vfs_count_mount_tree_nodes(root);
+    pair_capacity = vfs_count_complete_mount_tree_nodes(root);
     pairs = calloc(pair_capacity ? pair_capacity : 1, sizeof(*pairs));
     if (!pairs) {
         vfs_put_mount_tree_locked(clone);

@@ -26,6 +26,9 @@ typedef struct x64_tlb_shootdown_state {
 } x64_tlb_shootdown_state_t;
 
 static x64_tlb_shootdown_state_t x64_tlb_shootdown[MAX_CPU_NUM];
+static uint64_t x64_cpu_loaded_pgdir[MAX_CPU_NUM];
+
+static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id);
 
 uint64_t arch_page_table_levels() { return ARCH_MAX_PT_LEVEL; }
 
@@ -41,6 +44,14 @@ uint64_t *get_current_page_dir(bool user) {
 void set_current_page_dir(bool user, uint64_t pgdir) {
     (void)user;
     asm volatile("movq %0, %%cr3" ::"r"(pgdir) : "memory");
+    /*
+     * Runtime CR3 switches must refresh our loaded-pgdir tracking before any
+     * later shootdown targeting or wait logic observes this CPU. Drain the
+     * local queue here as well so pending requests for the previous mm can be
+     * retired immediately after the switch.
+     */
+    x64_tlb_note_loaded_pgdir();
+    x64_tlb_shootdown_process_cpu(current_cpu_id);
 }
 
 void arch_page_table_init(void) {
@@ -124,9 +135,40 @@ static uint64_t x64_tlb_current_pgdir(void) {
     return ARCH_READ_PTE(cr3);
 }
 
+static void x64_tlb_set_cpu_loaded_pgdir(uint32_t cpu_id, uint64_t pgdir) {
+    if (cpu_id >= MAX_CPU_NUM)
+        return;
+
+    __atomic_store_n(&x64_cpu_loaded_pgdir[cpu_id], pgdir, __ATOMIC_RELEASE);
+}
+
+static uint64_t x64_tlb_get_cpu_loaded_pgdir(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPU_NUM)
+        return 0;
+
+    return __atomic_load_n(&x64_cpu_loaded_pgdir[cpu_id], __ATOMIC_ACQUIRE);
+}
+
+void x64_tlb_note_loaded_pgdir(void) {
+    x64_tlb_set_cpu_loaded_pgdir(current_cpu_id, x64_tlb_current_pgdir());
+}
+
 static bool x64_tlb_shootdown_should_wait(void) {
     task_t *self = current_task;
-    return arch_interrupt_enabled() && (!self || self->preempt_count == 0);
+    /*
+     * Waiting while holding a spinlock is unsafe because those locks also
+     * disable local interrupts and remote CPUs may need the same lock before
+     * they can service the fault or scheduler path that will observe the new
+     * page tables. External IRQ/IPI context is also unsafe to block in, even
+     * if no spinlock is currently held. Interrupts being disabled alone is not
+     * a blocker here: x86 page-fault and exec/mm-switch paths run with IF
+     * cleared, but still need synchronous shootdown completion to avoid
+     * stale-TLB false faults.
+     */
+    if (x64_in_irq_context())
+        return false;
+
+    return !self || self->preempt_count == 0;
 }
 
 static uint64_t x64_tlb_shootdown_enqueue_cpu(uint32_t cpu_id,
@@ -224,18 +266,39 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
         }
     }
 
+    /*
+     * Make the invalidation globally visible before publishing completion so
+     * the sender cannot recycle page-table pages or resume userspace based on
+     * a stale completed_seq observation.
+     */
+    memory_barrier();
     __atomic_store_n(&state->completed_seq, complete_seq, __ATOMIC_RELEASE);
 }
 
 void apic_tlb_shootdown_handle(void) {
+    x64_tlb_set_cpu_loaded_pgdir(current_cpu_id, x64_tlb_current_pgdir());
     x64_tlb_shootdown_process_cpu(current_cpu_id);
 }
 
-static bool x64_tlb_shootdown_wait_cpu(uint32_t self_cpu, uint32_t cpu,
-                                       uint64_t seq) {
+static bool x64_tlb_shootdown_wait_cpu(task_mm_info_t *mm, uint32_t self_cpu,
+                                       uint32_t cpu, uint64_t seq) {
     x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu];
 
     while (__atomic_load_n(&state->completed_seq, __ATOMIC_ACQUIRE) < seq) {
+        /*
+         * Once the target CPU has switched away from this mm, the CR3 reload
+         * performed by the context switch has already discarded the stale TLB
+         * state we cared about. There is no value in waiting for an old queued
+         * request after that point.
+         */
+        if (x64_tlb_get_cpu_loaded_pgdir(cpu) != mm->page_table_addr)
+            return true;
+
+        /*
+         * Drain our own pending shootdowns while waiting. This avoids simple
+         * cross-CPU wait chains without introducing any new lock ordering:
+         * processing only touches this CPU's per-CPU queue.
+         */
         x64_tlb_shootdown_process_cpu(self_cpu);
         arch_pause();
     }
@@ -266,23 +329,23 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
     else
         arch_flush_tlb(vaddr);
 
-    for (size_t word = 0; word < MM_ACTIVE_CPU_WORDS; word++) {
-        uint64_t mask =
-            __atomic_load_n(&mm->active_cpu_mask[word], __ATOMIC_ACQUIRE);
-        while (mask) {
-            uint32_t bit = __builtin_ctzll(mask);
-            uint32_t cpu = (uint32_t)(word * 64 + bit);
-            mask &= ~(1ULL << bit);
+    /*
+     * Ensure page-table writes that happened before this call become visible
+     * before any remote CPU handles the shootdown IPI and reloads its TLB.
+     */
+    memory_barrier();
 
-            if (cpu >= cpu_count || cpu >= MAX_CPU_NUM || cpu == self_cpu)
-                continue;
+    for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM; cpu++) {
+        if (cpu == self_cpu)
+            continue;
+        if (x64_tlb_get_cpu_loaded_pgdir(cpu) != mm_pgdir)
+            continue;
 
-            target_seq[cpu] =
-                x64_tlb_shootdown_enqueue_cpu(cpu, mm_pgdir, vaddr, all);
-            targets[cpu] = true;
-            any_target = true;
-            irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR);
-        }
+        target_seq[cpu] =
+            x64_tlb_shootdown_enqueue_cpu(cpu, mm_pgdir, vaddr, all);
+        targets[cpu] = true;
+        any_target = true;
+        irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR);
     }
 
     if (!any_target)
@@ -296,7 +359,7 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
         if (!targets[cpu])
             continue;
 
-        if (!x64_tlb_shootdown_wait_cpu(self_cpu, cpu, target_seq[cpu]))
+        if (!x64_tlb_shootdown_wait_cpu(mm, self_cpu, cpu, target_seq[cpu]))
             complete = false;
     }
 

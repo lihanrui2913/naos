@@ -641,7 +641,7 @@ static int cgroupfs_setattr(struct vfs_dentry *dentry,
     }
 
     if (stat->mode)
-        inode->i_mode = stat->mode;
+        inode->i_mode = (inode->i_mode & S_IFMT) | (stat->mode & 07777);
     inode->i_uid = stat->uid;
     inode->i_gid = stat->gid;
     inode->inode = inode->i_ino;

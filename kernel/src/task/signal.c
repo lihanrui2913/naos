@@ -458,6 +458,7 @@ static bool signal_ensure_user_trampoline(task_t *task) {
         address_release(page_paddr);
         return false;
     }
+    spin_unlock(&mgr->lock);
 
     spin_lock(&task->mm->lock);
     uint64_t map_ret =
@@ -468,11 +469,23 @@ static bool signal_ensure_user_trampoline(task_t *task) {
         task_mm_flush_tlb_all(task->mm);
     mapped = map_ret == 0;
 
-    if (mapped && vma_insert(mgr, new_vma) == 0) {
-        inserted = true;
-        new_vma = NULL;
+    if (mapped) {
+        spin_lock(&mgr->lock);
+        vma = vma_find(mgr, trampoline_start);
+        if (vma) {
+            inserted = vma->vm_start == trampoline_start &&
+                       vma->vm_end == trampoline_end &&
+                       (vma->vm_flags & (VMA_READ | VMA_EXEC)) ==
+                           (VMA_READ | VMA_EXEC) &&
+                       !(vma->vm_flags & VMA_WRITE);
+        } else if (!vma_find_intersection(mgr, trampoline_start,
+                                          trampoline_end) &&
+                   vma_insert(mgr, new_vma) == 0) {
+            inserted = true;
+            new_vma = NULL;
+        }
+        spin_unlock(&mgr->lock);
     }
-    spin_unlock(&mgr->lock);
 
     if (!inserted && mapped) {
         unmap_page_range_mm_batched(task->mm, trampoline_start, PAGE_SIZE);

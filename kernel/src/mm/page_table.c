@@ -97,7 +97,7 @@ static void unmap_release_addrs(uint64_t *pages, size_t page_count,
 
 static bool unmap_release_can_wait(void) {
     task_t *self = current_task;
-    return arch_interrupt_enabled() && (!self || self->preempt_count == 0);
+    return !self || self->preempt_count == 0;
 }
 
 static void unmap_defer_release(unmap_release_batch_t *batch) {

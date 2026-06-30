@@ -7,6 +7,7 @@ typedef struct mountfd_ctx {
     struct vfs_mount *mnt;
     struct vfs_dentry *root;
     bool detached;
+    bool attached;
 } mountfd_ctx_t;
 
 typedef struct mountfdfs_info {
@@ -51,6 +52,16 @@ int mountfd_get_path(struct vfs_file *file, struct vfs_path *path) {
     return vfs_path_set(path, ctx->mnt, ctx->root) ? 0 : -ENOENT;
 }
 
+void mountfd_mark_attached(struct vfs_file *file) {
+    mountfd_ctx_t *ctx;
+
+    ctx = mountfd_file_ctx(file);
+    if (!ctx || !ctx->detached)
+        return;
+
+    ctx->attached = true;
+}
+
 static loff_t mountfd_llseek(struct vfs_file *file, loff_t offset, int whence) {
     (void)file;
     (void)offset;
@@ -91,9 +102,9 @@ static int mountfd_release(struct vfs_inode *inode, struct vfs_file *file) {
         return 0;
 
     if (ctx->mnt) {
-        if (ctx->detached)
+        if (ctx->detached && !ctx->attached)
             vfs_put_mount_tree(ctx->mnt);
-        else
+        else if (!ctx->detached)
             vfs_mntput(ctx->mnt);
     }
     if (ctx->root)

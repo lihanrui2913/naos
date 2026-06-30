@@ -65,7 +65,7 @@ typedef uint64_t (*special_syscall_handle_t)(struct pt_regs *regs,
 
 extern syscall_handle_t syscall_handlers[MAX_SYSCALL_NUM];
 
-static inline uint64_t dummy_syscall_handler() { return 0; }
+static inline uint64_t dummy_syscall_handler() { return (uint64_t)0; }
 
 void syscall_handler_init();
 void loongarch64_do_syscall(struct pt_regs *frame);

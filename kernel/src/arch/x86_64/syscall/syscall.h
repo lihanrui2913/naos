@@ -73,6 +73,6 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp);
 
 void syscall_init();
 
-static inline uint64_t dummy_syscall_handler() { return 0; }
+static inline uint64_t dummy_syscall_handler() { return (uint64_t)0; }
 
 void syscall_handler_init();

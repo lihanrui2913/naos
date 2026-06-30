@@ -571,29 +571,7 @@ uint64_t unmap_page_range_mm_locked(task_mm_info_t *mm, uint64_t vaddr,
 }
 
 void unmap_page_range_mm(task_mm_info_t *mm, uint64_t vaddr, uint64_t size) {
-    if (!mm)
-        return;
-
-    uint64_t unmapped = 0;
-    uint64_t end = vaddr + size;
-    unmap_release_batch_t batch = {
-        .mm = mm,
-        .flush_start = vaddr,
-        .flush_end = end,
-    };
-
-    for (uint64_t va = vaddr; va < end;) {
-        va = unmap_page_range_mm_locked(mm, va, end, &batch, &unmapped);
-        if (batch.page_count >= UNMAP_RELEASE_BATCH_MAX) {
-            unmap_release_batch_commit(&batch);
-            batch.mm = mm;
-            batch.flush_start = vaddr;
-            batch.flush_end = end;
-        }
-    }
-
-    unmap_release_batch_commit(&batch);
-    task_mm_account_unmapped_pages(mm, unmapped);
+    unmap_page_range_mm_batched(mm, vaddr, size);
 }
 
 void unmap_page_range_mm_batched(task_mm_info_t *mm, uint64_t vaddr,

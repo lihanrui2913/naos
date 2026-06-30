@@ -375,6 +375,8 @@ void generic_interrupt_table_init_early() {
 }
 
 void x64_do_irq(struct pt_regs *regs, uint64_t irq_num) {
+    x64_irq_context_enter();
     do_irq(regs, irq_num);
+    x64_irq_context_exit();
     x64_handle_signal_on_user_return(regs);
 }

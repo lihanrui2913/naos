@@ -13,6 +13,7 @@ typedef struct x64_cpu_local {
     task_t *task_ptr;
     uint32_t cpu_id;
     uint32_t lapic_id;
+    uint32_t irq_nesting;
 } x64_cpu_local_t;
 
 x64_cpu_local_t *x64_get_cpu_local(void);
@@ -20,3 +21,6 @@ x64_cpu_local_t *x64_get_cpu_local_by_id(uint32_t cpu_id);
 void x64_cpu_local_init(uint32_t cpu_id, uint32_t lapic_id);
 void x64_cpu_local_set_current(task_t *current);
 uint32_t x64_current_cpu_id(void);
+void x64_irq_context_enter(void);
+void x64_irq_context_exit(void);
+bool x64_in_irq_context(void);

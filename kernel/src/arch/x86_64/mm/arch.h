@@ -40,3 +40,4 @@ uint64_t get_arch_page_table_flags(uint64_t flags);
 uint64_t arch_page_table_levels();
 void arch_flush_tlb(uint64_t vaddr);
 void arch_flush_tlb_all();
+void x64_tlb_note_loaded_pgdir(void);

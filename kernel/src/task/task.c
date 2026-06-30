@@ -2283,7 +2283,7 @@ void task_exit_inner(task_t *task, int64_t code) {
             sigchld_info._sifields._sigchld._stime = 0;
             if (code >= 128) {
                 sigchld_info.si_code = CLD_KILLED;
-                sigchld_info._sifields._sigchld._status = code - 128;
+                sigchld_info._sifields._sigchld._status = code;
             } else {
                 sigchld_info.si_code = CLD_EXITED;
                 sigchld_info._sifields._sigchld._status = code;
@@ -2574,14 +2574,11 @@ void schedule(uint64_t sched_flags) {
     next->last_sched_in_ns = now_ns;
     sched_update_preempt_deadline(cpu_id, next, now_ns);
 
-    if (prev->mm != next->mm) {
-        task_mm_mark_cpu_active(next->mm, cpu_id);
-    }
-
     arch_set_current(next);
     switch_mm(prev, next);
     if (prev->mm != next->mm) {
         task_mm_mark_cpu_inactive(prev->mm, cpu_id);
+        task_mm_mark_cpu_active(next->mm, cpu_id);
     }
     switch_to(prev, next);
 

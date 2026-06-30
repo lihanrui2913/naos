@@ -634,7 +634,8 @@ static int devtmpfs_setattr(struct vfs_dentry *dentry,
         return -EINVAL;
 
     if (stat->mode)
-        dentry->d_inode->i_mode = stat->mode;
+        dentry->d_inode->i_mode =
+            (dentry->d_inode->i_mode & S_IFMT) | (stat->mode & 07777);
     dentry->d_inode->i_uid = stat->uid;
     dentry->d_inode->i_gid = stat->gid;
     if (!S_ISDIR(dentry->d_inode->i_mode) &&
@@ -1533,10 +1534,6 @@ void setup_console_symlinks() {
     ttydev_bind_path(kernel_session, "/dev/tty1");
 
     vfs_iput(tty_node);
-
-    vfs_symlinkat("/proc/self/fd/0", AT_FDCWD, "/dev/stdin", true);
-    vfs_symlinkat("/proc/self/fd/1", AT_FDCWD, "/dev/stdout", true);
-    vfs_symlinkat("/proc/self/fd/2", AT_FDCWD, "/dev/stderr", true);
 }
 
 ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
