@@ -1004,6 +1004,13 @@ done:
                  (self->signal && self->signal->signal != 0)))
         task_signal(regs);
 
+    /*
+     * Same-CPU wakeups only set need_resched on the current task. Consume it
+     * before returning to userspace so we don't wait for an unrelated IRQ to
+     * drive the handoff.
+     */
+    sched_resched_if_needed();
+
     if (idx != SYS_RT_SIGRETURN) {
         regs->rcx = regs->rip;
         regs->r11 = regs->rflags;

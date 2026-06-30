@@ -2,6 +2,49 @@
 #include <task/task.h>
 #include <libs/string_builder.h>
 
+typedef struct procfs_mount_visit {
+    struct vfs_mount *mnt;
+    struct procfs_mount_visit *next;
+} procfs_mount_visit_t;
+
+static bool procfs_mount_seen(procfs_mount_visit_t *visited,
+                              struct vfs_mount *mnt) {
+    procfs_mount_visit_t *it;
+
+    for (it = visited; it; it = it->next) {
+        if (it->mnt == mnt)
+            return true;
+    }
+
+    return false;
+}
+
+static bool procfs_mount_visit_add(procfs_mount_visit_t **visited,
+                                   struct vfs_mount *mnt) {
+    procfs_mount_visit_t *node;
+
+    if (!visited || !mnt)
+        return false;
+
+    node = calloc(1, sizeof(*node));
+    if (!node)
+        return false;
+
+    node->mnt = mnt;
+    node->next = *visited;
+    *visited = node;
+    return true;
+}
+
+static void procfs_mount_visit_free(procfs_mount_visit_t *visited) {
+    while (visited) {
+        procfs_mount_visit_t *next = visited->next;
+
+        free(visited);
+        visited = next;
+    }
+}
+
 static void procfs_append_mount_opts(string_builder_t *builder,
                                      unsigned long flags) {
     string_builder_append(builder, "%s",
@@ -88,16 +131,45 @@ static bool procfs_append_single_mount(string_builder_t *builder,
 static bool procfs_append_mount_tree(string_builder_t *builder,
                                      struct vfs_mount *mnt,
                                      const struct vfs_path *ns_root,
-                                     bool mountinfo) {
+                                     bool mountinfo,
+                                     procfs_mount_visit_t **visited) {
     struct vfs_mount *child, *tmp;
+    struct vfs_mount **extra_children = NULL;
+    size_t extra_count = 0;
+    size_t i;
+
+    if (!builder || !mnt || !ns_root || !visited)
+        return false;
+    if (procfs_mount_seen(*visited, mnt))
+        return true;
+    if (!procfs_mount_visit_add(visited, mnt))
+        return false;
 
     if (!procfs_append_single_mount(builder, mnt, ns_root, mountinfo))
         return false;
 
     llist_for_each(child, tmp, &mnt->mnt_mounts, mnt_child) {
-        if (!procfs_append_mount_tree(builder, child, ns_root, mountinfo))
+        if (!procfs_append_mount_tree(builder, child, ns_root, mountinfo,
+                                      visited))
             return false;
     }
+
+    if (vfs_mount_collect_missing_direct_children(mnt, &extra_children,
+                                                  &extra_count) < 0)
+        return true;
+
+    for (i = 0; i < extra_count; ++i) {
+        child = extra_children[i];
+        if (!child)
+            continue;
+        if (!procfs_append_mount_tree(builder, child, ns_root, mountinfo,
+                                      visited)) {
+            free(extra_children);
+            return false;
+        }
+    }
+
+    free(extra_children);
     return true;
 }
 
@@ -106,6 +178,7 @@ char *procfs_generate_mount_table(task_t *task, bool mountinfo,
     string_builder_t *builder = create_string_builder(512);
     struct vfs_mount *root;
     struct vfs_path ns_root = {0};
+    procfs_mount_visit_t *visited = NULL;
 
     if (!builder) {
         *content_len = 0;
@@ -125,12 +198,16 @@ char *procfs_generate_mount_table(task_t *task, bool mountinfo,
 
     ns_root.mnt = root;
     ns_root.dentry = root->mnt_root;
-    if (!procfs_append_mount_tree(builder, root, &ns_root, mountinfo)) {
+    if (!procfs_append_mount_tree(builder, root, &ns_root, mountinfo,
+                                  &visited)) {
+        procfs_mount_visit_free(visited);
         free(builder->data);
         free(builder);
         *content_len = 0;
         return NULL;
     }
+
+    procfs_mount_visit_free(visited);
 
     *content_len = builder->size;
     char *data = builder->data;

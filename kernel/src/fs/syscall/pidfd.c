@@ -166,16 +166,21 @@ static long pidfd_ioctl(struct vfs_file *file, unsigned long cmd,
         return procfs_create_nsfd_for_task(task, CLONE_NEWUSER);
     case PIDFD_GET_INFO: {
         pidfd_info_t info;
+        uint64_t request_mask;
+
         if (copy_from_user(&info, (const void *)arg, sizeof(info)))
             return -EFAULT;
-        if (info.mask & PIDFD_INFO_PID) {
+        request_mask = info.mask;
+        memset(&info, 0, sizeof(info));
+
+        if (request_mask & PIDFD_INFO_PID) {
             info.pid = task->pid;
             info.tgid = task->tgid;
             info.ppid = task->parent ? task->parent->pid : 0;
         }
-        if (info.mask & PIDFD_INFO_CGROUPID)
+        if (request_mask & PIDFD_INFO_CGROUPID)
             info.cgroupid = 0;
-        if (info.mask & PIDFD_INFO_CREDS) {
+        if (request_mask & PIDFD_INFO_CREDS) {
             info.ruid = task->uid;
             info.rgid = task->gid;
             info.euid = task->euid;
@@ -187,6 +192,24 @@ static long pidfd_ioctl(struct vfs_file *file, unsigned long cmd,
         }
         info.exit_code = ctx->exited ? ctx->exit_status : 0;
         info.coredump_mask = 0;
+        info.coredump_signal = 0;
+        info.coredump_code = 0;
+        info.coredump_pad = 0;
+        info.supported_mask =
+            PIDFD_INFO_PID | PIDFD_INFO_CREDS | PIDFD_INFO_CGROUPID |
+            PIDFD_INFO_EXIT | PIDFD_INFO_COREDUMP | PIDFD_INFO_SUPPORTED_MASK |
+            PIDFD_INFO_COREDUMP_SIGNAL | PIDFD_INFO_COREDUMP_CODE;
+        info.mask = PIDFD_INFO_PID | PIDFD_INFO_CREDS;
+        if (request_mask & PIDFD_INFO_SUPPORTED_MASK)
+            info.mask |= PIDFD_INFO_SUPPORTED_MASK;
+        if (request_mask & PIDFD_INFO_EXIT)
+            info.mask |= PIDFD_INFO_EXIT;
+        if (request_mask & PIDFD_INFO_COREDUMP)
+            info.mask |= PIDFD_INFO_COREDUMP;
+        if (request_mask & PIDFD_INFO_COREDUMP_SIGNAL)
+            info.mask |= PIDFD_INFO_COREDUMP_SIGNAL;
+        if (request_mask & PIDFD_INFO_COREDUMP_CODE)
+            info.mask |= PIDFD_INFO_COREDUMP_CODE;
         if (copy_to_user((void *)arg, &info, sizeof(info)))
             return -EFAULT;
         return 0;

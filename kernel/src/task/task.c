@@ -1626,6 +1626,9 @@ void task_detach_children_from_parent(task_t *owner) {
 bool task_initialized = false;
 bool can_schedule = false;
 
+#define TASK_CAP_LAST_CAP 40U
+#define TASK_CAP_FULL_MASK ((UINT64_C(1) << (TASK_CAP_LAST_CAP + 1U)) - 1U)
+
 extern int unix_socket_fsid;
 extern int unix_accept_fsid;
 
@@ -1734,6 +1737,13 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task->sgid = 0;
     task->fsuid = 0;
     task->fsgid = 0;
+    task->cap_effective = TASK_CAP_FULL_MASK;
+    task->cap_permitted = TASK_CAP_FULL_MASK;
+    task->cap_inheritable = 0;
+    task->cap_bounding = TASK_CAP_FULL_MASK;
+    task->cap_ambient = 0;
+    task->securebits = 0;
+    task->keep_caps = false;
     task->pgid = 0;
     task->tgid = task->pid;
     task->sid = 0;
@@ -2143,7 +2153,6 @@ void task_unblock(task_t *task, int reason) {
 
     bool irq_state = arch_interrupt_enabled();
     bool cancel_timeout = false;
-    bool should_wake = false;
 
     arch_disable_interrupt();
 
@@ -2168,7 +2177,6 @@ void task_unblock(task_t *task, int reason) {
     task->blocking_reason = NULL;
     cancel_timeout = task->force_wakeup_ns != UINT64_MAX;
     task->wake_pending = false;
-    should_wake = true;
 
     spin_unlock(&task->block_lock);
 
@@ -2180,8 +2188,7 @@ void task_unblock(task_t *task, int reason) {
         spin_unlock(&task->block_lock);
     }
 
-    if (should_wake)
-        add_sched_entity_wakeup(task, &schedulers[task->cpu_id]);
+    add_sched_entity_wakeup(task, &schedulers[task->cpu_id]);
 
 ret:
     if (irq_state) {
@@ -2231,6 +2238,7 @@ void task_exit_inner(task_t *task, int64_t code) {
     task->current_state = TASK_DIED;
     task->state = TASK_DIED;
     task->status = (uint64_t)code;
+    task->exited_by_signal = code >= 128 && code <= 128 + 64;
 
     futex_on_exit_task(task);
     pidfd_on_task_exit(task);
@@ -2281,9 +2289,9 @@ void task_exit_inner(task_t *task, int64_t code) {
             sigchld_info._sifields._sigchld._uid = task->uid;
             sigchld_info._sifields._sigchld._utime = 0;
             sigchld_info._sifields._sigchld._stime = 0;
-            if (code >= 128) {
+            if (task->exited_by_signal) {
                 sigchld_info.si_code = CLD_KILLED;
-                sigchld_info._sifields._sigchld._status = code;
+                sigchld_info._sifields._sigchld._status = code - 128;
             } else {
                 sigchld_info.si_code = CLD_EXITED;
                 sigchld_info._sifields._sigchld._status = code;
@@ -2323,6 +2331,8 @@ uint64_t task_exit_thread(int64_t code) {
     task_exit_inner(self, code);
 
     can_schedule = true;
+
+    schedule(0);
 
     while (1) {
         arch_enable_interrupt();
@@ -2380,6 +2390,8 @@ uint64_t task_exit(int64_t code) {
     task_exit_inner(self, code);
 
     can_schedule = true;
+
+    schedule(0);
 
     while (1) {
         arch_enable_interrupt();

@@ -296,6 +296,14 @@ static task_key_object_t *task_key_object_resolve_locked(task_t *task,
     return task_key_lookup_locked(serial);
 }
 
+static task_key_object_t *
+task_key_object_resolve_for_link_locked(task_t *task, key_serial_t serial) {
+    if (serial < 0)
+        return (task_key_object_t *)task_keyring_resolve_locked(task, serial,
+                                                                true);
+    return task_key_lookup_locked(serial);
+}
+
 static task_key_t *task_keyring_find_key_locked(task_keyring_t *ring,
                                                 const char *type,
                                                 const char *description,
@@ -744,10 +752,10 @@ uint64_t sys_keyctl(int cmd, unsigned long arg2, unsigned long arg3,
     case KEYCTL_LINK:
     case KEYCTL_UNLINK:
         spin_lock(&task_keyring_lock);
-        object = task_key_object_resolve_locked(current_task,
-                                                (key_serial_t)arg2, false);
-        target_object = task_key_object_resolve_locked(
-            current_task, (key_serial_t)arg3, false);
+        object = task_key_object_resolve_for_link_locked(current_task,
+                                                         (key_serial_t)arg2);
+        target_object = task_key_object_resolve_for_link_locked(
+            current_task, (key_serial_t)arg3);
         if (!object || !target_object ||
             target_object->type != TASK_KEY_OBJECT_KEYRING) {
             spin_unlock(&task_keyring_lock);

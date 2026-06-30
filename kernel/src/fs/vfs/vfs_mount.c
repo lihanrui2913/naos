@@ -113,9 +113,9 @@ vfs_find_child_mount_on_aliases(struct vfs_mount *parent,
     return best;
 }
 
-static int vfs_collect_missing_direct_child_mounts(struct vfs_mount *src_parent,
-                                                   struct vfs_mount ***out,
-                                                   size_t *out_count) {
+int vfs_mount_collect_missing_direct_children(struct vfs_mount *src_parent,
+                                              struct vfs_mount ***out,
+                                              size_t *out_count) {
     struct vfs_mount *missing[64];
     struct vfs_dentry *root_alias;
     struct vfs_dentry *tmp_root_alias;
@@ -486,7 +486,7 @@ vfs_count_complete_mount_tree_nodes(const struct vfs_mount *root) {
         count += vfs_count_complete_mount_tree_nodes(child);
     }
 
-    if (vfs_collect_missing_direct_child_mounts(
+    if (vfs_mount_collect_missing_direct_children(
             (struct vfs_mount *)root, &extra_children, &extra_count) < 0) {
         return count;
     }
@@ -1508,8 +1508,8 @@ static int vfs_clone_bind_mount_children(struct vfs_mount *src_base,
             return ret;
     }
 
-    ret = vfs_collect_missing_direct_child_mounts(src_parent, &extra_children,
-                                                  &extra_count);
+    ret = vfs_mount_collect_missing_direct_children(src_parent, &extra_children,
+                                                    &extra_count);
     if (ret < 0)
         return ret;
 
@@ -1670,8 +1670,8 @@ static int vfs_clone_mount_children(struct vfs_mount *src_parent,
             return ret;
     }
 
-    ret = vfs_collect_missing_direct_child_mounts(src_parent, &extra_children,
-                                                  &extra_count);
+    ret = vfs_mount_collect_missing_direct_children(src_parent, &extra_children,
+                                                    &extra_count);
     if (ret < 0)
         return ret;
 

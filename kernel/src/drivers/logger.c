@@ -8,7 +8,8 @@
 // util-linux dmesg defaults to /dev/kmsg. Keep records in Linux kmsg order.
 #define KMSG_TEXT_BUFFER_SIZE (256 * 1024)
 #define KMSG_RECORD_CAPACITY 1024
-#define KMSG_MAX_RECORD_TEXT (sizeof(buf) - 1)
+#define KMSG_PRINTK_BUFFER_SIZE 4096
+#define KMSG_MAX_RECORD_TEXT (KMSG_PRINTK_BUFFER_SIZE - 1)
 
 #define SYSLOG_ACTION_CLOSE 0
 #define SYSLOG_ACTION_OPEN 1
@@ -31,7 +32,7 @@
 #define SMALL 64   // 十进制以上数字显示小写字母
 #define SIGN 128   // 显示符号位
 
-char buf[4096];
+char buf[KMSG_PRINTK_BUFFER_SIZE];
 
 typedef struct kmsg_record {
     uint64_t seq;

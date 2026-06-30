@@ -2,6 +2,10 @@
 #include <task/ns.h>
 #include <task/task.h>
 
+#define PROC_SYS_KERNEL_CAP_LAST_CAP "40\n"
+#define PROC_SYS_KERNEL_THREADS_MAX "629145\n"
+#define PROC_SYS_FS_NR_OPEN "1048576\n"
+
 static const char *proc_sys_kernel_uts_value(size_t *len_out, bool domainname) {
     task_t *task = current_task;
     task_uts_namespace_t *uts_ns =
@@ -120,6 +124,30 @@ size_t proc_sys_kernel_printk_read(proc_handle_t *handle, void *addr,
     return proc_sys_kernel_const_read("4\t4\t1\t7\n", addr, offset, size);
 }
 
+size_t proc_sys_kernel_cap_last_cap_stat(proc_handle_t *handle) {
+    (void)handle;
+    return strlen(PROC_SYS_KERNEL_CAP_LAST_CAP);
+}
+
+size_t proc_sys_kernel_cap_last_cap_read(proc_handle_t *handle, void *addr,
+                                         size_t offset, size_t size) {
+    (void)handle;
+    return proc_sys_kernel_const_read(PROC_SYS_KERNEL_CAP_LAST_CAP, addr,
+                                      offset, size);
+}
+
+size_t proc_sys_kernel_threads_max_stat(proc_handle_t *handle) {
+    (void)handle;
+    return strlen(PROC_SYS_KERNEL_THREADS_MAX);
+}
+
+size_t proc_sys_kernel_threads_max_read(proc_handle_t *handle, void *addr,
+                                        size_t offset, size_t size) {
+    (void)handle;
+    return proc_sys_kernel_const_read(PROC_SYS_KERNEL_THREADS_MAX, addr, offset,
+                                      size);
+}
+
 size_t proc_sys_kernel_hostname_stat(proc_handle_t *handle) {
     size_t len = 0;
 
@@ -159,4 +187,15 @@ ssize_t proc_sys_kernel_domainname_write(proc_handle_t *handle,
                                          size_t size) {
     (void)handle;
     return proc_sys_kernel_uts_write(addr, offset, size, true);
+}
+
+size_t proc_sys_fs_nr_open_stat(proc_handle_t *handle) {
+    (void)handle;
+    return strlen(PROC_SYS_FS_NR_OPEN);
+}
+
+size_t proc_sys_fs_nr_open_read(proc_handle_t *handle, void *addr,
+                                size_t offset, size_t size) {
+    (void)handle;
+    return proc_sys_kernel_const_read(PROC_SYS_FS_NR_OPEN, addr, offset, size);
 }

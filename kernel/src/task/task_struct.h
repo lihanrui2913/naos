@@ -344,6 +344,13 @@ typedef struct task {
     int64_t sgid;
     int64_t fsuid;
     int64_t fsgid;
+    uint64_t cap_effective;
+    uint64_t cap_permitted;
+    uint64_t cap_inheritable;
+    uint64_t cap_bounding;
+    uint64_t cap_ambient;
+    uint32_t securebits;
+    bool keep_caps;
     int64_t pgid;
     int64_t tgid;
     int64_t sid;
@@ -433,4 +440,5 @@ typedef struct task {
     uint32_t tick_work_queue_id;
     bool timeout_queued;
     bool signal_timer_queued;
+    bool exited_by_signal;
 } task_t;

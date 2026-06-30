@@ -968,6 +968,9 @@ int vfs_do_remount(int dfd, const char *pathname, unsigned long mnt_flags);
 int vfs_do_move_mount(int from_dfd, const char *from_pathname, int to_dfd,
                       const char *to_pathname);
 int vfs_do_umount(int dfd, const char *pathname, int flags);
+int vfs_mount_collect_missing_direct_children(struct vfs_mount *src_parent,
+                                              struct vfs_mount ***out,
+                                              size_t *out_count);
 
 /**
  * Syscall-facing helpers that translate fd numbers into VFS file operations.

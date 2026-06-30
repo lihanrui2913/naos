@@ -357,14 +357,6 @@ static int vfs_open_from_root(struct vfs_path *start, struct vfs_path *root,
                 ret = -EOPNOTSUPP;
                 goto out;
             }
-            if (streq(name, "inaccessible") ||
-                streq(name, "/run/systemd/inaccessible")) {
-                printk("vfs_openat: mkdir via openat path='%s' parent_ino=%llu "
-                       "mode=%#o flags=%#llx\n",
-                       name, dir ? (unsigned long long)dir->i_ino : 0ULL,
-                       (unsigned)local_how.mode,
-                       (unsigned long long)local_how.flags);
-            }
             ret = dir->i_op->mkdir(dir, dentry, (umode_t)local_how.mode);
         } else {
             if (!dir->i_op || !dir->i_op->create) {

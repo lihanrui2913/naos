@@ -330,6 +330,34 @@ size_t sys_setitimer(int which, struct itimerval *value, struct itimerval *old);
 #define PR_CAP_AMBIENT_LOWER 3
 #define PR_CAP_AMBIENT_CLEAR_ALL 4
 
+#define SECURE_NOROOT 0
+#define SECURE_NOROOT_LOCKED 1
+#define SECURE_NO_SETUID_FIXUP 2
+#define SECURE_NO_SETUID_FIXUP_LOCKED 3
+#define SECURE_KEEP_CAPS 4
+#define SECURE_KEEP_CAPS_LOCKED 5
+#define SECURE_NO_CAP_AMBIENT_RAISE 6
+#define SECURE_NO_CAP_AMBIENT_RAISE_LOCKED 7
+#define SECURE_EXEC_RESTRICT_FILE 8
+#define SECURE_EXEC_RESTRICT_FILE_LOCKED 9
+#define SECURE_EXEC_DENY_INTERACTIVE 10
+#define SECURE_EXEC_DENY_INTERACTIVE_LOCKED 11
+
+#define SECBIT(bit) (1U << (bit))
+#define SECBIT_NOROOT SECBIT(SECURE_NOROOT)
+#define SECBIT_NOROOT_LOCKED SECBIT(SECURE_NOROOT_LOCKED)
+#define SECBIT_NO_SETUID_FIXUP SECBIT(SECURE_NO_SETUID_FIXUP)
+#define SECBIT_NO_SETUID_FIXUP_LOCKED SECBIT(SECURE_NO_SETUID_FIXUP_LOCKED)
+#define SECBIT_KEEP_CAPS SECBIT(SECURE_KEEP_CAPS)
+#define SECBIT_KEEP_CAPS_LOCKED SECBIT(SECURE_KEEP_CAPS_LOCKED)
+#define SECBIT_NO_CAP_AMBIENT_RAISE SECBIT(SECURE_NO_CAP_AMBIENT_RAISE)
+#define SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED                                     \
+    SECBIT(SECURE_NO_CAP_AMBIENT_RAISE_LOCKED)
+
+static inline bool task_keep_caps_enabled(const task_t *task) {
+    return task && (task->keep_caps || (task->securebits & SECBIT_KEEP_CAPS));
+}
+
 #define SECCOMP_MODE_DISABLED 0
 #define SECCOMP_MODE_STRICT 1
 #define SECCOMP_MODE_FILTER 2
@@ -443,6 +471,30 @@ static inline int64_t cred_keep_or_set(int value, int64_t current) {
     return value == -1 ? current : value;
 }
 
+static inline void
+task_cred_update_capabilities_after_uid_change(task_t *task, int64_t old_euid) {
+    if (!task)
+        return;
+
+    if (task->securebits & SECBIT_NO_SETUID_FIXUP) {
+        if (old_euid == 0 && task->euid != 0)
+            task->cap_ambient = 0;
+        return;
+    }
+
+    if (old_euid == 0 && task->euid != 0) {
+        task->cap_effective = 0;
+        if (!task_keep_caps_enabled(task))
+            task->cap_permitted = 0;
+        task->cap_ambient = 0;
+    }
+}
+
+static inline void
+task_cred_update_capabilities_after_gid_change(task_t *task) {
+    (void)task;
+}
+
 /**
  * Linux contract: virtually hang up the caller's controlling terminal.
  * Current kernel: accepts the request as a compatibility no-op. This is enough
@@ -456,13 +508,17 @@ static inline uint64_t sys_vhangup(void) { return 0; }
  * Gaps: Linux capability and permission checks are not implemented.
  */
 static inline uint64_t sys_setuid(uint64_t uid) {
+    int64_t old_euid;
+
     if (uid == (uint64_t)-1)
         return (uint64_t)-EINVAL;
 
+    old_euid = current_task->euid;
     current_task->uid = uid;
     current_task->euid = uid;
     current_task->suid = uid;
     current_task->fsuid = uid;
+    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
     return 0;
 }
 
@@ -512,11 +568,14 @@ static inline uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
  * Gaps: Linux privilege checks are not enforced.
  */
 static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
+    int64_t old_euid = current_task->euid;
+
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
     current_task->suid = cred_keep_or_set(suid, current_task->suid);
     if (euid != -1)
         current_task->fsuid = current_task->euid;
+    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
 
     return 0;
 }
@@ -528,6 +587,7 @@ static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
  */
 static inline uint64_t sys_setreuid(int ruid, int euid) {
     int64_t old_ruid = current_task->uid;
+    int64_t old_euid = current_task->euid;
 
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
@@ -535,6 +595,7 @@ static inline uint64_t sys_setreuid(int ruid, int euid) {
         current_task->fsuid = current_task->euid;
     if (ruid != -1 || (euid != -1 && current_task->euid != old_ruid))
         current_task->suid = current_task->euid;
+    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
 
     return 0;
 }
@@ -575,6 +636,7 @@ static inline uint64_t sys_setresgid(int rgid, int egid, int sgid) {
     current_task->sgid = cred_keep_or_set(sgid, current_task->sgid);
     if (egid != -1)
         current_task->fsgid = current_task->egid;
+    task_cred_update_capabilities_after_gid_change(current_task);
 
     return 0;
 }
@@ -591,6 +653,7 @@ static inline uint64_t sys_setregid(int rgid, int egid) {
         current_task->fsgid = current_task->egid;
     if (rgid != -1 || (egid != -1 && current_task->egid != old_rgid))
         current_task->sgid = current_task->egid;
+    task_cred_update_capabilities_after_gid_change(current_task);
 
     return 0;
 }
@@ -608,6 +671,7 @@ static inline uint64_t sys_setgid(uint64_t gid) {
     current_task->egid = gid;
     current_task->sgid = gid;
     current_task->fsgid = gid;
+    task_cred_update_capabilities_after_gid_change(current_task);
     return 0;
 }
 

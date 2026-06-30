@@ -122,6 +122,12 @@ void procfs_nodes_init() {
                          proc_sys_kernel_tainted_stat, NULL, NULL);
     create_procfs_handle("proc_sys_kernel_printk", proc_sys_kernel_printk_read,
                          NULL, proc_sys_kernel_printk_stat, NULL, NULL);
+    create_procfs_handle("proc_sys_kernel_cap_last_cap",
+                         proc_sys_kernel_cap_last_cap_read, NULL,
+                         proc_sys_kernel_cap_last_cap_stat, NULL, NULL);
+    create_procfs_handle("proc_sys_kernel_threads_max",
+                         proc_sys_kernel_threads_max_read, NULL,
+                         proc_sys_kernel_threads_max_stat, NULL, NULL);
     create_procfs_handle("proc_sys_kernel_hostname",
                          proc_sys_kernel_hostname_read,
                          proc_sys_kernel_hostname_write,
@@ -130,6 +136,8 @@ void procfs_nodes_init() {
                          proc_sys_kernel_domainname_read,
                          proc_sys_kernel_domainname_write,
                          proc_sys_kernel_domainname_stat, NULL, NULL);
+    create_procfs_handle("proc_sys_fs_nr_open", proc_sys_fs_nr_open_read, NULL,
+                         proc_sys_fs_nr_open_stat, NULL, NULL);
     create_procfs_handle("proc_pressure_memory", proc_pressure_memory_read,
                          NULL, proc_pressure_memory_stat, NULL, NULL);
     create_procfs_handle("proc_sysvipc_shm", proc_sysvipc_shm_read, NULL,

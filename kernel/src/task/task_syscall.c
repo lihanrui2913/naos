@@ -1126,6 +1126,8 @@ typedef struct task_user_cap_data {
 #define LINUX_CAPABILITY_VERSION_1 0x19980330
 #define LINUX_CAPABILITY_VERSION_2 0x20071026
 #define LINUX_CAPABILITY_VERSION_3 0x20080522
+#define TASK_CAP_LAST_CAP 40U
+#define TASK_CAP_FULL_MASK ((UINT64_C(1) << (TASK_CAP_LAST_CAP + 1U)) - 1U)
 
 typedef struct task_execve_elf_image {
     uint64_t load_base;
@@ -1179,8 +1181,12 @@ static task_execve_creds_t task_execve_prepare_creds(task_t *task,
 
 static void task_execve_commit_creds(task_t *task,
                                      const task_execve_creds_t *creds) {
+    bool dropped_root;
+
     if (!task || !creds)
         return;
+
+    dropped_root = task->euid == 0 && creds->euid != 0;
 
     task->uid = creds->uid;
     task->gid = creds->gid;
@@ -1190,6 +1196,12 @@ static void task_execve_commit_creds(task_t *task,
     task->sgid = creds->sgid;
     task->fsuid = creds->fsuid;
     task->fsgid = creds->fsgid;
+
+    if (dropped_root && !task->keep_caps) {
+        task->cap_effective = 0;
+        task->cap_permitted = 0;
+        task->cap_ambient = 0;
+    }
 }
 
 static int task_capability_u32_count(uint32_t version) {
@@ -1208,6 +1220,44 @@ static bool task_capability_pid_matches(int32_t pid) {
     if (!current_task)
         return false;
     return pid == 0 || pid == (int32_t)current_task->pid;
+}
+
+static inline uint64_t task_capability_mask(void) { return TASK_CAP_FULL_MASK; }
+
+static inline bool task_capability_valid(unsigned long cap) {
+    return cap <= TASK_CAP_LAST_CAP;
+}
+
+static inline uint64_t task_capability_bit(unsigned long cap) {
+    return UINT64_C(1) << cap;
+}
+
+static inline void task_capability_clear_root_ambient(task_t *task) {
+    if (!task)
+        return;
+    task->cap_ambient = 0;
+}
+
+static int task_capability_apply_sets(task_t *task, uint64_t effective,
+                                      uint64_t permitted,
+                                      uint64_t inheritable) {
+    uint64_t mask = task_capability_mask();
+
+    if (!task)
+        return -EINVAL;
+
+    effective &= mask;
+    permitted &= mask;
+    inheritable &= mask;
+
+    if ((effective & ~permitted) != 0)
+        return -EPERM;
+
+    task->cap_effective = effective;
+    task->cap_permitted = permitted;
+    task->cap_inheritable = inheritable;
+    task->cap_ambient &= permitted & inheritable;
+    return 0;
 }
 
 uint64_t sys_capget(void *header_user, void *data_user) {
@@ -1229,6 +1279,19 @@ uint64_t sys_capget(void *header_user, void *data_user) {
         return 0;
 
     task_user_cap_data_t data[2] = {0};
+    uint64_t effective = current_task ? current_task->cap_effective : 0;
+    uint64_t permitted = current_task ? current_task->cap_permitted : 0;
+    uint64_t inheritable = current_task ? current_task->cap_inheritable : 0;
+
+    data[0].effective = (uint32_t)(effective & UINT32_MAX);
+    data[0].permitted = (uint32_t)(permitted & UINT32_MAX);
+    data[0].inheritable = (uint32_t)(inheritable & UINT32_MAX);
+    if (u32_count > 1) {
+        data[1].effective = (uint32_t)(effective >> 32);
+        data[1].permitted = (uint32_t)(permitted >> 32);
+        data[1].inheritable = (uint32_t)(inheritable >> 32);
+    }
+
     if (copy_to_user(data_user, data, sizeof(data[0]) * (size_t)u32_count))
         return (uint64_t)-EFAULT;
     return 0;
@@ -1255,12 +1318,18 @@ uint64_t sys_capset(void *header_user, const void *data_user) {
     if (copy_from_user(data, data_user, sizeof(data[0]) * (size_t)u32_count))
         return (uint64_t)-EFAULT;
 
-    for (int i = 0; i < u32_count; i++) {
-        if (data[i].effective || data[i].permitted || data[i].inheritable)
-            return (uint64_t)-EPERM;
+    uint64_t effective = (uint64_t)data[0].effective;
+    uint64_t permitted = (uint64_t)data[0].permitted;
+    uint64_t inheritable = (uint64_t)data[0].inheritable;
+
+    if (u32_count > 1) {
+        effective |= ((uint64_t)data[1].effective) << 32;
+        permitted |= ((uint64_t)data[1].permitted) << 32;
+        inheritable |= ((uint64_t)data[1].inheritable) << 32;
     }
 
-    return 0;
+    return (uint64_t)task_capability_apply_sets(current_task, effective,
+                                                permitted, inheritable);
 }
 
 static uint64_t simple_rand() {
@@ -2840,7 +2909,7 @@ uint64_t sys_wait4(int pid, int *status, uint64_t options,
         int ret_status = 0;
 
         if (status) {
-            if (target->status < 128) {
+            if (!target->exited_by_signal) {
                 ret_status = ((target->status & 0xff) << 8);
             } else {
                 int sig = target->status - 128;
@@ -2877,6 +2946,7 @@ uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
     int match_idtype = idtype;
     uint64_t match_id = id;
     uint64_t wait_parent_pid = task_effective_wait_parent_pid(current_task);
+    bool waiting_on_pidfd = false;
 
     if (idtype < P_ALL || idtype > P_PIDFD)
         return -EINVAL;
@@ -2896,6 +2966,7 @@ uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
             return (uint64_t)pidfd_ret;
         }
         match_idtype = P_PID;
+        waiting_on_pidfd = true;
     }
 
     bool has_children = false;
@@ -2908,7 +2979,7 @@ uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
     has_ptraced =
         wait_has_ptraced_target_waitid(current_task, match_idtype, match_id);
 
-    if (!has_children && !has_ptraced)
+    if (!has_children && !has_ptraced && !waiting_on_pidfd)
         return -ECHILD;
 
     while (1) {
@@ -3076,9 +3147,9 @@ uint64_t sys_waitid(int idtype, uint64_t id, siginfo_t *infop, int options,
             info._sifields._sigchld._uid = target->uid;
 
             if (target->state == TASK_DIED) {
-                if (target->status >= 128) {
+                if (target->exited_by_signal) {
                     info.si_code = CLD_KILLED;
-                    info._sifields._sigchld._status = target->status;
+                    info._sifields._sigchld._status = target->status - 128;
                 } else {
                     info.si_code = CLD_EXITED;
                     info._sifields._sigchld._status = target->status;
@@ -3379,6 +3450,13 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     child->sgid = self->sgid;
     child->fsuid = self->fsuid;
     child->fsgid = self->fsgid;
+    child->cap_effective = self->cap_effective;
+    child->cap_permitted = self->cap_permitted;
+    child->cap_inheritable = self->cap_inheritable;
+    child->cap_bounding = self->cap_bounding;
+    child->cap_ambient = self->cap_ambient;
+    child->securebits = self->securebits;
+    child->keep_caps = self->keep_caps;
     child->pgid = self->pgid;
     child->sid = self->sid;
     task_keyring_inherit(child, self);
@@ -3912,28 +3990,49 @@ uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4,
         current_task->parent_death_sig = arg2;
         return 0;
 
+    case PR_GET_KEEPCAPS:
+        return current_task->keep_caps ? 1 : 0;
+
+    case PR_SET_KEEPCAPS:
+        if (arg2 != 0 && arg2 != 1)
+            return (uint64_t)-EINVAL;
+        current_task->keep_caps = arg2 != 0;
+        return 0;
+
+    case PR_CAPBSET_READ:
+        if (!task_capability_valid(arg2))
+            return (uint64_t)-EINVAL;
+        return (current_task->cap_bounding & task_capability_bit(arg2)) ? 1 : 0;
+
+    case PR_CAPBSET_DROP:
+        if (!task_capability_valid(arg2))
+            return (uint64_t)-EINVAL;
+        current_task->cap_bounding &= ~task_capability_bit(arg2);
+        current_task->cap_ambient &= current_task->cap_bounding;
+        return 0;
+
+    case PR_GET_SECUREBITS:
+        return current_task->securebits;
+
     case PR_SET_SECUREBITS:
+        current_task->securebits = (uint32_t)arg2;
         return 0;
 
     case PR_SET_NO_NEW_PRIVS:
-        if (arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0)
+        if (arg2 != 1)
             return (uint64_t)-EINVAL;
         current_task->no_new_privs = true;
         return 0;
 
     case PR_GET_NO_NEW_PRIVS:
-        if (arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0)
-            return (uint64_t)-EINVAL;
         return current_task->no_new_privs ? 1 : 0;
 
     case PR_SET_CHILD_SUBREAPER:
-        if (arg3 != 0 || arg4 != 0 || arg5 != 0)
-            return (uint64_t)-EINVAL;
         current_task->child_subreaper = arg2 != 0;
         return 0;
 
     case PR_GET_CHILD_SUBREAPER:
-        if (!arg2 || arg3 != 0 || arg4 != 0 || arg5 != 0)
+        if (!arg2)
             return (uint64_t)-EINVAL;
         {
             int value = current_task->child_subreaper ? 1 : 0;
@@ -3943,7 +4042,35 @@ uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4,
         return 0;
 
     case PR_CAP_AMBIENT:
-        return 0;
+        switch (arg2) {
+        case PR_CAP_AMBIENT_IS_SET:
+            if (!task_capability_valid(arg3))
+                return (uint64_t)-EINVAL;
+            return (current_task->cap_ambient & task_capability_bit(arg3)) ? 1
+                                                                           : 0;
+        case PR_CAP_AMBIENT_RAISE:
+            if (!task_capability_valid(arg3))
+                return (uint64_t)-EINVAL;
+            if (current_task->securebits & SECBIT_NO_CAP_AMBIENT_RAISE)
+                return (uint64_t)-EPERM;
+            if (!(current_task->cap_permitted & task_capability_bit(arg3)) ||
+                !(current_task->cap_inheritable & task_capability_bit(arg3)))
+                return (uint64_t)-EPERM;
+            current_task->cap_ambient |= task_capability_bit(arg3);
+            return 0;
+        case PR_CAP_AMBIENT_LOWER:
+            if (!task_capability_valid(arg3))
+                return (uint64_t)-EINVAL;
+            current_task->cap_ambient &= ~task_capability_bit(arg3);
+            return 0;
+        case PR_CAP_AMBIENT_CLEAR_ALL:
+            if (arg3 != 0)
+                return (uint64_t)-EINVAL;
+            task_capability_clear_root_ambient(current_task);
+            return 0;
+        default:
+            return (uint64_t)-EINVAL;
+        }
 
     case PR_GET_TIMERSLACK:
         return 0;
@@ -4839,6 +4966,6 @@ uint32_t sys_personality(uint32_t personality) {
 }
 
 int sys_yield() {
-    schedule(0);
+    schedule(SCHED_FLAG_YIELD);
     return 0;
 }

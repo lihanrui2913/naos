@@ -9,6 +9,7 @@ typedef enum procfs_inode_kind {
     PROCFS_INO_ROOT,
     PROCFS_INO_SYS_DIR,
     PROCFS_INO_SYS_KERNEL_DIR,
+    PROCFS_INO_SYS_FS_DIR,
     PROCFS_INO_SYSVIPC_DIR,
     PROCFS_INO_PRESSURE_DIR,
     PROCFS_INO_TASK_DIR,
@@ -1088,9 +1089,14 @@ static int procfs_iterate_shared(struct vfs_file *file,
         break;
     }
     case PROCFS_INO_SYS_DIR:
-        procfs_emit_entry(
-            ctx, &index, "kernel", DT_DIR,
-            procfs_ino_for(PROCFS_INO_SYS_KERNEL_DIR, NULL, -1, "kernel"));
+        if (procfs_emit_entry(ctx, &index, "kernel", DT_DIR,
+                              procfs_ino_for(PROCFS_INO_SYS_KERNEL_DIR, NULL,
+                                             -1, "kernel")) != 0 ||
+            procfs_emit_entry(
+                ctx, &index, "fs", DT_DIR,
+                procfs_ino_for(PROCFS_INO_SYS_FS_DIR, NULL, -1, "fs")) != 0) {
+            break;
+        }
         break;
     case PROCFS_INO_SYS_KERNEL_DIR:
         if (procfs_emit_entry(ctx, &index, "osrelease", DT_REG,
@@ -1113,9 +1119,22 @@ static int procfs_iterate_shared(struct vfs_file *file,
                                              "proc_sys_kernel_tainted")) != 0 ||
             procfs_emit_entry(ctx, &index, "printk", DT_REG,
                               procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
-                                             "proc_sys_kernel_printk")) != 0) {
+                                             "proc_sys_kernel_printk")) != 0 ||
+            procfs_emit_entry(ctx, &index, "cap_last_cap", DT_REG,
+                              procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
+                                             "proc_sys_kernel_cap_last_cap")) !=
+                0 ||
+            procfs_emit_entry(ctx, &index, "threads-max", DT_REG,
+                              procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
+                                             "proc_sys_kernel_threads_max")) !=
+                0) {
             break;
         }
+        break;
+    case PROCFS_INO_SYS_FS_DIR:
+        procfs_emit_entry(
+            ctx, &index, "nr_open", DT_REG,
+            procfs_ino_for(PROCFS_INO_FILE, NULL, -1, "proc_sys_fs_nr_open"));
         break;
     case PROCFS_INO_SYSVIPC_DIR:
         procfs_emit_entry(
@@ -1377,6 +1396,9 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         if (!strcmp(dentry->d_name.name, "kernel")) {
             inode = procfs_new_inode(dir->i_sb, S_IFDIR | 0555,
                                      PROCFS_INO_SYS_KERNEL_DIR, NULL, -1, NULL);
+        } else if (!strcmp(dentry->d_name.name, "fs")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFDIR | 0555,
+                                     PROCFS_INO_SYS_FS_DIR, NULL, -1, NULL);
         }
         break;
     case PROCFS_INO_SYS_KERNEL_DIR:
@@ -1398,6 +1420,18 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         } else if (!strcmp(dentry->d_name.name, "printk")) {
             inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
                                      NULL, -1, "proc_sys_kernel_printk");
+        } else if (!strcmp(dentry->d_name.name, "cap_last_cap")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
+                                     NULL, -1, "proc_sys_kernel_cap_last_cap");
+        } else if (!strcmp(dentry->d_name.name, "threads-max")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
+                                     NULL, -1, "proc_sys_kernel_threads_max");
+        }
+        break;
+    case PROCFS_INO_SYS_FS_DIR:
+        if (!strcmp(dentry->d_name.name, "nr_open")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
+                                     NULL, -1, "proc_sys_fs_nr_open");
         }
         break;
     case PROCFS_INO_SYSVIPC_DIR:

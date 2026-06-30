@@ -3198,6 +3198,15 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         }
     case FIONBIO:
         return 0;
+    case TCGETS2:
+        if (!arg)
+            return -EFAULT;
+        {
+            struct termios2 tio = {0};
+            if (copy_to_user((void *)arg, &tio, sizeof(tio)))
+                return -EFAULT;
+            return 0;
+        }
     case SIOCGSKNS:
         if (!sock->net_ns)
             return -EINVAL;

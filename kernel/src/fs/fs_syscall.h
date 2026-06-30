@@ -402,6 +402,8 @@ enum fsconfig_command {
 #define MOUNT_ATTR_NOATIME 0x00000010
 #define MOUNT_ATTR_STRICTATIME 0x00000020
 #define MOUNT_ATTR_NODIRATIME 0x00000080
+#define MOUNT_ATTR__ATIME 0x00000070
+#define MOUNT_ATTR_IDMAP 0x00100000
 #define MOUNT_ATTR_NOSYMFOLLOW 0x00200000
 #define MOUNT_ATTR_SIZE_VER0 32
 
@@ -726,8 +728,14 @@ uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags);
 #define PIDFD_INFO_CGROUPID (1UL << 2)
 #define PIDFD_INFO_EXIT (1UL << 3)
 #define PIDFD_INFO_COREDUMP (1UL << 4)
+#define PIDFD_INFO_SUPPORTED_MASK (1UL << 5)
+#define PIDFD_INFO_COREDUMP_SIGNAL (1UL << 6)
+#define PIDFD_INFO_COREDUMP_CODE (1UL << 7)
 
 #define PIDFD_INFO_SIZE_VER0 64
+#define PIDFD_INFO_SIZE_VER1 72
+#define PIDFD_INFO_SIZE_VER2 80
+#define PIDFD_INFO_SIZE_VER3 88
 
 #define PIDFD_COREDUMPED (1U << 0)
 #define PIDFD_COREDUMP_SKIP (1U << 1)
@@ -750,7 +758,10 @@ typedef struct pidfd_info {
     uint32_t fsgid;
     int32_t exit_code;
     uint32_t coredump_mask;
-    uint32_t __spare1;
+    uint32_t coredump_signal;
+    uint32_t coredump_code;
+    uint32_t coredump_pad;
+    uint64_t supported_mask;
 } pidfd_info_t;
 
 #define PIDFD_GET_INFO _IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)

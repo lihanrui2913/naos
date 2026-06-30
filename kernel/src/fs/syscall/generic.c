@@ -1002,12 +1002,14 @@ uint64_t sys_mount_setattr(int dfd, const char *path, uint64_t flags,
     static const uint64_t allowed_attr =
         MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV |
         MOUNT_ATTR_NOEXEC | MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME |
-        MOUNT_ATTR_NODIRATIME | MOUNT_ATTR_NOSYMFOLLOW;
+        MOUNT_ATTR_NODIRATIME | MOUNT_ATTR_NOSYMFOLLOW | MOUNT_ATTR__ATIME |
+        MOUNT_ATTR_IDMAP;
     mount_attr_t attr;
     char pathname[512] = {0};
     struct vfs_path target = {0};
     struct vfs_mount *mnt = NULL;
     unsigned long current_flags, new_flags, attr_mask;
+    bool idmap_requested;
     int ret;
 
     if (!attr_user || size < MOUNT_ATTR_SIZE_VER0)
@@ -1016,8 +1018,21 @@ uint64_t sys_mount_setattr(int dfd, const char *path, uint64_t flags,
         return (uint64_t)-EFAULT;
     if ((attr.attr_set | attr.attr_clr) & ~allowed_attr)
         return (uint64_t)-EINVAL;
-    if (attr.userns_fd != (uint64_t)-1 && attr.userns_fd != 0)
+    if (attr.attr_clr & MOUNT_ATTR_IDMAP)
         return (uint64_t)-EINVAL;
+
+    idmap_requested = (attr.attr_set & MOUNT_ATTR_IDMAP) != 0;
+    if (idmap_requested) {
+        if ((int64_t)attr.userns_fd < 0)
+            return (uint64_t)-EINVAL;
+    } else {
+        /*
+         * Linux callers commonly pass negative sentinels such as -EBADF here
+         * when no idmapped mount is requested. Ignore the field unless the
+         * IDMAP attribute is actually set.
+         */
+        attr.userns_fd = (uint64_t)-1;
+    }
 
     if (path && copy_from_user_str(pathname, path, sizeof(pathname)))
         return (uint64_t)-EFAULT;
@@ -1081,6 +1096,12 @@ uint64_t sys_mount_setattr(int dfd, const char *path, uint64_t flags,
             new_flags |= VFS_MNT_NOSYMFOLLOW;
         mnt->mnt_flags = new_flags;
         spin_unlock(&mnt->mnt_lock);
+    }
+
+    if (idmap_requested) {
+        vfs_mntput(mnt);
+        vfs_path_put(&target);
+        return (uint64_t)-EOPNOTSUPP;
     }
 
     if (attr.propagation != 0) {
