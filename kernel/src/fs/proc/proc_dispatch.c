@@ -128,6 +128,9 @@ void procfs_nodes_init() {
     create_procfs_handle("proc_sys_kernel_threads_max",
                          proc_sys_kernel_threads_max_read, NULL,
                          proc_sys_kernel_threads_max_stat, NULL, NULL);
+    create_procfs_handle("proc_sys_kernel_boot_id",
+                         proc_sys_kernel_boot_id_read, NULL,
+                         proc_sys_kernel_boot_id_stat, NULL, NULL);
     create_procfs_handle("proc_sys_kernel_hostname",
                          proc_sys_kernel_hostname_read,
                          proc_sys_kernel_hostname_write,

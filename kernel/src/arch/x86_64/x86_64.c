@@ -1,6 +1,9 @@
 #include <arch/x86_64/x86_64.h>
+#include <drivers/deadline.h>
+#include <task/task.h>
 
 extern void sse_init();
+extern bool task_initialized;
 
 void arch_early_init() {
     close_interrupt;
@@ -74,6 +77,16 @@ void arch_program_timer_deadline_local(uint64_t deadline_ns) {
     uint64_t now = nano_time();
     uint64_t delta_ns = deadline_ns > now ? deadline_ns - now : 1;
     apic_timer_set_interval_ns(delta_ns);
+}
+
+void arch_before_wait_for_interrupt(void) {
+    if (!arch_interrupt_enabled())
+        return;
+    if (!__atomic_load_n(&task_initialized, __ATOMIC_ACQUIRE))
+        return;
+
+    sched_check_wakeup();
+    deadline_reprogram_local();
 }
 
 bool arch_memory_region_usable(uint64_t addr, uint64_t len) {

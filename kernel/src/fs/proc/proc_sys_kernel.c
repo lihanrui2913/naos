@@ -1,10 +1,62 @@
 #include <fs/proc.h>
+#include <boot/boot.h>
+#include <drivers/smbios.h>
 #include <task/ns.h>
 #include <task/task.h>
 
 #define PROC_SYS_KERNEL_CAP_LAST_CAP "40\n"
 #define PROC_SYS_KERNEL_THREADS_MAX "629145\n"
 #define PROC_SYS_FS_NR_OPEN "1048576\n"
+
+static char proc_sys_kernel_boot_id[37];
+static bool proc_sys_kernel_boot_id_ready = false;
+
+static uint64_t proc_sys_kernel_boot_id_next(uint64_t *state) {
+    uint64_t x = *state;
+
+    if (x == 0)
+        x = UINT64_C(0x9e3779b97f4a7c15);
+
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
+
+static void proc_sys_kernel_boot_id_ensure(void) {
+    smbios_system_info_t system_info;
+    uint8_t bytes[16];
+    uint64_t state;
+
+    if (proc_sys_kernel_boot_id_ready)
+        return;
+
+    state = nano_time() ^ (boot_get_boottime() << 32) ^
+            (uint64_t)(uintptr_t)&proc_sys_kernel_boot_id_ready;
+
+    for (size_t i = 0; i < sizeof(bytes); i += sizeof(uint64_t)) {
+        uint64_t value = proc_sys_kernel_boot_id_next(&state);
+        size_t chunk = MIN(sizeof(uint64_t), sizeof(bytes) - i);
+        memcpy(bytes + i, &value, chunk);
+    }
+
+    if (smbios_get_system_info(&system_info) == 0) {
+        for (size_t i = 0; i < sizeof(bytes); i++)
+            bytes[i] ^= system_info.uuid[i];
+    }
+
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    snprintf(proc_sys_kernel_boot_id, sizeof(proc_sys_kernel_boot_id),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+             bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+             bytes[12], bytes[13], bytes[14], bytes[15]);
+    proc_sys_kernel_boot_id_ready = true;
+}
 
 static const char *proc_sys_kernel_uts_value(size_t *len_out, bool domainname) {
     task_t *task = current_task;
@@ -145,6 +197,20 @@ size_t proc_sys_kernel_threads_max_read(proc_handle_t *handle, void *addr,
                                         size_t offset, size_t size) {
     (void)handle;
     return proc_sys_kernel_const_read(PROC_SYS_KERNEL_THREADS_MAX, addr, offset,
+                                      size);
+}
+
+size_t proc_sys_kernel_boot_id_stat(proc_handle_t *handle) {
+    (void)handle;
+    proc_sys_kernel_boot_id_ensure();
+    return strlen(proc_sys_kernel_boot_id);
+}
+
+size_t proc_sys_kernel_boot_id_read(proc_handle_t *handle, void *addr,
+                                    size_t offset, size_t size) {
+    (void)handle;
+    proc_sys_kernel_boot_id_ensure();
+    return proc_sys_kernel_const_read(proc_sys_kernel_boot_id, addr, offset,
                                       size);
 }
 

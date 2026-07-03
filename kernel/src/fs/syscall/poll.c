@@ -139,6 +139,10 @@ static size_t do_poll(struct pollfd *fds, int nfds, uint64_t timeout) {
             vfs_poll_wait_table_cleanup(&table);
             return (size_t)-EINTR;
         }
+        if (vfs_poll_wait_table_seq_changed(&table)) {
+            vfs_poll_wait_table_cleanup(&table);
+            continue;
+        }
 
         if (!infinite_timeout) {
             uint64_t now = nano_time();

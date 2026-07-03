@@ -138,6 +138,9 @@ size_t proc_sys_kernel_cap_last_cap_read(proc_handle_t *handle, void *addr,
 size_t proc_sys_kernel_threads_max_stat(proc_handle_t *handle);
 size_t proc_sys_kernel_threads_max_read(proc_handle_t *handle, void *addr,
                                         size_t offset, size_t size);
+size_t proc_sys_kernel_boot_id_stat(proc_handle_t *handle);
+size_t proc_sys_kernel_boot_id_read(proc_handle_t *handle, void *addr,
+                                    size_t offset, size_t size);
 size_t proc_sys_kernel_hostname_stat(proc_handle_t *handle);
 size_t proc_sys_kernel_hostname_read(proc_handle_t *handle, void *addr,
                                      size_t offset, size_t size);

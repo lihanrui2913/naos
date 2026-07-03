@@ -225,7 +225,8 @@ size_t proc_pmountinfo_stat(proc_handle_t *handle) {
 
 int proc_pmountinfo_poll(proc_handle_t *handle, int events) {
     (void)handle;
-    return (events & EPOLLIN) ? EPOLLIN : 0;
+    (void)events;
+    return 0;
 }
 
 size_t proc_pmountinfo_read(proc_handle_t *handle, void *addr, size_t offset,

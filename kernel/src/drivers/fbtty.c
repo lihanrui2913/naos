@@ -37,6 +37,7 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case TIOCSCTTY:
+        tty_session_attach_current(device);
         return 0;
     case TIOCGPGRP: {
         int pid = device->at_process_group_id;
@@ -48,7 +49,16 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         int pid = 0;
         if (!arg || copy_from_user(&pid, (void *)arg, sizeof(pid)))
             return -EFAULT;
+        tty_session_attach_current(device);
         device->at_process_group_id = pid;
+        return 0;
+    }
+    case TIOCGSID: {
+        int sid = (int)device->at_session_id;
+        if (!sid)
+            return -ENOTTY;
+        if (!arg || copy_to_user((void *)arg, &sid, sizeof(sid)))
+            return -EFAULT;
         return 0;
     }
     case TCGETS:
@@ -147,14 +157,25 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case TIOCNOTTY:
+        tty_session_detach_current(device);
         return 0;
     case TCSETSF:
         if (!arg ||
             copy_from_user(&device->termios, (void *)arg, sizeof(termios)))
             return -EFAULT;
+        tty_input_flush(device);
         return 0;
     case TCFLSH:
         tty_input_flush(device);
+        return 0;
+    case FIONREAD: {
+        int available = tty_input_available(device);
+        if (!arg || copy_to_user((void *)arg, &available, sizeof(available)))
+            return -EFAULT;
+        return 0;
+    }
+    case TCSBRK:
+    case TCSBRKP:
         return 0;
     case TIOCNXCL:
         return 0;
@@ -204,9 +225,9 @@ uint64_t create_session_terminal(tty_t *session) {
     session->termios.c_cflag = CS8 | CREAD | CLOCAL;
     session->termios.c_lflag = ECHO | ICANON | IEXTEN | ISIG;
     session->termios.c_line = 0;
-    session->termios.c_cc[VINTR] = 3; // Ctrl-C
-    session->termios.c_cc[VQUIT] =
-        28; // Ctrl-session->termios.c_cc[VERASE] = 127; // DEL
+    session->termios.c_cc[VINTR] = 3;     // Ctrl-C
+    session->termios.c_cc[VQUIT] = 28;    // Ctrl-Backslash
+    session->termios.c_cc[VERASE] = 127;  // DEL
     session->termios.c_cc[VKILL] = 21;    // Ctrl-U
     session->termios.c_cc[VEOF] = 4;      // Ctrl-D
     session->termios.c_cc[VTIME] = 0;     // No timer

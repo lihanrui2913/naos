@@ -287,6 +287,7 @@ struct vfs_poll_table {
 typedef struct vfs_poll_wait_entry {
     struct llist_header node;
     struct vfs_inode *inode;
+    uint64_t seq;
     wait_queue_entry_t wait;
 } vfs_poll_wait_entry_t;
 
@@ -476,6 +477,7 @@ struct vfs_inode {
     struct llist_header i_sb_list;
     vfs_ref_t i_ref;
     wait_queue_head_t poll_wait;
+    uint64_t poll_seq;
 };
 
 #define VFS_FMODE_WRITE_ACCESS (1U << 0)
@@ -601,6 +603,8 @@ struct vfs_mount_namespace {
 
 extern struct vfs_mount_namespace vfs_init_mnt_ns;
 extern struct vfs_path vfs_root_path;
+
+uint64_t vfs_mount_seq_read(void);
 
 static inline void vfs_ref_init(vfs_ref_t *ref, int value) {
     if (!ref)
@@ -934,6 +938,7 @@ void vfs_poll_wait(struct vfs_file *file, struct vfs_poll_table *pt);
 void vfs_poll_wait_table_init(vfs_poll_wait_table_t *table, task_t *task);
 void vfs_poll_wait_table_cleanup(vfs_poll_wait_table_t *table);
 int vfs_poll_wait_table_error(vfs_poll_wait_table_t *table);
+bool vfs_poll_wait_table_seq_changed(vfs_poll_wait_table_t *table);
 void vfs_poll_notify_inode(struct vfs_inode *inode, uint32_t events);
 void vfs_poll_notify_file(struct vfs_file *file, uint32_t events);
 int vfs_poll_wait_interruptible(struct vfs_file *file, uint32_t events);

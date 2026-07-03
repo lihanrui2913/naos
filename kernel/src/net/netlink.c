@@ -19,6 +19,14 @@ static spinlock_t netlink_sockets_lock = SPIN_INIT;
 #define MAX_NETLINK_MSG_POOL_SIZE 1024
 #define SIOCGSKNS 0x894C
 
+#define AUDIT_GET 1000
+#define AUDIT_SIGNAL_INFO 1010
+#define AUDIT_GET_FEATURE 1019
+#define AUDIT_FIRST_USER_MSG 1100
+#define AUDIT_LAST_USER_MSG 1199
+#define AUDIT_FIRST_USER_MSG2 2100
+#define AUDIT_LAST_USER_MSG2 2999
+
 struct netlink_msg_pool_entry {
     char message[NETLINK_BUFFER_SIZE];
     size_t length;
@@ -2241,6 +2249,36 @@ static int genl_handle_request(struct netlink_sock *sender_sock,
     return -ENOENT;
 }
 
+static bool audit_msg_is_user_generated(uint16_t type) {
+    return (type >= AUDIT_FIRST_USER_MSG && type <= AUDIT_LAST_USER_MSG) ||
+           (type >= AUDIT_FIRST_USER_MSG2 && type <= AUDIT_LAST_USER_MSG2);
+}
+
+static int audit_handle_request(struct netlink_sock *sender_sock,
+                                const struct nlmsghdr *req) {
+    (void)sender_sock;
+
+    if (!req || req->nlmsg_len < sizeof(*req))
+        return -EINVAL;
+
+    switch (req->nlmsg_type) {
+    case AUDIT_GET:
+    case AUDIT_SIGNAL_INFO:
+    case AUDIT_GET_FEATURE:
+        /*
+         * systemd/libaudit only needs these requests to be accepted so the
+         * caller can detect that audit logging is available.
+         */
+        return 0;
+    default:
+        if (audit_msg_is_user_generated(req->nlmsg_type))
+            return 0;
+
+        printk("Unsupported audit req->nlmsg_type = %u\n", req->nlmsg_type);
+        return -EOPNOTSUPP;
+    }
+}
+
 static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
                                   const char *data, size_t len,
                                   uint32_t sender_pid) {
@@ -2255,14 +2293,17 @@ static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
         return -EINVAL;
 
     if (sender_sock->protocol == NETLINK_ROUTE ||
-        sender_sock->protocol == NETLINK_GENERIC) {
+        sender_sock->protocol == NETLINK_GENERIC ||
+        sender_sock->protocol == NETLINK_AUDIT) {
         remaining = len;
         req = (const struct nlmsghdr *)data;
 
         while (NLMSG_OK(req, remaining)) {
             ret = sender_sock->protocol == NETLINK_ROUTE
                       ? rtnetlink_handle_request(sender_sock, req)
-                      : genl_handle_request(sender_sock, req);
+                  : sender_sock->protocol == NETLINK_GENERIC
+                      ? genl_handle_request(sender_sock, req)
+                      : audit_handle_request(sender_sock, req);
             if (ret < 0) {
                 if (sender_sock->protocol == NETLINK_GENERIC &&
                     req->nlmsg_len >= NLMSG_LENGTH(sizeof(struct genlmsghdr))) {
@@ -2272,6 +2313,12 @@ static int netlink_send_to_kernel(struct netlink_sock *sender_sock,
                            "genl_cmd=%u seq=%u ret=%d flags=0x%x\n",
                            sender_sock->protocol, req->nlmsg_type, genlh->cmd,
                            req->nlmsg_seq, ret, req->nlmsg_flags);
+                } else if (sender_sock->protocol == NETLINK_AUDIT) {
+                    printk("netlink: error protocol=%d nlmsg_type=%u "
+                           "audit_type=%u seq=%u ret=%d flags=0x%x\n",
+                           sender_sock->protocol, req->nlmsg_type,
+                           req->nlmsg_type, req->nlmsg_seq, ret,
+                           req->nlmsg_flags);
                 } else {
                     printk("netlink: error protocol=%d nlmsg_type=%u seq=%u "
                            "ret=%d flags=0x%x\n",

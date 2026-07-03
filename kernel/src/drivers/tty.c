@@ -7,6 +7,7 @@
 #include <fs/vfs/fcntl.h>
 
 DEFINE_LLIST(tty_device_list);
+DEFINE_LLIST(tty_session_list);
 tty_t *kernel_session = NULL; // 内核会话
 
 extern void send_process_group_signal(int pgid, int sig);
@@ -43,6 +44,8 @@ static bool tty_input_dequeue_byte(tty_t *tty, char *c) {
 }
 
 void tty_bind_devnode(tty_t *tty, vfs_node_t *node) {
+    vfs_node_t *new_node;
+
     if (!tty || !node)
         return;
 
@@ -51,18 +54,69 @@ void tty_bind_devnode(tty_t *tty, vfs_node_t *node) {
             return;
     }
 
-    if (tty->poll_node_count >= TTY_POLL_NODE_LIMIT)
+    new_node = vfs_igrab(node);
+    if (!new_node)
         return;
 
-    tty->poll_nodes[tty->poll_node_count++] = vfs_igrab(node);
+    if (tty->poll_node_count < TTY_POLL_NODE_LIMIT) {
+        tty->poll_nodes[tty->poll_node_count++] = new_node;
+        return;
+    }
+
+    size_t index = tty->poll_node_cursor++ % TTY_POLL_NODE_LIMIT;
+    vfs_node_t *old_node = tty->poll_nodes[index];
+    tty->poll_nodes[index] = new_node;
+    if (old_node)
+        vfs_iput(old_node);
 }
 
-static void tty_notify_readable(tty_t *tty) {
+void tty_notify_input_ready(tty_t *tty) {
     if (!tty)
         return;
 
+    wait_queue_wake_all(&tty->input_wait, EPOLLIN | EPOLLRDNORM, EOK);
     for (size_t i = 0; i < tty->poll_node_count; i++)
         vfs_poll_notify_inode(tty->poll_nodes[i], EPOLLIN | EPOLLRDNORM);
+}
+
+void tty_register_session(tty_t *tty) {
+    if (!tty || !llist_empty(&tty->node))
+        return;
+
+    llist_append(&tty_session_list, &tty->node);
+}
+
+tty_t *tty_lookup_session_by_sid(uint64_t sid) {
+    tty_t *pos = NULL;
+    tty_t *tmp = NULL;
+
+    if (!sid)
+        return NULL;
+
+    llist_for_each(pos, tmp, &tty_session_list, node) {
+        if (pos->at_session_id == sid)
+            return pos;
+    }
+
+    return NULL;
+}
+
+void tty_session_attach_current(tty_t *tty) {
+    if (!tty || !current_task)
+        return;
+
+    tty->at_session_id = current_task->sid;
+    tty->at_process_group_id = current_task->pgid;
+}
+
+void tty_session_detach_current(tty_t *tty) {
+    if (!tty || !current_task)
+        return;
+    if (tty->at_session_id != current_task->sid)
+        return;
+
+    tty->at_session_id = 0;
+    tty->at_process_group_id = 0;
 }
 
 static void tty_echo_bytes(tty_t *tty, const char *buf, size_t len) {
@@ -82,18 +136,31 @@ static void tty_echo_erase(tty_t *tty) {
         tty->ops.write(tty, erase_seq, sizeof(erase_seq) - 1);
 }
 
-static void tty_input_commit_canon(tty_t *tty) {
+static bool tty_is_canon_line_end(tty_t *tty, char c) {
+    if (!tty)
+        return false;
+
+    if (c == '\n')
+        return true;
+    if (tty->termios.c_cc[VEOL] && c == tty->termios.c_cc[VEOL])
+        return true;
+    if (tty->termios.c_cc[VEOL2] && c == tty->termios.c_cc[VEOL2])
+        return true;
+
+    return false;
+}
+
+static bool tty_input_commit_canon_locked(tty_t *tty) {
     uint16_t old_count;
 
     if (!tty)
-        return;
+        return false;
 
     old_count = tty->input_count;
     for (uint16_t i = 0; i < tty->canon_count; i++)
         tty_input_enqueue_byte(tty, tty->canon_buf[i]);
     tty->canon_count = 0;
-    if (old_count == 0 && tty->input_count > 0)
-        tty_notify_readable(tty);
+    return old_count == 0 && tty->input_count > 0;
 }
 
 static char tty_shifted_digit(uint16_t code) {
@@ -318,6 +385,8 @@ static void tty_receive_bytes(tty_t *tty, const char *buf, size_t len) {
     canonical = (tty->termios.c_lflag & ICANON) != 0;
     eofc = tty->termios.c_cc[VEOF];
 
+    spin_lock(&tty->input_lock);
+
     for (size_t i = 0; i < len; i++) {
         char c = buf[i];
 
@@ -374,7 +443,7 @@ static void tty_receive_bytes(tty_t *tty, const char *buf, size_t len) {
         }
 
         if (c == eofc) {
-            tty_input_commit_canon(tty);
+            notify |= tty_input_commit_canon_locked(tty);
             continue;
         }
 
@@ -382,13 +451,15 @@ static void tty_receive_bytes(tty_t *tty, const char *buf, size_t len) {
             tty->canon_buf[tty->canon_count++] = c;
         tty_echo_bytes(tty, &c, 1);
 
-        if (c == '\n' || c == tty->termios.c_cc[VEOL]) {
-            tty_input_commit_canon(tty);
+        if (tty_is_canon_line_end(tty, c)) {
+            notify |= tty_input_commit_canon_locked(tty);
         }
     }
 
+    spin_unlock(&tty->input_lock);
+
     if (notify)
-        tty_notify_readable(tty);
+        tty_notify_input_ready(tty);
 }
 
 static bool tty_input_device_is_keyboard(dev_input_event_t *event) {
@@ -399,6 +470,53 @@ static bool tty_input_device_is_keyboard(dev_input_event_t *event) {
            (tty_bitmap_test(event->keybit, KEY_A) ||
             tty_bitmap_test(event->keybit, KEY_ENTER) ||
             tty_bitmap_test(event->keybit, KEY_SPACE));
+}
+
+static bool tty_input_has_data(tty_t *tty) {
+    bool ready;
+
+    if (!tty)
+        return false;
+
+    spin_lock(&tty->input_lock);
+    ready = tty->input_count > 0;
+    spin_unlock(&tty->input_lock);
+    return ready;
+}
+
+static int tty_input_wait(tty_t *tty) {
+    wait_queue_entry_t wait;
+    int reason;
+
+    if (!tty || !current_task)
+        return -EINVAL;
+
+    task_prepare_block(current_task);
+    wait_queue_entry_init(&wait, current_task, EPOLLIN | EPOLLRDNORM, NULL,
+                          NULL);
+    wait_queue_add(&tty->input_wait, &wait);
+
+    if (tty_input_has_data(tty)) {
+        wait_queue_remove(&tty->input_wait, &wait);
+        task_cancel_block_prepare(current_task);
+        return EOK;
+    }
+
+    if (task_signal_has_deliverable(current_task)) {
+        wait_queue_remove(&tty->input_wait, &wait);
+        task_cancel_block_prepare(current_task);
+        return -EINTR;
+    }
+
+    reason = task_block(current_task, TASK_BLOCKING, -1, "tty_input_read");
+    wait_queue_remove(&tty->input_wait, &wait);
+    task_cancel_block_prepare(current_task);
+
+    if (reason < 0)
+        return reason;
+    if (reason != EOK && task_signal_has_deliverable(current_task))
+        return -EINTR;
+    return EOK;
 }
 
 ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd) {
@@ -420,11 +538,16 @@ ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd) {
             return read ? read : (size_t)-EINTR;
         }
 
-        if (tty_input_dequeue_byte(tty, &buf[read])) {
+        spin_lock(&tty->input_lock);
+        bool got_byte = tty_input_dequeue_byte(tty, &buf[read]);
+        spin_unlock(&tty->input_lock);
+
+        if (got_byte) {
             read++;
             if (!(tty->termios.c_lflag & ICANON) && read >= (size_t)vmin)
                 break;
-            if ((tty->termios.c_lflag & ICANON) && buf[read - 1] == '\n')
+            if ((tty->termios.c_lflag & ICANON) &&
+                tty_is_canon_line_end(tty, buf[read - 1]))
                 break;
             continue;
         }
@@ -438,16 +561,9 @@ ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd) {
         }
 
         arch_disable_interrupt();
-        if (fd) {
-            int reason = vfs_poll_wait_interruptible(
-                fd, EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLHUP | EPOLLNVAL);
-            if (reason < 0)
-                return reason;
-        } else {
-            arch_enable_interrupt();
-            arch_wait_for_interrupt();
-            arch_disable_interrupt();
-        }
+        int reason = tty_input_wait(tty);
+        if (reason < 0)
+            return reason;
     }
 
     arch_disable_interrupt();
@@ -460,7 +576,11 @@ int tty_input_poll(tty_t *tty, int events) {
     if (!tty)
         return 0;
 
-    if ((events & (EPOLLIN | EPOLLRDNORM)) && tty->input_count > 0)
+    spin_lock(&tty->input_lock);
+    bool input_ready = tty->input_count > 0;
+    spin_unlock(&tty->input_lock);
+
+    if ((events & (EPOLLIN | EPOLLRDNORM)) && input_ready)
         revents |= EPOLLIN | EPOLLRDNORM;
     if (events & (EPOLLOUT | EPOLLWRNORM))
         revents |= EPOLLOUT | EPOLLWRNORM;
@@ -468,15 +588,28 @@ int tty_input_poll(tty_t *tty, int events) {
     return revents;
 }
 
+int tty_input_available(tty_t *tty) {
+    if (!tty)
+        return 0;
+
+    spin_lock(&tty->input_lock);
+    int available = tty->input_count;
+    spin_unlock(&tty->input_lock);
+
+    return available;
+}
+
 void tty_input_flush(tty_t *tty) {
     if (!tty)
         return;
 
+    spin_lock(&tty->input_lock);
     tty->input_head = 0;
     tty->input_tail = 0;
     tty->input_count = 0;
     tty->canon_count = 0;
-    tty_notify_readable(tty);
+    spin_unlock(&tty->input_lock);
+    tty_notify_input_ready(tty);
 }
 
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
@@ -680,7 +813,11 @@ void tty_init_session() {
 
     tty_t *tty = calloc(1, sizeof(tty_t));
     tty->device = device;
+    spin_init(&tty->input_lock);
+    wait_queue_init(&tty->input_wait);
+    llist_init_head(&tty->node);
     create_session_terminal(tty);
+    tty_register_session(tty);
     device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL, tty_ioctl,
                    tty_poll, tty_read, tty_write, NULL);
     device_install(DEV_CHAR, DEV_TTY, tty, "tty1", 0, NULL, NULL, tty_ioctl,
@@ -699,7 +836,11 @@ void tty_init_session_serial() {
 
     tty_t *tty = calloc(1, sizeof(tty_t));
     tty->device = device;
+    spin_init(&tty->input_lock);
+    wait_queue_init(&tty->input_wait);
+    llist_init_head(&tty->node);
     create_session_terminal_serial(tty);
+    tty_register_session(tty);
     device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL, tty_ioctl,
                    tty_poll, tty_read, tty_write, NULL);
 

@@ -1,9 +1,37 @@
 #include <drivers/serial.h>
+#include <init/callbacks.h>
 
 bool serial_initialized = false;
 
 static serial_driver_t *active_serial_driver = NULL;
 static spinlock_t serial_write_lock = SPIN_INIT;
+#define SERIAL_READABLE_NOTIFIER_LIMIT 16
+static serial_readable_notifier_t
+    serial_readable_notifiers[SERIAL_READABLE_NOTIFIER_LIMIT];
+static void *serial_readable_notifier_opaque[SERIAL_READABLE_NOTIFIER_LIMIT];
+static size_t serial_readable_notifier_count = 0;
+static bool serial_sched_update_registered = false;
+static bool serial_readable_latched = false;
+
+static int serial_sched_update_notify(void) {
+    bool readable = serial_can_read();
+
+    if (!readable) {
+        serial_readable_latched = false;
+        return 0;
+    }
+
+    if (serial_readable_latched)
+        return 0;
+
+    serial_readable_latched = true;
+    for (size_t i = 0; i < serial_readable_notifier_count; i++) {
+        if (serial_readable_notifiers[i])
+            serial_readable_notifiers[i](serial_readable_notifier_opaque[i]);
+    }
+
+    return 0;
+}
 
 int serial_register_driver(serial_driver_t *driver) {
     if (!driver || !driver->write)
@@ -11,6 +39,11 @@ int serial_register_driver(serial_driver_t *driver) {
 
     active_serial_driver = driver;
     serial_initialized = true;
+    serial_readable_latched = false;
+    if (!serial_sched_update_registered) {
+        regist_on_sched_update_callback(serial_sched_update_notify);
+        serial_sched_update_registered = true;
+    }
     return 0;
 }
 
@@ -62,4 +95,15 @@ void serial_printk(const char *buf, int len) {
     }
 
     spin_unlock(&serial_write_lock);
+}
+
+int serial_register_readable_notifier(serial_readable_notifier_t fn,
+                                      void *opaque) {
+    if (!fn || serial_readable_notifier_count >= SERIAL_READABLE_NOTIFIER_LIMIT)
+        return -1;
+
+    serial_readable_notifiers[serial_readable_notifier_count] = fn;
+    serial_readable_notifier_opaque[serial_readable_notifier_count] = opaque;
+    serial_readable_notifier_count++;
+    return 0;
 }

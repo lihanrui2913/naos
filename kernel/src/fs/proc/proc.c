@@ -1,6 +1,7 @@
 #include <fs/proc/proc.h>
 #include <arch/arch.h>
 #include <boot/boot.h>
+#include <init/callbacks.h>
 #include <task/task.h>
 
 #define PROCFS_MAGIC 0x9fa0ULL
@@ -9,6 +10,7 @@ typedef enum procfs_inode_kind {
     PROCFS_INO_ROOT,
     PROCFS_INO_SYS_DIR,
     PROCFS_INO_SYS_KERNEL_DIR,
+    PROCFS_INO_SYS_KERNEL_RANDOM_DIR,
     PROCFS_INO_SYS_FS_DIR,
     PROCFS_INO_SYSVIPC_DIR,
     PROCFS_INO_PRESSURE_DIR,
@@ -34,7 +36,13 @@ typedef struct procfs_inode_info {
     task_user_namespace_t *user_ns;
     task_simple_namespace_t *net_ns;
     char *dispatch_name;
+    struct llist_header mount_watch_node;
+    bool mount_watch_registered;
 } procfs_inode_info_t;
+
+typedef struct procfs_mount_watch_state {
+    uint64_t seen_seq;
+} procfs_mount_watch_state_t;
 
 typedef struct procfs_task_snapshot {
     uint64_t pid;
@@ -50,7 +58,10 @@ static const struct vfs_file_operations procfs_file_ops;
 
 spinlock_t procfs_oplock;
 static spinlock_t procfs_mount_lock;
+static spinlock_t procfs_mount_watch_lock;
 static struct vfs_mount *procfs_internal_mnt;
+static struct llist_header procfs_mount_watch_list;
+static int procfs_notify_mount_change(void);
 
 static inline procfs_inode_info_t *procfs_i(vfs_node_t *inode) {
     return inode ? container_of(inode, procfs_inode_info_t, vfs_inode) : NULL;
@@ -151,6 +162,10 @@ static bool procfs_is_ns_symlink_name(const char *name) {
             !strcmp(name, "proc_ns_net"));
 }
 
+static bool procfs_dispatch_is_mount_watch(const char *name) {
+    return name && (!strcmp(name, "mounts") || !strcmp(name, "proc_mountinfo"));
+}
+
 static bool procfs_is_ns_link_inode(const procfs_inode_info_t *info) {
     if (!info)
         return false;
@@ -238,6 +253,13 @@ static void procfs_evict_inode(struct vfs_inode *inode) {
 
     if (!info)
         return;
+    if (info->mount_watch_registered) {
+        spin_lock(&procfs_mount_watch_lock);
+        if (!llist_empty(&info->mount_watch_node))
+            llist_delete(&info->mount_watch_node);
+        info->mount_watch_registered = false;
+        spin_unlock(&procfs_mount_watch_lock);
+    }
     free(info->dispatch_name);
     task_mount_namespace_put(info->mnt_ns);
     task_user_namespace_put(info->user_ns);
@@ -317,6 +339,13 @@ static vfs_node_t *procfs_new_inode(struct vfs_super_block *sb, umode_t mode,
         if (!info->dispatch_name) {
             vfs_iput(inode);
             return NULL;
+        }
+        if (procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+            llist_init_head(&info->mount_watch_node);
+            spin_lock(&procfs_mount_watch_lock);
+            llist_append(&procfs_mount_watch_list, &info->mount_watch_node);
+            info->mount_watch_registered = true;
+            spin_unlock(&procfs_mount_watch_lock);
         }
     }
 
@@ -1103,6 +1132,9 @@ static int procfs_iterate_shared(struct vfs_file *file,
                               procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
                                              "proc_sys_kernel_osrelease")) !=
                 0 ||
+            procfs_emit_entry(ctx, &index, "random", DT_DIR,
+                              procfs_ino_for(PROCFS_INO_SYS_KERNEL_RANDOM_DIR,
+                                             NULL, -1, "random")) != 0 ||
             procfs_emit_entry(ctx, &index, "hostname", DT_REG,
                               procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
                                              "proc_sys_kernel_hostname")) !=
@@ -1128,6 +1160,13 @@ static int procfs_iterate_shared(struct vfs_file *file,
                               procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
                                              "proc_sys_kernel_threads_max")) !=
                 0) {
+            break;
+        }
+        break;
+    case PROCFS_INO_SYS_KERNEL_RANDOM_DIR:
+        if (procfs_emit_entry(ctx, &index, "boot_id", DT_REG,
+                              procfs_ino_for(PROCFS_INO_FILE, NULL, -1,
+                                             "proc_sys_kernel_boot_id")) != 0) {
             break;
         }
         break;
@@ -1231,15 +1270,31 @@ static int procfs_iterate_shared(struct vfs_file *file,
 }
 
 static int procfs_open_file(struct vfs_inode *inode, struct vfs_file *file) {
+    procfs_inode_info_t *info;
+
     if (!inode || !file)
         return -EINVAL;
     file->f_op = inode->i_fop;
+
+    info = procfs_i(inode);
+    if (info && procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+        procfs_mount_watch_state_t *state = calloc(1, sizeof(*state));
+
+        if (!state)
+            return -ENOMEM;
+
+        state->seen_seq = vfs_mount_seq_read();
+        file->private_data = state;
+    }
+
     return 0;
 }
 
 static int procfs_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     (void)inode;
-    (void)file;
+    free(file ? file->private_data : NULL);
+    if (file)
+        file->private_data = NULL;
     return 0;
 }
 
@@ -1247,8 +1302,6 @@ static __poll_t procfs_poll_file(struct vfs_file *file,
                                  struct vfs_poll_table *pt) {
     proc_handle_t handle;
     procfs_inode_info_t *info;
-
-    (void)pt;
     if (!file || !file->f_inode)
         return EPOLLNVAL;
 
@@ -1257,10 +1310,26 @@ static __poll_t procfs_poll_file(struct vfs_file *file,
         return 0;
     if (!procfs_task_inode_is_valid(info))
         return EPOLLERR;
+    if (procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+        procfs_mount_watch_state_t *state =
+            (procfs_mount_watch_state_t *)file->private_data;
+        uint64_t seq = vfs_mount_seq_read();
+
+        if (!state)
+            return EPOLLERR;
+        if (state->seen_seq == seq)
+            return 0;
+
+        state->seen_seq = seq;
+        return EPOLLPRI;
+    }
 
     procfs_fill_handle(&handle, file->f_inode);
     return (__poll_t)procfs_poll_dispatch(&handle, file->f_inode,
-                                          EPOLLIN | EPOLLOUT);
+                                          pt ? (int)pt->events
+                                             : (EPOLLIN | EPOLLOUT | EPOLLPRI |
+                                                EPOLLERR | EPOLLHUP |
+                                                EPOLLNVAL | EPOLLRDHUP));
 }
 
 static vfs_node_t *procfs_make_task_child(struct vfs_super_block *sb,
@@ -1405,6 +1474,10 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         if (!strcmp(dentry->d_name.name, "osrelease")) {
             inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
                                      NULL, -1, "proc_sys_kernel_osrelease");
+        } else if (!strcmp(dentry->d_name.name, "random")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFDIR | 0555,
+                                     PROCFS_INO_SYS_KERNEL_RANDOM_DIR, NULL, -1,
+                                     NULL);
         } else if (!strcmp(dentry->d_name.name, "hostname")) {
             inode = procfs_new_inode(dir->i_sb, S_IFREG | 0644, PROCFS_INO_FILE,
                                      NULL, -1, "proc_sys_kernel_hostname");
@@ -1426,6 +1499,12 @@ static struct vfs_dentry *procfs_lookup(struct vfs_inode *dir,
         } else if (!strcmp(dentry->d_name.name, "threads-max")) {
             inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
                                      NULL, -1, "proc_sys_kernel_threads_max");
+        }
+        break;
+    case PROCFS_INO_SYS_KERNEL_RANDOM_DIR:
+        if (!strcmp(dentry->d_name.name, "boot_id")) {
+            inode = procfs_new_inode(dir->i_sb, S_IFREG | 0444, PROCFS_INO_FILE,
+                                     NULL, -1, "proc_sys_kernel_boot_id");
         }
         break;
     case PROCFS_INO_SYS_FS_DIR:
@@ -1668,8 +1747,23 @@ size_t proc_fdinfo_read(proc_handle_t *handle, void *addr, size_t offset,
 void proc_init() {
     spin_init(&procfs_oplock);
     spin_init(&procfs_mount_lock);
+    spin_init(&procfs_mount_watch_lock);
+    llist_init_head(&procfs_mount_watch_list);
     vfs_register_filesystem(&procfs_fs_type);
     procfs_nodes_init();
+    regist_on_mount_change_callback(procfs_notify_mount_change);
+}
+
+static int procfs_notify_mount_change(void) {
+    procfs_inode_info_t *info;
+    procfs_inode_info_t *tmp;
+
+    spin_lock(&procfs_mount_watch_lock);
+    llist_for_each(info, tmp, &procfs_mount_watch_list, mount_watch_node) {
+        vfs_poll_notify_inode(&info->vfs_inode, EPOLLPRI);
+    }
+    spin_unlock(&procfs_mount_watch_lock);
+    return 0;
 }
 
 void procfs_on_new_task(task_t *task) { (void)task; }

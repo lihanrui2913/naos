@@ -2,6 +2,7 @@
 #include <libs/llist.h>
 #include <drivers/bus/bus.h>
 #include <libs/termios.h>
+#include <task/wait.h>
 
 enum tty_device_type {
     TTY_DEVICE_SERIAL = 0, // 串口设备
@@ -55,7 +56,7 @@ typedef struct tty_session_ops {
     int (*poll)(tty_t *device, int events);
 } tty_session_ops_t;
 
-#define TTY_POLL_NODE_LIMIT 8
+#define TTY_POLL_NODE_LIMIT 32
 
 typedef struct tty_session { // 一个 TTY 会话
     void *terminal;
@@ -63,6 +64,7 @@ typedef struct tty_session { // 一个 TTY 会话
     struct vt_mode current_vt_mode;
     int tty_kbmode;
     int tty_mode;
+    uint64_t at_session_id;
     uint64_t at_process_group_id;
     char input_buf[1024];
     uint16_t input_head;
@@ -70,6 +72,8 @@ typedef struct tty_session { // 一个 TTY 会话
     uint16_t input_count;
     char canon_buf[1024];
     uint16_t canon_count;
+    spinlock_t input_lock;
+    wait_queue_head_t input_wait;
     bool key_shift;
     bool key_ctrl;
     bool key_alt;
@@ -78,6 +82,8 @@ typedef struct tty_session { // 一个 TTY 会话
     tty_device_t *device; // 会话所属的TTY设备
     vfs_node_t *poll_nodes[TTY_POLL_NODE_LIMIT];
     size_t poll_node_count;
+    size_t poll_node_cursor;
+    struct llist_header node;
 } tty_t;
 
 extern tty_t *kernel_session;
@@ -96,6 +102,12 @@ void tty_init();
 void tty_init_session();
 void tty_init_session_serial();
 void tty_bind_devnode(tty_t *tty, vfs_node_t *node);
+void tty_notify_input_ready(tty_t *tty);
+void tty_register_session(tty_t *tty);
+tty_t *tty_lookup_session_by_sid(uint64_t sid);
+void tty_session_attach_current(tty_t *tty);
+void tty_session_detach_current(tty_t *tty);
+int tty_input_available(tty_t *tty);
 ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd);
 int tty_input_poll(tty_t *tty, int events);
 void tty_input_flush(tty_t *tty);

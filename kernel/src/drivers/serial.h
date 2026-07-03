@@ -10,6 +10,8 @@ typedef struct serial_driver {
     void (*write)(struct serial_driver *driver, char ch);
 } serial_driver_t;
 
+typedef void (*serial_readable_notifier_t)(void *opaque);
+
 extern bool serial_initialized;
 
 int init_serial();
@@ -21,3 +23,5 @@ bool serial_read(char *ch);
 char read_serial();
 void write_serial(char ch);
 void serial_printk(const char *buf, int len);
+int serial_register_readable_notifier(serial_readable_notifier_t fn,
+                                      void *opaque);

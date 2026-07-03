@@ -1380,7 +1380,7 @@ void task_complete_vfork(task_t *task) {
     }
 
     parent->child_vfork_done = true;
-    if (parent->state == TASK_BLOCKING) {
+    if (parent->state == TASK_BLOCKING || parent->block_preparing) {
         task_unblock(parent, EOK);
     }
     spin_unlock(&task_queue_lock);
@@ -1866,19 +1866,20 @@ extern bool system_initialized;
 
 void softirqd_thread(uint64_t arg) {
     uint32_t queue_id = (uint32_t)arg;
+    (void)queue_id;
+
     while (true) {
         arch_enable_interrupt();
 
-        bool did_work = false;
-
+        task_prepare_block(current_task);
         if (softirq_has_pending()) {
+            task_cancel_block_prepare(current_task);
             softirq_handle_pending();
-            did_work = true;
+            continue;
         }
 
-        if (!did_work) {
-            task_block(current_task, TASK_BLOCKING, -1, "waiting_for_softirq");
-        }
+        task_block(current_task, TASK_BLOCKING, -1, "waiting_for_softirq");
+        task_cancel_block_prepare(current_task);
     }
 }
 
@@ -2332,11 +2333,9 @@ uint64_t task_exit_thread(int64_t code) {
 
     can_schedule = true;
 
-    schedule(0);
-
     while (1) {
         arch_enable_interrupt();
-        arch_wait_for_interrupt();
+        schedule(SCHED_FLAG_YIELD);
     }
 }
 
@@ -2395,7 +2394,7 @@ uint64_t task_exit(int64_t code) {
 
     while (1) {
         arch_enable_interrupt();
-        arch_wait_for_interrupt();
+        schedule(SCHED_FLAG_YIELD);
     }
 }
 

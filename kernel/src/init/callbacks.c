@@ -14,6 +14,7 @@ callback_t *callbacks_on_new_bus_device_head = NULL;
 callback_t *callbacks_on_remove_bus_device_head = NULL;
 callback_t *callbacks_on_sched_update_head = NULL;
 callback_t *callbacks_on_send_signal_head = NULL;
+callback_t *callbacks_on_mount_change_head = NULL;
 
 callback_t *callback_new(void *fn) {
     callback_t *cb = malloc(sizeof(callback_t));
@@ -76,6 +77,10 @@ void regist_on_sched_update_callback(on_sched_update_t fn) {
 
 void regist_on_send_signal_callback(on_send_signal_t fn) {
     callback_insert(&callbacks_on_send_signal_head, callback_new(fn));
+}
+
+void regist_on_mount_change_callback(on_mount_change_t fn) {
+    callback_insert(&callbacks_on_mount_change_head, callback_new(fn));
 }
 
 void on_new_task_call(task_t *task) {
@@ -162,6 +167,15 @@ void on_send_signal_call(task_t *task, int sig, const siginfo_t *info) {
     while (ptr) {
         on_send_signal_t fn = ptr->fn;
         fn(task, sig, info);
+        ptr = ptr->next;
+    }
+}
+
+void on_mount_change_call(void) {
+    callback_t *ptr = callbacks_on_mount_change_head;
+    while (ptr) {
+        on_mount_change_t fn = ptr->fn;
+        fn();
         ptr = ptr->next;
     }
 }

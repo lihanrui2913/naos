@@ -14,6 +14,7 @@
 #include <fs/vfs/paged_store.h>
 #include <fs/vfs/tmpfs_limit.h>
 #include <mm/mm_syscall.h>
+#include <task/task.h>
 
 #define DEVTMPFS_MAGIC 0x01021994ULL
 #define MAX_DEVTMPFS_FILE_SIZE (128 * 1024 * 1024)
@@ -168,6 +169,9 @@ static vfs_node_t *devtmpfs_lookup_inode_path(const char *path,
                                               unsigned int flags);
 static void setup_console_symlinks(void);
 
+static char ttydev_magic;
+static char consoledev_magic;
+
 static void ttydev_bind_path(tty_t *tty, const char *path) {
     if (!tty || !path)
         return;
@@ -178,6 +182,19 @@ static void ttydev_bind_path(tty_t *tty, const char *path) {
 
     tty_bind_devnode(tty, inode);
     vfs_iput(inode);
+}
+
+static void ttydev_bind_file(struct vfs_file *file) {
+    device_t *device;
+
+    if (!file || !file->f_inode || !S_ISCHR(file->f_inode->i_mode))
+        return;
+
+    device = device_get(file->f_inode->i_rdev);
+    if (!device || device->subtype != DEV_TTY || !device->ptr)
+        return;
+
+    tty_bind_devnode((tty_t *)device->ptr, file->f_inode);
 }
 
 static unsigned char devtmpfs_dtype(umode_t mode) {
@@ -773,6 +790,7 @@ static int devtmpfs_open_file(struct vfs_inode *inode, struct vfs_file *file) {
         ret = device_open(inode->i_rdev, file);
         if (ret < 0)
             return (int)ret;
+        ttydev_bind_file(file);
     }
     file->f_op = inode->i_fop;
     return 0;
@@ -842,12 +860,15 @@ static void *devtmpfs_mmap(struct vfs_file *file, void *addr, size_t offset,
 
 static __poll_t devtmpfs_poll_file(struct vfs_file *file,
                                    struct vfs_poll_table *pt) {
-    (void)pt;
     if (!file || !file->f_inode)
         return EPOLLNVAL;
-    if (S_ISCHR(file->f_inode->i_mode) || S_ISBLK(file->f_inode->i_mode))
-        return (__poll_t)device_poll(file->f_inode->i_rdev,
-                                     EPOLLIN | EPOLLOUT | EPOLLPRI);
+    if (S_ISCHR(file->f_inode->i_mode) || S_ISBLK(file->f_inode->i_mode)) {
+        ttydev_bind_file(file);
+        uint32_t events = pt ? pt->events
+                             : (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLERR |
+                                EPOLLHUP | EPOLLNVAL);
+        return (__poll_t)device_poll(file->f_inode->i_rdev, events);
+    }
     return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
 }
 
@@ -1349,7 +1370,8 @@ void devfs_register_device(device_t *device) {
 
     if (device->subtype == DEV_TTY && device->ptr)
         ttydev_bind_path(device->ptr, path);
-    if (device->subtype == DEV_SYSDEV && streq(device->name, "tty"))
+    if (device->subtype == DEV_SYSDEV &&
+        (streq(device->name, "tty") || streq(device->name, "console")))
         ttydev_bind_path(kernel_session, path);
 
     if (device->type == DEV_BLOCK && device->ptr) {
@@ -1479,61 +1501,54 @@ ssize_t urandom_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
 
 extern char *default_console;
 
+static tty_t *ttydev_resolve(void *data) {
+    if (data == &consoledev_magic)
+        return kernel_session;
+    if (!current_task)
+        return kernel_session;
+    return tty_lookup_session_by_sid(current_task->sid);
+}
+
+static ssize_t ttydev_open(void *data, void *arg) {
+    (void)arg;
+    return ttydev_resolve(data) ? 0 : -ENXIO;
+}
+
 static ssize_t ttydev_ioctl(void *data, ssize_t request, ssize_t arg,
                             fd_t *fd) {
-    (void)data;
+    tty_t *tty = ttydev_resolve(data);
     (void)fd;
-    if (!kernel_session)
-        return -ENODEV;
-    return tty_ioctl(kernel_session, (int)request, (void *)arg);
+    if (!tty)
+        return -ENXIO;
+    return tty_ioctl(tty, (int)request, (void *)arg);
 }
 
 static ssize_t ttydev_poll(void *data, int events) {
-    (void)data;
-    if (!kernel_session)
-        return -ENODEV;
-    return tty_poll(kernel_session, events);
+    tty_t *tty = ttydev_resolve(data);
+    if (!tty)
+        return -ENXIO;
+    return tty_poll(tty, events);
 }
 
 static ssize_t ttydev_read(void *data, void *buf, uint64_t offset, uint64_t len,
                            fd_t *fd) {
-    (void)data;
-    if (!kernel_session)
-        return -ENODEV;
-    return tty_read(kernel_session, buf, offset, len, fd);
+    tty_t *tty = ttydev_resolve(data);
+    if (!tty)
+        return -ENXIO;
+    return tty_read(tty, buf, offset, len, fd);
 }
 
 static ssize_t ttydev_write(void *data, void *buf, uint64_t offset,
                             uint64_t len, fd_t *fd) {
-    (void)data;
-    if (!kernel_session)
-        return -ENODEV;
-    return tty_write(kernel_session, buf, offset, len, fd);
+    tty_t *tty = ttydev_resolve(data);
+    if (!tty)
+        return -ENXIO;
+    return tty_write(tty, buf, offset, len, fd);
 }
 
 void setup_console_symlinks() {
-    vfs_node_t *tty_node =
-        devtmpfs_lookup_inode_path(default_console, LOOKUP_FOLLOW);
-    vfs_node_t *tty0_node;
-
-    if (!tty_node)
-        return;
-
     ttydev_bind_path(kernel_session, "/dev/tty");
-    vfs_mknodat(AT_FDCWD, "/dev/console", 0600 | S_IFCHR, tty_node->i_rdev,
-                true);
     ttydev_bind_path(kernel_session, "/dev/console");
-    tty0_node = devtmpfs_lookup_inode_path("/dev/tty0", LOOKUP_FOLLOW);
-    if (!tty0_node)
-        vfs_mknodat(AT_FDCWD, "/dev/tty0", 0600 | S_IFCHR, tty_node->i_rdev,
-                    true);
-    else
-        vfs_iput(tty0_node);
-    ttydev_bind_path(kernel_session, "/dev/tty0");
-    vfs_mknodat(AT_FDCWD, "/dev/tty1", 0600 | S_IFCHR, tty_node->i_rdev, true);
-    ttydev_bind_path(kernel_session, "/dev/tty1");
-
-    vfs_iput(tty_node);
 }
 
 ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
@@ -1647,8 +1662,12 @@ void devfs_nodes_init() {
                    urandom_ioctl, NULL, urandom_read, urandom_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, kernel_session, "kmsg", 0, NULL, NULL,
                    kmsg_ioctl, kmsg_poll, kmsg_read, kmsg_write, NULL);
-    device_install(DEV_CHAR, DEV_SYSDEV, NULL, "tty", 0, NULL, NULL,
-                   ttydev_ioctl, ttydev_poll, ttydev_read, ttydev_write, NULL);
+    device_install(DEV_CHAR, DEV_SYSDEV, &ttydev_magic, "tty", 0, ttydev_open,
+                   NULL, ttydev_ioctl, ttydev_poll, ttydev_read, ttydev_write,
+                   NULL);
+    device_install(DEV_CHAR, DEV_SYSDEV, &consoledev_magic, "console", 0,
+                   ttydev_open, NULL, ttydev_ioctl, ttydev_poll, ttydev_read,
+                   ttydev_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, NULL, "rfkill", 0, NULL, NULL, NULL,
                    rfkill_poll, rfkill_read, NULL, NULL);
 

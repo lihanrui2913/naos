@@ -32,7 +32,12 @@ __attribute__((noreturn)) void arch_shutdown();
 
 static inline void arch_pause() { asm volatile("pause"); }
 
-static inline void arch_wait_for_interrupt() { asm volatile("hlt"); }
+void arch_before_wait_for_interrupt(void);
+
+static inline void arch_wait_for_interrupt() {
+    arch_before_wait_for_interrupt();
+    asm volatile("hlt");
+}
 
 void dcache_clean_range(void *addr, size_t size);
 void dcache_invalidate_range(void *addr, size_t size);

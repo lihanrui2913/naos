@@ -1,11 +1,22 @@
 #include "fs/vfs/vfs_internal.h"
 #include "fs/fs_syscall.h"
+#include "init/callbacks.h"
 #include "task/task.h"
 
 static spinlock_t vfs_mount_lock;
 static volatile unsigned int vfs_next_mnt_id = 1;
 static volatile unsigned int vfs_next_peer_group_id = 1;
 static volatile uint64_t vfs_mount_seq = 1;
+
+uint64_t vfs_mount_seq_read(void) {
+    return __atomic_load_n(&vfs_mount_seq, __ATOMIC_ACQUIRE);
+}
+
+static inline void vfs_mount_mark_changed(void) {
+    __atomic_add_fetch(&vfs_mount_seq, 1, __ATOMIC_ACQ_REL);
+    vfs_init_mnt_ns.seq++;
+    on_mount_change_call();
+}
 
 struct vfs_propagation_target {
     struct vfs_mount *receiver;
@@ -1128,8 +1139,7 @@ static int vfs_mount_attach_locked(struct vfs_mount *parent,
         return ret;
     }
 
-    __atomic_add_fetch(&vfs_mount_seq, 1, __ATOMIC_ACQ_REL);
-    vfs_init_mnt_ns.seq++;
+    vfs_mount_mark_changed();
     if (!vfs_init_mnt_ns.root)
         vfs_init_mnt_ns.root = child;
     return 0;
@@ -1183,8 +1193,7 @@ static void vfs_mount_detach_locked(struct vfs_mount *mnt, bool propagate) {
     if (!llist_empty(&mnt->mnt_child))
         llist_delete(&mnt->mnt_child);
 
-    __atomic_add_fetch(&vfs_mount_seq, 1, __ATOMIC_ACQ_REL);
-    vfs_init_mnt_ns.seq++;
+    vfs_mount_mark_changed();
     if (mountpoint)
         vfs_dput(mountpoint);
     if (parent)
@@ -1955,8 +1964,7 @@ int vfs_mount_set_propagation(struct vfs_mount *mnt, unsigned long flags,
         vfs_mount_apply_propagation_tree(mnt, propagation);
     else
         vfs_mount_apply_propagation(mnt, propagation);
-    __atomic_add_fetch(&vfs_mount_seq, 1, __ATOMIC_ACQ_REL);
-    vfs_init_mnt_ns.seq++;
+    vfs_mount_mark_changed();
     spin_unlock(&vfs_mount_lock);
     return 0;
 }

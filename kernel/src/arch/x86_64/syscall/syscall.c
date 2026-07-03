@@ -919,6 +919,7 @@ static inline void syscall_charge_sched_runtime(task_t *task,
 
 void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     uint64_t idx = regs->rax & 0xFFFFFFFF;
+    bool irq_enabled_for_syscall = false;
 
     regs->rip = regs->rcx;
     regs->rflags = regs->r11;
@@ -935,6 +936,8 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     }
 
     x64_fpu_save(self->arch_context->fpu_ctx);
+    arch_enable_interrupt();
+    irq_enabled_for_syscall = true;
 
     regs->rax = self->last_syscall_ret;
     ptrace_on_syscall_enter(regs);
@@ -1000,21 +1003,18 @@ done:
         serial_fprintk("syscall %d accessed a invalid address\n", idx);
     }
 
+    sched_resched_if_needed();
+
     if (self && (self->signal->sighand->group_exit ||
                  (self->signal && self->signal->signal != 0)))
         task_signal(regs);
-
-    /*
-     * Same-CPU wakeups only set need_resched on the current task. Consume it
-     * before returning to userspace so we don't wait for an unrelated IRQ to
-     * drive the handoff.
-     */
-    sched_resched_if_needed();
 
     if (idx != SYS_RT_SIGRETURN) {
         regs->rcx = regs->rip;
         regs->r11 = regs->rflags;
     }
 
+    if (irq_enabled_for_syscall)
+        arch_disable_interrupt();
     x64_fpu_restore(self->arch_context->fpu_ctx);
 }

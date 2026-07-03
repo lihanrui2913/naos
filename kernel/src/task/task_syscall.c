@@ -3639,9 +3639,12 @@ static void task_wait_vfork_done_poll(task_t *parent) {
         return;
 
     while (!parent->child_vfork_done) {
-        arch_enable_interrupt();
-        arch_wait_for_interrupt();
-        arch_disable_interrupt();
+        task_prepare_block(parent);
+        if (parent->child_vfork_done) {
+            task_cancel_block_prepare(parent);
+            break;
+        }
+        task_block(parent, TASK_BLOCKING, -1, "vfork");
     }
 
     parent->child_vfork_done = false;

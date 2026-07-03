@@ -199,6 +199,13 @@ void apic_timer_rearm(void) {
     lapic_write(LAPIC_TIMER_INIT, (uint32_t)interval);
 }
 
+void apic_timer_mark_fired(void) {
+    uint32_t cpu_id = current_cpu_id;
+
+    if (cpu_id < MAX_CPU_NUM)
+        lapic_next_deadline[cpu_id] = 0;
+}
+
 void apic_timer_set_interval_ns(uint64_t ns) {
     apic_timer_set_interval_ns_for_cpu(current_cpu_id, ns);
     apic_timer_rearm();

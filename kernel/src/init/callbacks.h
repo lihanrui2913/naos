@@ -15,6 +15,7 @@ typedef int (*on_new_bus_device_t)(bus_device_t *dev);
 typedef int (*on_remove_bus_device_t)(bus_device_t *dev);
 typedef int (*on_sched_update_t)(void);
 typedef int (*on_send_signal_t)(task_t *task, int sig, const siginfo_t *info);
+typedef int (*on_mount_change_t)(void);
 
 typedef struct callback {
     void *fn;
@@ -31,6 +32,7 @@ void regist_on_new_bus_device_callback(on_new_bus_device_t fn);
 void regist_on_remove_bus_device_callback(on_remove_bus_device_t fn);
 void regist_on_sched_update_callback(on_sched_update_t fn);
 void regist_on_send_signal_callback(on_send_signal_t fn);
+void regist_on_mount_change_callback(on_mount_change_t fn);
 
 void on_new_task_call(task_t *task);
 void on_exit_task_call(task_t *task);
@@ -42,3 +44,4 @@ void on_new_bus_device_call(bus_device_t *device);
 void on_remove_bus_device_call(bus_device_t *device);
 void on_sched_update_call(void);
 void on_send_signal_call(task_t *task, int sig, const siginfo_t *info);
+void on_mount_change_call(void);

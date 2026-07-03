@@ -600,6 +600,10 @@ static uint64_t do_epoll_wait(struct vfs_file *epoll_file,
             vfs_poll_wait_table_cleanup(&table);
             return (uint64_t)-EINTR;
         }
+        if (vfs_poll_wait_table_seq_changed(&table)) {
+            vfs_poll_wait_table_cleanup(&table);
+            continue;
+        }
         if (timeout_ns == 0) {
             vfs_poll_wait_table_cleanup(&table);
             return 0;

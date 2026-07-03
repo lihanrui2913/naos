@@ -43,6 +43,7 @@ static void vfs_poll_table_queue_proc(struct vfs_file *file,
         table->error = -EBADF;
         return;
     }
+    entry->seq = __atomic_load_n(&entry->inode->poll_seq, __ATOMIC_ACQUIRE);
 
     llist_init_head(&entry->node);
     wait_queue_entry_init(&entry->wait, table->task, pt->events, NULL, table);
@@ -82,6 +83,21 @@ int vfs_poll_wait_table_error(vfs_poll_wait_table_t *table) {
     return table ? table->error : -EINVAL;
 }
 
+bool vfs_poll_wait_table_seq_changed(vfs_poll_wait_table_t *table) {
+    if (!table)
+        return false;
+
+    vfs_poll_wait_entry_t *entry, *tmp;
+    llist_for_each(entry, tmp, &table->entries, node) {
+        uint64_t seq =
+            __atomic_load_n(&entry->inode->poll_seq, __ATOMIC_ACQUIRE);
+        if (seq != entry->seq)
+            return true;
+    }
+
+    return false;
+}
+
 void vfs_poll_wait(struct vfs_file *file, struct vfs_poll_table *pt) {
     if (!pt || !pt->queue_proc)
         return;
@@ -91,6 +107,7 @@ void vfs_poll_wait(struct vfs_file *file, struct vfs_poll_table *pt) {
 void vfs_poll_notify_inode(struct vfs_inode *inode, uint32_t events) {
     if (!inode || !events)
         return;
+    __atomic_add_fetch(&inode->poll_seq, 1, __ATOMIC_ACQ_REL);
     wait_queue_wake_all(&inode->poll_wait, vfs_poll_expand_events(events), EOK);
 }
 
@@ -821,6 +838,10 @@ int vfs_poll_wait_interruptible(struct vfs_file *file, uint32_t events) {
         if (task_signal_has_deliverable(current_task)) {
             vfs_poll_wait_table_cleanup(&table);
             return -EINTR;
+        }
+        if (vfs_poll_wait_table_seq_changed(&table)) {
+            vfs_poll_wait_table_cleanup(&table);
+            continue;
         }
 
         int reason =

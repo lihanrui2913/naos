@@ -15,6 +15,10 @@ void terminal_flush_serial(tty_t *session) {
 
 extern void send_process_group_signal(int pgid, int sig);
 
+static void terminal_serial_notify_readable(void *opaque) {
+    tty_notify_input_ready((tty_t *)opaque);
+}
+
 ssize_t terminal_read_serial(tty_t *device, char *buf, size_t count, fd_t *fd) {
     size_t read = 0;
     bool canonical = (device->termios.c_lflag & ICANON) != 0;
@@ -88,6 +92,7 @@ int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case TIOCSCTTY:
+        tty_session_attach_current(device);
         return 0;
     case TIOCGPGRP: {
         int pid = device->at_process_group_id;
@@ -99,7 +104,16 @@ int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
         int pid = 0;
         if (!arg || copy_from_user(&pid, (void *)arg, sizeof(pid)))
             return -EFAULT;
+        tty_session_attach_current(device);
         device->at_process_group_id = pid;
+        return 0;
+    }
+    case TIOCGSID: {
+        int sid = (int)device->at_session_id;
+        if (!sid)
+            return -ENOTTY;
+        if (!arg || copy_to_user((void *)arg, &sid, sizeof(sid)))
+            return -EFAULT;
         return 0;
     }
     case TCGETS:
@@ -198,6 +212,7 @@ int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case TIOCNOTTY:
+        tty_session_detach_current(device);
         return 0;
     case TCSETSF:
         if (!arg ||
@@ -205,6 +220,15 @@ int terminal_ioctl_serial(tty_t *device, uint32_t cmd, uint64_t arg) {
             return -EFAULT;
         return 0;
     case TCFLSH:
+        return 0;
+    case FIONREAD: {
+        int available = serial_can_read() ? 1 : 0;
+        if (!arg || copy_to_user((void *)arg, &available, sizeof(available)))
+            return -EFAULT;
+        return 0;
+    }
+    case TCSBRK:
+    case TCSBRKP:
         return 0;
     case TIOCNXCL:
         return 0;
@@ -246,9 +270,9 @@ uint64_t create_session_terminal_serial(tty_t *session) {
     session->termios.c_cflag = CS8 | CREAD | CLOCAL;
     session->termios.c_lflag = ECHO | ICANON | IEXTEN | ISIG;
     session->termios.c_line = 0;
-    session->termios.c_cc[VINTR] = 3; // Ctrl-C
-    session->termios.c_cc[VQUIT] =
-        28; // Ctrl-session->termios.c_cc[VERASE] = 127; // DEL
+    session->termios.c_cc[VINTR] = 3;     // Ctrl-C
+    session->termios.c_cc[VQUIT] = 28;    // Ctrl-Backslash
+    session->termios.c_cc[VERASE] = 127;  // DEL
     session->termios.c_cc[VKILL] = 21;    // Ctrl-U
     session->termios.c_cc[VEOF] = 4;      // Ctrl-D
     session->termios.c_cc[VTIME] = 0;     // No timer
@@ -273,6 +297,7 @@ uint64_t create_session_terminal_serial(tty_t *session) {
     session->ops.poll = terminal_poll_serial;
     session->ops.read = terminal_read_serial;
     session->ops.write = terminal_write_serial;
+    serial_register_readable_notifier(terminal_serial_notify_readable, session);
 
     return EOK;
 }
