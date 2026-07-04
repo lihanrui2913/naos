@@ -3120,6 +3120,23 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
     return ret;
 }
 
+static uint64_t fcntl_dupfd_query(task_t *self, fd_t *file, uint64_t arg) {
+    int query_fd = (int)arg;
+    fd_t *query_file;
+    uint64_t ret;
+
+    if (!self || !file)
+        return (uint64_t)-EBADF;
+
+    query_file = task_get_file(self, query_fd);
+    if (!query_file)
+        return (uint64_t)-EBADF;
+
+    ret = (query_file == file) ? 1 : 0;
+    vfs_file_put(query_file);
+    return ret;
+}
+
 uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags) {
     if (flags & ~O_CLOEXEC)
         return (uint64_t)-EINVAL;
@@ -3165,6 +3182,9 @@ uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t arg) {
         break;
     case F_DUPFD:
         out = dup_to_free_slot(self, fd, arg, false);
+        break;
+    case F_DUPFD_QUERY:
+        out = fcntl_dupfd_query(self, file, arg);
         break;
     case F_GETFL:
         out = fd_get_flags(file);
@@ -3919,7 +3939,7 @@ uint64_t sys_chmod(const char *name_user, uint16_t mode) {
     char name[512];
     if (copy_from_user_str(name, name_user, sizeof(name)))
         return (uint64_t)-EFAULT;
-    ret = vfs_filename_lookup(AT_FDCWD, name, LOOKUP_FOLLOW, &path);
+    ret = vfs_filename_lookup(AT_FDCWD, name, LOOKUP_NOFOLLOW, &path);
     if (ret < 0)
         return (uint64_t)ret;
     ret = generic_setattr_path(&path, true, mode, false, 0, false, 0, false, 0);
@@ -3943,7 +3963,7 @@ uint64_t sys_fchmodat(int dfd, const char *name_user, uint16_t mode) {
     char name[512];
     if (copy_from_user_str(name, name_user, sizeof(name)))
         return (uint64_t)-EFAULT;
-    ret = vfs_filename_lookup(dfd, name, LOOKUP_FOLLOW, &path);
+    ret = vfs_filename_lookup(dfd, name, LOOKUP_NOFOLLOW, &path);
     if (ret < 0)
         return (uint64_t)ret;
     ret = generic_setattr_path(&path, true, mode, false, 0, false, 0, false, 0);
@@ -3974,7 +3994,7 @@ uint64_t sys_chown(const char *filename_user, uint64_t uid, uint64_t gid) {
     char filename[512];
     if (copy_from_user_str(filename, filename_user, sizeof(filename)))
         return (uint64_t)-EFAULT;
-    ret = vfs_filename_lookup(AT_FDCWD, filename, LOOKUP_FOLLOW, &path);
+    ret = vfs_filename_lookup(AT_FDCWD, filename, LOOKUP_NOFOLLOW, &path);
     if (ret < 0)
         return (uint64_t)ret;
     ret = generic_chown_path(&path, uid, gid);
