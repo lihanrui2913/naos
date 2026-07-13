@@ -273,3 +273,13 @@ virtio_net_device_t *virtio_net_get_device(uint32_t index) {
 }
 
 uint32_t virtio_net_get_device_count(void) { return virtio_net_idx; }
+
+static virtio_device_driver_t virtio_net_driver = {
+    .name = "virtio-net",
+    .device_type = VIRTIO_DEVICE_TYPE_NETWORK,
+    .probe = virtio_net_init,
+    .remove = NULL,
+    .shutdown = NULL,
+};
+
+int dlmain(void) { return virtio_register_device_driver(&virtio_net_driver); }

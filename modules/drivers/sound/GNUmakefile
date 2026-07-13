@@ -1,6 +1,6 @@
-KM_NAME := sound
+all:
+	$(call PRINT_STEP,MAKE,modules/drivers/sound/legacy)
+	$(Q)$(MAKE) -C legacy
 
-override SRCFILES := $(shell find . -name "*.[Sc]" | LC_ALL=C sort)
-MODULE_LINK_LIBS := $(PROJECT_ROOT)/libgcc_$(ARCH).a
-
-include $(PROJECT_ROOT)/modules/build/module.mk
+	$(call PRINT_STEP,MAKE,modules/drivers/sound/virtio-sound)
+	$(Q)$(MAKE) -C virtio-sound

@@ -5,7 +5,7 @@
 #include <task/task.h>
 #include <irq/irq_manager.h>
 
-#define X64_TLB_SHOOTDOWN_QUEUE_SIZE 32
+#define X64_TLB_SHOOTDOWN_QUEUE_SIZE 256
 
 typedef struct x64_tlb_shootdown_req {
     uint64_t seq;

@@ -9,6 +9,7 @@
 #include <net/real_socket.h>
 #include <drivers/fb.h>
 #include <drivers/drm/drm.h>
+#include <drivers/virtio/virtio.h>
 
 extern void acpi_init_after_pci();
 
@@ -38,6 +39,7 @@ void init_thread(uint64_t arg) {
     arch_init_after_thread();
 
     pci_controller_init();
+    virtio_bus_init();
 
 #if !defined(__x86_64__)
     fdt_init();

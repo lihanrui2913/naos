@@ -480,3 +480,13 @@ virtio_blk_device_t *virtio_blk_get_device(uint32_t index) {
 }
 
 uint32_t virtio_blk_get_device_count(void) { return virtio_blk_idx; }
+
+static virtio_device_driver_t virtio_blk_driver = {
+    .name = "virtio-blk",
+    .device_type = VIRTIO_DEVICE_TYPE_BLOCK,
+    .probe = virtio_blk_init,
+    .remove = NULL,
+    .shutdown = NULL,
+};
+
+int dlmain(void) { return virtio_register_device_driver(&virtio_blk_driver); }

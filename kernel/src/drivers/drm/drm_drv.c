@@ -540,11 +540,11 @@ void drm_device_set_driver_info(drm_device_t *dev, const char *name,
  *
  * Creates sysfs entries for the DRM device
  */
-static void drm_device_setup_sysfs(int major, int card_minor, int render_minor,
-                                   bool has_render_node, pci_device_t *pci_dev,
-                                   const char *driver_name,
-                                   const char *card_dev_name,
-                                   const char *render_dev_name) {
+void drm_register_sysfs_nodes(int major, int card_minor, int render_minor,
+                              bool has_render_node, pci_device_t *pci_dev,
+                              const char *driver_name,
+                              const char *card_dev_name,
+                              const char *render_dev_name) {
     if (!pci_dev) {
         return;
     }
@@ -906,10 +906,10 @@ drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
     framebuffer->depth = 24;
 
     // Setup sysfs entries
-    drm_device_setup_sysfs((card_dev_nr >> 8) & 0xFF, dev->primary_minor,
-                           dev->render_minor, dev->render_node_registered,
-                           pci_dev, dev->driver_name, card_dev_name,
-                           render_dev_name);
+    drm_register_sysfs_nodes((card_dev_nr >> 8) & 0xFF, dev->primary_minor,
+                             dev->render_minor, dev->render_node_registered,
+                             pci_dev, dev->driver_name, card_dev_name,
+                             render_dev_name);
 
     drm_id++;
 

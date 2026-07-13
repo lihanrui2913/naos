@@ -179,15 +179,15 @@ void pci_init();
 
 #define PCI_DRIVER_FLAGS_NEED_SYSFS (1 << 0)
 
-struct pci_driver;
+struct kernel_pci_driver;
 typedef bool (*pci_driver_match_t)(pci_device_t *dev,
-                                   const struct pci_driver *driver);
+                                   const struct kernel_pci_driver *driver);
 
 /**
  * High-level PCI driver descriptor. The core matches enumerated pci_device_t
  * objects against this table and then calls probe/remove/shutdown.
  */
-typedef struct pci_driver {
+typedef struct kernel_pci_driver {
     const char *name;
     uint32_t class_id;
     pci_driver_match_t match;

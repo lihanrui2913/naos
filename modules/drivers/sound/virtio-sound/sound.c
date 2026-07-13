@@ -732,3 +732,13 @@ int virtio_sound_init(virtio_driver_t *driver) {
     printk("virtio_sound: initialized %u streams\n", dev->stream_count);
     return 0;
 }
+
+static virtio_device_driver_t virtio_sound_driver = {
+    .name = "virtio-sound",
+    .device_type = VIRTIO_DEVICE_TYPE_SOUND,
+    .probe = virtio_sound_init,
+    .remove = NULL,
+    .shutdown = NULL,
+};
+
+int dlmain(void) { return virtio_register_device_driver(&virtio_sound_driver); }

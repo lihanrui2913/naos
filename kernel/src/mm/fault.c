@@ -151,7 +151,7 @@ map_anon_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
         !fault_snapshot_allows_access(snapshot, fault_flags)) {
         spin_unlock(&mgr->lock);
         address_release(page_paddr);
-        return PF_RES_SEGF;
+        return PF_RES_RETRY;
     }
 
     spin_lock(&task->mm->lock);
@@ -256,7 +256,7 @@ map_file_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
         !fault_snapshot_allows_access(snapshot, fault_flags)) {
         spin_unlock(&mgr->lock);
         address_release(page_paddr);
-        return PF_RES_SEGF;
+        return PF_RES_RETRY;
     }
 
     spin_lock(&task->mm->lock);
@@ -295,10 +295,12 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
         return PF_RES_SEGF;
 
     vma_manager_t *mgr = &task->mm->task_vma_mgr;
+    spin_lock(&mgr->lock);
     vma_t *current_vma = vma_find(mgr, vaddr);
     if (!fault_vma_matches_snapshot(current_vma, snapshot) ||
         !fault_vma_can_resolve_cow(snapshot)) {
-        return PF_RES_SEGF;
+        spin_unlock(&mgr->lock);
+        return PF_RES_RETRY;
     }
 
     spin_lock(&task->mm->lock);
@@ -308,6 +310,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     uint64_t levels = arch_page_table_levels();
     if (!fault_page_table_levels_valid(levels)) {
         spin_unlock(&task->mm->lock);
+        spin_unlock(&mgr->lock);
         return PF_RES_SEGF;
     }
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
@@ -319,6 +322,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
         uint64_t entry = pgdir[indexs[i]];
         if (!ARCH_PT_IS_TABLE(entry)) {
             spin_unlock(&task->mm->lock);
+            spin_unlock(&mgr->lock);
             return PF_RES_SEGF;
         }
         pgdir = (uint64_t *)phys_to_virt(ARCH_READ_PTE(entry));
@@ -329,12 +333,14 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     if (!(current_entry & ARCH_PT_FLAG_COW)) {
         bool already_resolved = (current_entry & ARCH_PT_FLAG_VALID) != 0;
         spin_unlock(&task->mm->lock);
+        spin_unlock(&mgr->lock);
         return already_resolved ? PF_RES_OK : PF_RES_SEGF;
     }
 
     if (ARCH_READ_PTE(current_entry) != old_paddr) {
         spin_unlock(&task->mm->lock);
-        return PF_RES_SEGF;
+        spin_unlock(&mgr->lock);
+        return PF_RES_RETRY;
     }
 
     if (address_is_managed(old_paddr) &&
@@ -344,6 +350,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
 
         pgdir[index] = ARCH_MAKE_PTE(old_paddr, flags);
         spin_unlock(&task->mm->lock);
+        spin_unlock(&mgr->lock);
         task_mm_flush_tlb_page(task->mm, aligned_vaddr);
         return PF_RES_OK;
     }
@@ -351,6 +358,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     uint64_t new_paddr = alloc_frames(1);
     if (!new_paddr) {
         spin_unlock(&task->mm->lock);
+        spin_unlock(&mgr->lock);
         return PF_RES_NOMEM;
     }
     memcpy((void *)phys_to_virt(new_paddr),
@@ -362,9 +370,18 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
 
     pgdir[index] = ARCH_MAKE_PTE(new_paddr, flags);
     spin_unlock(&task->mm->lock);
-    task_mm_flush_tlb_page(task->mm, aligned_vaddr);
+    spin_unlock(&mgr->lock);
 
-    address_release(old_paddr);
+    if (task_mm_flush_tlb_page(task->mm, aligned_vaddr)) {
+        address_release(old_paddr);
+    } else {
+        unmap_release_batch_t batch = {
+            .mm = task->mm,
+            .page_addrs = {old_paddr},
+            .page_count = 1,
+        };
+        unmap_release_batch_commit(&batch);
+    }
 
     return PF_RES_OK;
 }
@@ -409,8 +426,9 @@ static page_fault_result_t map_shm_fault_page_locked(task_t *task, vma_t *vma,
     return PF_RES_OK;
 }
 
-page_fault_result_t handle_page_fault_flags(task_t *task, uint64_t vaddr,
-                                            uint64_t fault_flags) {
+static page_fault_result_t handle_page_fault_flags_once(task_t *task,
+                                                        uint64_t vaddr,
+                                                        uint64_t fault_flags) {
     if (!task)
         return PF_RES_SEGF;
     if (!vaddr)
@@ -477,8 +495,8 @@ page_fault_result_t handle_page_fault_flags(task_t *task, uint64_t vaddr,
             return PF_RES_SEGF;
         }
 
-        result = map_cow_fault_page_snapshot(task, &snapshot, vaddr, paddr);
         spin_unlock(&mgr->lock);
+        result = map_cow_fault_page_snapshot(task, &snapshot, vaddr, paddr);
         fault_vma_snapshot_put(&snapshot);
         return result;
     }
@@ -531,4 +549,15 @@ page_fault_result_t handle_page_fault_flags(task_t *task, uint64_t vaddr,
     spin_unlock(&mgr->lock);
 
     return result;
+}
+
+page_fault_result_t handle_page_fault_flags(task_t *task, uint64_t vaddr,
+                                            uint64_t fault_flags) {
+    while (true) {
+        page_fault_result_t result =
+            handle_page_fault_flags_once(task, vaddr, fault_flags);
+        if (result != PF_RES_RETRY)
+            return result;
+        arch_pause();
+    }
 }

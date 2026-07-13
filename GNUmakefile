@@ -4,12 +4,6 @@ MAKEFLAGS += -rR --no-print-directory
 
 include build/common-env.mk
 
-ifeq ($(ARCH), x86_64)
-ARCH_DIR := x64
-else
-ARCH_DIR := $(ARCH)
-endif
-
 KVM ?= 0
 HVF ?= 0
 SMP ?= 4
@@ -127,7 +121,7 @@ distclean:
 clippy:
 	$(MAKE) -C kernel clippy
 
-ROOTFS_IMG_SIZE ?= 4096
+ROOTFS_IMG_SIZE ?= 8192
 ROOTFS_EXT_BLOCK_SIZE ?= 1024
 ROOTFS_EXT_INODE_SIZE ?= 256
 ROOTFS_EXT_FEATURES := extent,64bit,flex_bg,huge_file,dir_nlink,extra_isize,dir_index,metadata_csum,^has_journal,^quota,^metadata_csum_seed,^orphan_file,^project,^encrypt,^verity,^casefold,^inline_data,^ea_inode,^bigalloc,^mmp,^fast_commit,^sparse_super2

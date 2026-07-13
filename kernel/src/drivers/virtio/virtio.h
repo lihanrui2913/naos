@@ -1,7 +1,5 @@
 #pragma once
 
-#include <stdint.h>
-#include <stdbool.h>
 #include <libs/klibc.h>
 #include <mm/mm.h>
 #include <drivers/bus/pci.h>
@@ -30,8 +28,9 @@ typedef enum virtio_device_type {
 
 struct virtio_driver;
 typedef struct virtio_driver virtio_driver_t;
-struct netdev;
-typedef struct netdev netdev_t;
+struct virtio_device_driver;
+typedef struct virtio_device_driver virtio_device_driver_t;
+
 typedef void (*virtio_interrupt_handler_t)(void *opaque, uint8_t isr_status);
 
 typedef struct virtio_driver_op {
@@ -60,6 +59,17 @@ typedef struct virtio_driver_op {
 struct virtio_driver {
     void *data;
     virtio_driver_op_t *op;
+    virtio_device_type_t device_type;
+    const char *transport_name;
+    virtio_device_driver_t *bound_driver;
+};
+
+struct virtio_device_driver {
+    const char *name;
+    virtio_device_type_t device_type;
+    int (*probe)(virtio_driver_t *driver);
+    void (*remove)(virtio_driver_t *driver);
+    void (*shutdown)(virtio_driver_t *driver);
 };
 
 typedef struct virtio_buffer {
@@ -70,20 +80,24 @@ typedef struct virtio_buffer {
 struct virtqueue;
 typedef struct virtqueue virtqueue_t;
 
-typedef struct virtio_net_device {
-    virtio_driver_t *driver;
-    uint8_t mac[6];
-    uint16_t mtu;
-    uint16_t net_hdr_size;
-    virtqueue_t *send_queue;
-    virtqueue_t *recv_queue;
-    void *rx_buffers[64];
-    void *tx_buffers[64];
-    uint32_t tx_buffer_sizes[64];
-    spinlock_t send_recv_lock;
-    netdev_t *netdev;
-} virtio_net_device_t;
-
 uint64_t virtio_begin_init(virtio_driver_t *driver,
                            uint64_t supported_features);
 void virtio_finish_init(virtio_driver_t *driver);
+void virtio_driver_reset(virtio_driver_t *driver);
+int virtio_register_device_driver(virtio_device_driver_t *driver);
+int virtio_unregister_device_driver(virtio_device_driver_t *driver);
+bool virtio_driver_has_feature(virtio_driver_t *driver,
+                               unsigned int feature_bit);
+uint32_t virtio_driver_read_config_u32(virtio_driver_t *driver,
+                                       uint32_t offset);
+void virtio_driver_write_config_u32(virtio_driver_t *driver, uint32_t offset,
+                                    uint32_t value);
+bool virtio_driver_supports_interrupts(virtio_driver_t *driver);
+void virtio_driver_set_interrupt_handler(virtio_driver_t *driver,
+                                         virtio_interrupt_handler_t handler,
+                                         void *opaque);
+void *virtio_driver_parent_native(virtio_driver_t *driver);
+bool virtio_driver_get_shm_region(virtio_driver_t *driver, uint8_t id,
+                                  uint64_t *addr, uint64_t *len);
+virtio_device_type_t virtio_driver_get_device_type(virtio_driver_t *driver);
+void virtio_bus_init(void);

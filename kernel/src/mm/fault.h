@@ -7,6 +7,7 @@ typedef enum page_fault_result {
     PF_RES_OK,
     PF_RES_SEGF,
     PF_RES_NOMEM,
+    PF_RES_RETRY,
 } page_fault_result_t;
 
 typedef enum page_fault_access {

@@ -1,5 +1,4 @@
 #include "gpu.h"
-#include "pci.h"
 
 #include <drivers/drm/drm_ioctl.h>
 #include <drivers/logger.h>
@@ -2250,3 +2249,13 @@ int virtio_gpu_init(virtio_driver_t *driver) {
                 KTHREAD_PRIORITY);
     return 0;
 }
+
+static virtio_device_driver_t virtio_gpu_driver = {
+    .name = "virtio-gpu",
+    .device_type = VIRTIO_DEVICE_TYPE_GPU,
+    .probe = virtio_gpu_init,
+    .remove = NULL,
+    .shutdown = NULL,
+};
+
+int dlmain(void) { return virtio_register_device_driver(&virtio_gpu_driver); }

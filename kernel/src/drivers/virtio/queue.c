@@ -289,6 +289,10 @@ uint16_t virt_queue_get_used_buf(virtqueue_t *queue, uint32_t *len) {
     return desc_idx;
 }
 
+uint16_t virt_queue_size(const virtqueue_t *queue) {
+    return queue ? queue->size : 0;
+}
+
 void virt_queue_notify(virtio_driver_t *driver, virtqueue_t *queue) {
     driver->op->notify(driver->data, queue->queue_idx);
 }

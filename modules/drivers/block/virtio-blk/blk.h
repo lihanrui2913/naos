@@ -1,9 +1,7 @@
 #pragma once
 
-#include "virtio.h"
-#include "queue.h"
-
-#include <stdint.h>
+#include <drivers/virtio/queue.h>
+#include <drivers/virtio/virtio.h>
 #include <block/block.h>
 #include <task/wait.h>
 

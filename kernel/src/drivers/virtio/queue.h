@@ -106,4 +106,5 @@ uint16_t virt_queue_add_buf(virtqueue_t *queue, virtio_buffer_t *bufs,
                             uint16_t num_bufs, bool *device_writable);
 void virt_queue_submit_buf(virtqueue_t *queue, uint16_t desc_idx);
 uint16_t virt_queue_get_used_buf(virtqueue_t *queue, uint32_t *len);
+uint16_t virt_queue_size(const virtqueue_t *queue);
 void virt_queue_notify(virtio_driver_t *driver, virtqueue_t *queue);

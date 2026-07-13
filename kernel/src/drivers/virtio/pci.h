@@ -55,3 +55,5 @@ typedef struct virtio_pci_device {
     virtio_interrupt_handler_t irq_handler;
     void *irq_handler_opaque;
 } virtio_pci_device_t;
+
+extern virtio_driver_op_t virtio_pci_driver_op;

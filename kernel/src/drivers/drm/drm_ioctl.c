@@ -6,6 +6,7 @@
  */
 
 #include <drivers/drm/drm.h>
+#include <drivers/drm/drmfs.h>
 #include <drivers/drm/drm_ioctl.h>
 #include <drivers/drm/drm_core.h>
 #include <drivers/logger.h>
@@ -112,25 +113,10 @@ typedef struct drm_prime_export_entry {
 static drm_prime_export_entry_t drm_prime_exports[DRM_MAX_PRIME_EXPORTS];
 static spinlock_t drm_prime_exports_lock = SPIN_INIT;
 
-typedef struct drmfdfs_info {
-    spinlock_t lock;
-    ino64_t next_ino;
-} drmfdfs_info_t;
-
-typedef struct drmfdfs_inode_info {
-    struct vfs_inode vfs_inode;
-} drmfdfs_inode_info_t;
-
-static struct vfs_file_system_type drmfdfs_fs_type;
-static const struct vfs_super_operations drmfdfs_super_ops;
 static const struct vfs_file_operations drmfdfs_dir_file_ops;
 static const struct vfs_file_operations drmfdfs_prime_file_ops;
 static const struct vfs_file_operations drmfdfs_sync_file_ops;
 static const struct vfs_file_operations drmfdfs_drm_file_ops;
-static spinlock_t drmfdfs_mount_lock;
-static struct vfs_mount *drmfdfs_internal_mnt;
-static spinlock_t drmfdfs_register_lock = SPIN_INIT;
-static bool drmfdfs_registered = false;
 
 typedef struct drm_syncfd_ctx drm_syncfd_ctx_t;
 static drm_syncfd_ctx_t *drm_syncfd_create_immediate_ctx(const char *name,
@@ -183,152 +169,6 @@ static inline void *drm_effective_ioctl_data(void *data, fd_t *fd) {
     return file ? (void *)file : data;
 }
 
-static inline drmfdfs_info_t *drmfdfs_sb_info(struct vfs_super_block *sb) {
-    return sb ? (drmfdfs_info_t *)sb->s_fs_info : NULL;
-}
-
-static struct vfs_inode *drmfdfs_alloc_inode(struct vfs_super_block *sb) {
-    drmfdfs_inode_info_t *info = calloc(1, sizeof(*info));
-
-    (void)sb;
-    return info ? &info->vfs_inode : NULL;
-}
-
-static void drmfdfs_destroy_inode(struct vfs_inode *inode) {
-    if (!inode)
-        return;
-    free(container_of(inode, drmfdfs_inode_info_t, vfs_inode));
-}
-
-static void drmfdfs_put_super(struct vfs_super_block *sb) {
-    if (sb && sb->s_fs_info)
-        free(sb->s_fs_info);
-}
-
-static int drmfdfs_statfs(struct vfs_path *path, void *buf) {
-    struct statfs *st = (struct statfs *)buf;
-    struct vfs_super_block *sb;
-
-    if (!path || !path->dentry || !path->dentry->d_inode || !st)
-        return -EINVAL;
-
-    memset(st, 0, sizeof(*st));
-    sb = path->dentry->d_inode->i_sb;
-    if (!sb)
-        return 0;
-    st->f_type = sb->s_magic;
-    st->f_bsize = PAGE_SIZE;
-    st->f_frsize = PAGE_SIZE;
-    st->f_namelen = 255;
-    st->f_flags = sb->s_flags;
-    return 0;
-}
-
-static int drmfdfs_init_fs_context(struct vfs_fs_context *fc) {
-    (void)fc;
-    return 0;
-}
-
-static int drmfdfs_get_tree(struct vfs_fs_context *fc) {
-    struct vfs_super_block *sb;
-    drmfdfs_info_t *fsi;
-    struct vfs_inode *inode;
-    struct vfs_dentry *root;
-
-    if (!fc)
-        return -EINVAL;
-
-    sb = vfs_alloc_super(fc->fs_type, fc->sb_flags);
-    if (!sb)
-        return -ENOMEM;
-
-    fsi = calloc(1, sizeof(*fsi));
-    if (!fsi) {
-        vfs_put_super(sb);
-        return -ENOMEM;
-    }
-
-    spin_init(&fsi->lock);
-    fsi->next_ino = 1;
-    sb->s_magic = 0x64726d66ULL;
-    sb->s_fs_info = fsi;
-    sb->s_op = &drmfdfs_super_ops;
-    sb->s_type = &drmfdfs_fs_type;
-
-    inode = vfs_alloc_inode(sb);
-    if (!inode) {
-        free(fsi);
-        vfs_put_super(sb);
-        return -ENOMEM;
-    }
-
-    inode->i_ino = 1;
-    inode->inode = 1;
-    inode->i_mode = S_IFDIR | 0700;
-    inode->i_nlink = 2;
-    inode->i_fop = &drmfdfs_dir_file_ops;
-
-    root = vfs_d_alloc(sb, NULL, NULL);
-    if (!root) {
-        vfs_iput(inode);
-        free(fsi);
-        vfs_put_super(sb);
-        return -ENOMEM;
-    }
-
-    vfs_d_instantiate(root, inode);
-    sb->s_root = root;
-    fc->sb = sb;
-    return 0;
-}
-
-static const struct vfs_super_operations drmfdfs_super_ops = {
-    .alloc_inode = drmfdfs_alloc_inode,
-    .destroy_inode = drmfdfs_destroy_inode,
-    .put_super = drmfdfs_put_super,
-    .statfs = drmfdfs_statfs,
-};
-
-static struct vfs_file_system_type drmfdfs_fs_type = {
-    .name = "drmfdfs",
-    .fs_flags = VFS_FS_VIRTUAL,
-    .init_fs_context = drmfdfs_init_fs_context,
-    .get_tree = drmfdfs_get_tree,
-};
-
-static struct vfs_mount *drmfdfs_get_internal_mount(void) {
-    int ret;
-
-    spin_lock(&drmfdfs_register_lock);
-    if (!drmfdfs_registered) {
-        spin_init(&drmfdfs_mount_lock);
-        vfs_register_filesystem(&drmfdfs_fs_type);
-        drmfdfs_registered = true;
-    }
-    spin_unlock(&drmfdfs_register_lock);
-
-    spin_lock(&drmfdfs_mount_lock);
-    if (!drmfdfs_internal_mnt) {
-        ret = vfs_kern_mount("drmfdfs", 0, NULL, NULL, &drmfdfs_internal_mnt);
-        if (ret < 0)
-            drmfdfs_internal_mnt = NULL;
-    }
-    if (drmfdfs_internal_mnt)
-        vfs_mntget(drmfdfs_internal_mnt);
-    spin_unlock(&drmfdfs_mount_lock);
-    return drmfdfs_internal_mnt;
-}
-
-static ino64_t drmfdfs_next_ino(struct vfs_super_block *sb) {
-    drmfdfs_info_t *fsi = drmfdfs_sb_info(sb);
-    ino64_t ino;
-
-    spin_lock(&fsi->lock);
-    ino = ++fsi->next_ino;
-    spin_unlock(&fsi->lock);
-    return ino;
-}
-
 static loff_t drmfdfs_llseek(struct vfs_file *file, loff_t offset, int whence) {
     (void)file;
     (void)offset;
@@ -351,80 +191,12 @@ static int drmfdfs_release(struct vfs_inode *inode, struct vfs_file *file) {
     return 0;
 }
 
-static int
-drmfdfs_create_file(const char *prefix, const struct vfs_file_operations *ops,
-                    void *private_data, umode_t mode, unsigned int open_flags,
-                    struct vfs_file **out_file, struct vfs_inode **out_inode) {
-    struct vfs_mount *mnt;
-    struct vfs_super_block *sb;
-    struct vfs_inode *inode;
-    struct vfs_dentry *dentry;
-    struct vfs_qstr name = {0};
-    struct vfs_file *file;
-    char label[64];
-
-    if (!prefix || !ops || !private_data || !out_file)
-        return -EINVAL;
-
-    mnt = drmfdfs_get_internal_mount();
-    if (!mnt)
-        return -ENODEV;
-    sb = mnt->mnt_sb;
-
-    inode = vfs_alloc_inode(sb);
-    if (!inode) {
-        vfs_mntput(mnt);
-        return -ENOMEM;
-    }
-
-    inode->i_ino = drmfdfs_next_ino(sb);
-    inode->inode = inode->i_ino;
-    inode->i_mode = mode;
-    if (S_ISREG(mode))
-        inode->i_nlink = 1;
-    inode->i_fop = ops;
-    inode->i_private = private_data;
-
-    snprintf(label, sizeof(label), "%s-%llu", prefix,
-             (unsigned long long)inode->i_ino);
-    vfs_qstr_make(&name, label);
-    dentry = vfs_d_alloc(sb, sb->s_root, &name);
-    if (!dentry) {
-        inode->i_private = NULL;
-        vfs_iput(inode);
-        vfs_mntput(mnt);
-        return -ENOMEM;
-    }
-
-    vfs_d_instantiate(dentry, inode);
-    file = vfs_alloc_file(&(struct vfs_path){.mnt = mnt, .dentry = dentry},
-                          open_flags);
-    if (!file) {
-        vfs_dput(dentry);
-        inode->i_private = NULL;
-        vfs_iput(inode);
-        vfs_mntput(mnt);
-        return -ENOMEM;
-    }
-
-    file->private_data = private_data;
-    *out_file = file;
-    if (out_inode)
-        *out_inode = inode;
-
-    vfs_dput(dentry);
-    vfs_iput(inode);
-    vfs_mntput(mnt);
-    return 0;
-}
-
 static drm_prime_fd_ctx_t *drm_primefd_file_ctx(struct vfs_file *file) {
     if (!file)
         return NULL;
     if (file->private_data)
         return (drm_prime_fd_ctx_t *)file->private_data;
-    if (!file->f_inode || !file->f_inode->i_sb ||
-        file->f_inode->i_sb->s_type != &drmfdfs_fs_type) {
+    if (!drmfs_owns_file(file)) {
         return NULL;
     }
     return (drm_prime_fd_ctx_t *)file->f_inode->i_private;
@@ -674,8 +446,7 @@ static drm_syncfd_ctx_t *drm_syncfd_file_ctx(struct vfs_file *file) {
         return NULL;
     if (file->private_data)
         return (drm_syncfd_ctx_t *)file->private_data;
-    if (!file->f_inode || !file->f_inode->i_sb ||
-        file->f_inode->i_sb->s_type != &drmfdfs_fs_type) {
+    if (!drmfs_owns_file(file)) {
         return NULL;
     }
     return (drm_syncfd_ctx_t *)file->f_inode->i_private;
@@ -1184,9 +955,9 @@ static int drm_leasefd_create(drm_device_t *dev, drm_file_t *owner,
     dev->leases[slot].lessor_id = drm_file_lessor_id(owner);
     spin_unlock(&dev->lease_lock);
 
-    ret = drmfdfs_create_file("drmlease", &drmfdfs_drm_file_ops, lease_file,
-                              S_IFCHR | 0600, O_RDWR | (flags & O_NONBLOCK),
-                              &file, &inode);
+    ret = drmfs_create_file("drmlease", &drmfdfs_drm_file_ops, lease_file,
+                            S_IFCHR | 0600, O_RDWR | (flags & O_NONBLOCK),
+                            &file, &inode);
     if (ret < 0) {
         spin_lock(&dev->lease_lock);
         if (slot >= 0) {
@@ -1236,8 +1007,8 @@ static ssize_t drm_syncfd_create_fd(drm_syncfd_ctx_t *ctx, uint32_t flags) {
     drm_syncfd_ctx_get(ctx);
     struct vfs_file *file = NULL;
     struct vfs_inode *inode = NULL;
-    int ret = drmfdfs_create_file("drmsync", &drmfdfs_sync_file_ops, ctx,
-                                  S_IFCHR | 0600, O_RDWR, &file, &inode);
+    int ret = drmfs_create_file("drmsync", &drmfdfs_sync_file_ops, ctx,
+                                S_IFCHR | 0600, O_RDWR, &file, &inode);
     if (ret < 0) {
         drm_syncfd_ctx_unlink(ctx);
         drm_syncfd_ctx_put(ctx);
@@ -1343,8 +1114,8 @@ ssize_t drm_primefd_create(drm_device_t *dev, uint32_t handle, uint64_t phys,
 
     struct vfs_file *file = NULL;
     struct vfs_inode *inode = NULL;
-    int ret = drmfdfs_create_file("drmprime", &drmfdfs_prime_file_ops, ctx,
-                                  S_IFREG | 0600, O_RDWR, &file, &inode);
+    int ret = drmfs_create_file("drmprime", &drmfdfs_prime_file_ops, ctx,
+                                S_IFREG | 0600, O_RDWR, &file, &inode);
     if (ret < 0) {
         free(ctx);
         return ret;
@@ -2583,6 +2354,14 @@ ssize_t drm_ioctl_version(drm_device_t *dev, void *arg) {
  */
 ssize_t drm_ioctl_get_cap(drm_device_t *dev, void *arg) {
     struct drm_get_cap *cap = (struct drm_get_cap *)arg;
+
+    if (dev && dev->op && dev->op->get_cap) {
+        int ret = dev->op->get_cap(dev, cap);
+
+        if (ret != -ENOTSUP)
+            return ret;
+    }
+
     switch (cap->capability) {
     case DRM_CAP_DUMB_BUFFER:
         cap->value = 1; // Support dumb buffer
@@ -3348,6 +3127,14 @@ ssize_t drm_ioctl_mode_setplane(drm_device_t *dev, void *arg, fd_t *fd) {
     uint32_t old_fb_id = plane->fb_id;
     plane->crtc_id = plane_cmd->crtc_id;
     plane->fb_id = plane_cmd->fb_id;
+    plane->src_x = plane_cmd->src_x;
+    plane->src_y = plane_cmd->src_y;
+    plane->src_w = plane_cmd->src_w;
+    plane->src_h = plane_cmd->src_h;
+    plane->crtc_x = plane_cmd->crtc_x;
+    plane->crtc_y = plane_cmd->crtc_y;
+    plane->crtc_w = plane_cmd->crtc_w;
+    plane->crtc_h = plane_cmd->crtc_h;
 
     // Call driver to set plane (if supported)
     int ret = 0;
@@ -3458,6 +3245,27 @@ ssize_t drm_ioctl_mode_getproperty(drm_device_t *dev, void *arg) {
         }
         return 0;
 
+    case DRM_PROPERTY_ID_HOTSPOT_X:
+    case DRM_PROPERTY_ID_HOTSPOT_Y:
+        prop->flags = DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC;
+        if (prop->prop_id == DRM_PROPERTY_ID_HOTSPOT_X)
+            strncpy((char *)prop->name, "HOTSPOT_X", DRM_PROP_NAME_LEN);
+        else
+            strncpy((char *)prop->name, "HOTSPOT_Y", DRM_PROP_NAME_LEN);
+        prop->name[DRM_PROP_NAME_LEN - 1] = '\0';
+        prop->count_enum_blobs = 0;
+        prop->count_values = 2;
+        if (prop->values_ptr) {
+            uint64_t values[2] = {0, INT32_MAX};
+            uint32_t copy_values = MIN(values_cap, prop->count_values);
+            int ret = drm_copy_to_user_ptr(prop->values_ptr, values,
+                                           copy_values * sizeof(uint64_t));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+
     case DRM_PROPERTY_ID_CRTC_W:
     case DRM_PROPERTY_ID_CRTC_H:
         prop->flags = DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC;
@@ -3470,6 +3278,52 @@ ssize_t drm_ioctl_mode_getproperty(drm_device_t *dev, void *arg) {
         prop->count_values = 2;
         if (prop->values_ptr) {
             uint64_t values[2] = {0, 8192};
+            uint32_t copy_values = MIN(values_cap, prop->count_values);
+            int ret = drm_copy_to_user_ptr(prop->values_ptr, values,
+                                           copy_values * sizeof(uint64_t));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+
+    case DRM_PROPERTY_ID_IN_FENCE_FD:
+        prop->flags = DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC;
+        strncpy((char *)prop->name, "IN_FENCE_FD", DRM_PROP_NAME_LEN);
+        prop->name[DRM_PROP_NAME_LEN - 1] = '\0';
+        prop->count_enum_blobs = 0;
+        prop->count_values = 2;
+        if (prop->values_ptr) {
+            uint64_t values[2] = {(uint64_t)(-(1LL << 31)),
+                                  (uint64_t)((1LL << 31) - 1)};
+            uint32_t copy_values = MIN(values_cap, prop->count_values);
+            int ret = drm_copy_to_user_ptr(prop->values_ptr, values,
+                                           copy_values * sizeof(uint64_t));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+
+    case DRM_PROPERTY_ID_FB_DAMAGE_CLIPS:
+        prop->flags = DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC;
+        strncpy((char *)prop->name, "FB_DAMAGE_CLIPS", DRM_PROP_NAME_LEN);
+        prop->name[DRM_PROP_NAME_LEN - 1] = '\0';
+        prop->count_enum_blobs = 0;
+        prop->count_values = 0;
+        return 0;
+
+    case DRM_CRTC_OUT_FENCE_PTR_PROP_ID:
+        if (!dev || !dev->op || !dev->op->driver_ioctl) {
+            return -EINVAL;
+        }
+        prop->flags = DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC;
+        strncpy((char *)prop->name, "OUT_FENCE_PTR", DRM_PROP_NAME_LEN);
+        prop->name[DRM_PROP_NAME_LEN - 1] = '\0';
+        prop->count_enum_blobs = 0;
+        prop->count_values = 2;
+        if (prop->values_ptr) {
+            uint64_t values[2] = {0, INT64_MAX};
             uint32_t copy_values = MIN(values_cap, prop->count_values);
             int ret = drm_copy_to_user_ptr(prop->values_ptr, values,
                                            copy_values * sizeof(uint64_t));
@@ -4053,20 +3907,22 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
             return -ENOENT;
         }
 
-        // Plane properties needed by wlroots/smithay/weston style atomic
-        // userspace.
-        props->count_props = 12;
+        uint32_t prop_count =
+            plane->plane_type == DRM_PLANE_TYPE_CURSOR ? 16 : 14;
 
         if (props->props_ptr) {
-            uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint32_t prop_ids[12] = {
-                DRM_PROPERTY_ID_PLANE_TYPE, DRM_PROPERTY_ID_IN_FORMATS,
-                DRM_PROPERTY_ID_FB_ID,      DRM_PROPERTY_ID_CRTC_ID,
-                DRM_PROPERTY_ID_SRC_X,      DRM_PROPERTY_ID_SRC_Y,
-                DRM_PROPERTY_ID_SRC_W,      DRM_PROPERTY_ID_SRC_H,
-                DRM_PROPERTY_ID_CRTC_X,     DRM_PROPERTY_ID_CRTC_Y,
-                DRM_PROPERTY_ID_CRTC_W,     DRM_PROPERTY_ID_CRTC_H,
+            uint32_t copy_props = MIN(props_cap, prop_count);
+            uint32_t prop_ids[16] = {
+                DRM_PROPERTY_ID_PLANE_TYPE,  DRM_PROPERTY_ID_IN_FORMATS,
+                DRM_PROPERTY_ID_FB_ID,       DRM_PROPERTY_ID_CRTC_ID,
+                DRM_PROPERTY_ID_SRC_X,       DRM_PROPERTY_ID_SRC_Y,
+                DRM_PROPERTY_ID_SRC_W,       DRM_PROPERTY_ID_SRC_H,
+                DRM_PROPERTY_ID_CRTC_X,      DRM_PROPERTY_ID_CRTC_Y,
+                DRM_PROPERTY_ID_CRTC_W,      DRM_PROPERTY_ID_CRTC_H,
+                DRM_PROPERTY_ID_IN_FENCE_FD, DRM_PROPERTY_ID_FB_DAMAGE_CLIPS,
+                DRM_PROPERTY_ID_HOTSPOT_X,   DRM_PROPERTY_ID_HOTSPOT_Y,
             };
+            props->count_props = prop_count;
 
             int ret = drm_copy_to_user_ptr(props->props_ptr, prop_ids,
                                            copy_props * sizeof(uint32_t));
@@ -4075,55 +3931,64 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
             }
         }
         if (props->prop_values_ptr) {
-            uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint64_t prop_values[12];
+            uint32_t copy_props;
+            uint64_t prop_values[16];
 
+            props->count_props = prop_count;
+            copy_props = MIN(props_cap, prop_count);
             prop_values[0] = plane->plane_type;
             prop_values[1] = drm_plane_in_formats_blob_id(plane->id);
             prop_values[2] = plane->fb_id; // 当前关联的 framebuffer
             prop_values[3] = plane->crtc_id;
-            prop_values[4] = 0;
-            prop_values[5] = 0;
-            prop_values[6] = 0;
-            prop_values[7] = 0;
+            prop_values[4] = plane->src_x;
+            prop_values[5] = plane->src_y;
+            prop_values[6] = plane->src_w;
+            prop_values[7] = plane->src_h;
+            prop_values[8] = (uint64_t)(int64_t)plane->crtc_x;
+            prop_values[9] = (uint64_t)(int64_t)plane->crtc_y;
+            prop_values[10] = plane->crtc_w;
+            prop_values[11] = plane->crtc_h;
 
-            drm_crtc_t *crtc = NULL;
-            if (plane->crtc_id) {
-                crtc = drm_crtc_get(&dev->resource_mgr, plane->crtc_id);
+            if ((prop_values[6] == 0 || prop_values[7] == 0) &&
+                plane->fb_id != 0) {
+                drm_framebuffer_t *fb =
+                    drm_framebuffer_get(&dev->resource_mgr, plane->fb_id);
+
+                if (fb) {
+                    if (prop_values[6] == 0)
+                        prop_values[6] = ((uint64_t)fb->width) << 16;
+                    if (prop_values[7] == 0)
+                        prop_values[7] = ((uint64_t)fb->height) << 16;
+                    drm_framebuffer_free(&dev->resource_mgr, fb->id);
+                }
             }
 
-            drm_framebuffer_t *fb = NULL;
-            if (plane->fb_id) {
-                fb = drm_framebuffer_get(&dev->resource_mgr, plane->fb_id);
+            if ((prop_values[10] == 0 || prop_values[11] == 0) &&
+                plane->crtc_id != 0) {
+                drm_crtc_t *crtc =
+                    drm_crtc_get(&dev->resource_mgr, plane->crtc_id);
+
+                if (crtc) {
+                    if (prop_values[10] == 0)
+                        prop_values[10] = crtc->w;
+                    if (prop_values[11] == 0)
+                        prop_values[11] = crtc->h;
+                    drm_crtc_free(&dev->resource_mgr, crtc->id);
+                }
             }
 
-            if (fb) {
-                prop_values[6] = ((uint64_t)fb->width) << 16;
-                prop_values[7] = ((uint64_t)fb->height) << 16;
-                drm_framebuffer_free(&dev->resource_mgr, fb->id);
-            } else if (crtc) {
-                prop_values[6] = ((uint64_t)crtc->w) << 16;
-                prop_values[7] = ((uint64_t)crtc->h) << 16;
-            }
-
-            if (crtc) {
-                prop_values[8] = crtc->x;
-                prop_values[9] = crtc->y;
-                prop_values[10] = crtc->w;
-                prop_values[11] = crtc->h;
-                drm_crtc_free(&dev->resource_mgr, crtc->id);
-            } else {
-                prop_values[8] = 0;
-                prop_values[9] = 0;
-                prop_values[10] = 0;
-                prop_values[11] = 0;
-            }
+            prop_values[12] = (uint64_t)-1;
+            prop_values[13] = 0;
+            prop_values[14] = (uint64_t)(int64_t)plane->hotspot_x;
+            prop_values[15] = (uint64_t)(int64_t)plane->hotspot_y;
 
             int ret = drm_copy_to_user_ptr(props->prop_values_ptr, prop_values,
                                            copy_props * sizeof(uint64_t));
             if (ret) {
                 return ret;
             }
+        } else {
+            props->count_props = prop_count;
         }
 
         break;
@@ -4143,12 +4008,13 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
             return -ENOENT;
         }
 
-        props->count_props = 2;
+        props->count_props = (dev && dev->op && dev->op->driver_ioctl) ? 3 : 2;
 
         if (props->props_ptr) {
             uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint32_t prop_ids[2] = {DRM_CRTC_ACTIVE_PROP_ID,
-                                    DRM_CRTC_MODE_ID_PROP_ID};
+            uint32_t prop_ids[3] = {DRM_CRTC_ACTIVE_PROP_ID,
+                                    DRM_CRTC_MODE_ID_PROP_ID,
+                                    DRM_CRTC_OUT_FENCE_PTR_PROP_ID};
             int ret = drm_copy_to_user_ptr(props->props_ptr, prop_ids,
                                            copy_props * sizeof(uint32_t));
             if (ret) {
@@ -4157,7 +4023,7 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
         }
         if (props->prop_values_ptr) {
             uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint64_t prop_values[2] = {1, drm_crtc_mode_blob_id(crtc->id)};
+            uint64_t prop_values[3] = {1, drm_crtc_mode_blob_id(crtc->id), 0};
             int ret = drm_copy_to_user_ptr(props->prop_values_ptr, prop_values,
                                            copy_props * sizeof(uint64_t));
             if (ret) {

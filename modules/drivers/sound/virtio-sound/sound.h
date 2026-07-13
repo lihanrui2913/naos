@@ -1,9 +1,9 @@
 #pragma once
 
-#include "queue.h"
-#include "virtio.h"
+#include <drivers/virtio/queue.h>
+#include <drivers/virtio/virtio.h>
 
-#include "../sound/sound.h"
+#include "../legacy/sound.h"
 
 #define VIRTIO_SOUND_F_CTLS (1ULL << 0)
 

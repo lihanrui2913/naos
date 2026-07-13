@@ -560,8 +560,8 @@ static int split_vma_boundaries_locked(vma_manager_t *mgr, uint64_t start,
     return 0;
 }
 
-static uint64_t update_vma_pte_attrs(task_mm_info_t *mm, uint64_t start,
-                                     uint64_t end, bool *ptes_changed) {
+static uint64_t update_vma_pte_attrs_locked(task_mm_info_t *mm, uint64_t start,
+                                            uint64_t end, bool *ptes_changed) {
     if (!mm || start >= end)
         return 0;
 
@@ -569,12 +569,9 @@ static uint64_t update_vma_pte_attrs(task_mm_info_t *mm, uint64_t start,
     uint64_t cursor = start;
 
     while (cursor < end) {
-        spin_lock(&mgr->lock);
         vma_t *vma = vma_find(mgr, cursor);
-        if (!vma) {
-            spin_unlock(&mgr->lock);
+        if (!vma)
             return (uint64_t)-ENOMEM;
-        }
 
         uint64_t next_cursor =
             mm_pte_attr_batch_end(cursor, MIN(vma->vm_end, end));
@@ -586,7 +583,6 @@ static uint64_t update_vma_pte_attrs(task_mm_info_t *mm, uint64_t start,
         uint64_t *pgdir = task_mm_pgdir(mm);
         if (!pgdir) {
             spin_unlock(&mm->lock);
-            spin_unlock(&mgr->lock);
             return (uint64_t)-1;
         }
 
@@ -594,7 +590,6 @@ static uint64_t update_vma_pte_attrs(task_mm_info_t *mm, uint64_t start,
             pgdir, cursor, next_cursor - cursor,
             vm_flags_to_pt_flags(effective_access), false);
         spin_unlock(&mm->lock);
-        spin_unlock(&mgr->lock);
 
         if ((int64_t)ret < 0)
             return ret;
@@ -1212,14 +1207,10 @@ uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
         cursor = vma->vm_end;
     }
 
-    spin_unlock(&mgr->lock);
-
-    uint64_t ret = update_vma_pte_attrs(mm, addr, end, &ptes_changed);
-    if (ret == 0) {
-        spin_lock(&mgr->lock);
+    uint64_t ret = update_vma_pte_attrs_locked(mm, addr, end, &ptes_changed);
+    if (ret == 0)
         ret = merge_vma_range_locked(mgr, addr, end);
-        spin_unlock(&mgr->lock);
-    }
+    spin_unlock(&mgr->lock);
 
     if (ptes_changed)
         task_mm_flush_tlb_all(mm);
@@ -1281,14 +1272,10 @@ static uint64_t madvise_guard_install_range(uint64_t addr, uint64_t len) {
         cursor = MIN(vma->vm_end, end);
     }
 
-    spin_unlock(&mgr->lock);
-
-    uint64_t ret = update_vma_pte_attrs(mm, addr, end, &ptes_changed);
-    if (ret == 0) {
-        spin_lock(&mgr->lock);
+    uint64_t ret = update_vma_pte_attrs_locked(mm, addr, end, &ptes_changed);
+    if (ret == 0)
         ret = merge_vma_range_locked(mgr, addr, end);
-        spin_unlock(&mgr->lock);
-    }
+    spin_unlock(&mgr->lock);
 
     if (ptes_changed)
         task_mm_flush_tlb_all(mm);
@@ -1325,14 +1312,10 @@ static uint64_t madvise_guard_remove_range(uint64_t addr, uint64_t len) {
         cursor = MIN(vma->vm_end, end);
     }
 
-    spin_unlock(&mgr->lock);
-
-    ret = update_vma_pte_attrs(mm, addr, end, &ptes_changed);
-    if (ret == 0) {
-        spin_lock(&mgr->lock);
+    ret = update_vma_pte_attrs_locked(mm, addr, end, &ptes_changed);
+    if (ret == 0)
         ret = merge_vma_range_locked(mgr, addr, end);
-        spin_unlock(&mgr->lock);
-    }
+    spin_unlock(&mgr->lock);
 
     if (ptes_changed)
         task_mm_flush_tlb_all(mm);
