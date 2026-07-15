@@ -9,6 +9,7 @@
 /initramfs-*
 /obj-modules-*
 /nvidia-open-*
+/*.lock
 *.iso
 *.img
 *.vmdk
