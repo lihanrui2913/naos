@@ -30,7 +30,7 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
     cmd = cmd & 0xFFFFFFFF;
 
     switch (cmd) {
-    case FBIOGET_FSCREENINFO:
+    case FBIOGET_FSCREENINFO: {
         struct fb_fix_screeninfo *fb_fix = (struct fb_fix_screeninfo *)arg;
         memcpy(fb_fix->id, "NAOS-FBDEV", 10);
         fb_fix->smem_start = translate_address(get_current_page_dir(false),
@@ -48,7 +48,8 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
         fb_fix->mmio_len = framebuffer->pitch * framebuffer->height;
         fb_fix->capabilities = 0;
         return 0;
-    case FBIOGET_VSCREENINFO:
+    }
+    case FBIOGET_VSCREENINFO: {
         struct fb_var_screeninfo *fb_var = (struct fb_var_screeninfo *)arg;
         fb_var->xres = framebuffer->width;
         fb_var->yres = framebuffer->height;
@@ -79,9 +80,10 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
         fb_var->width = framebuffer->width / 4;   // VERY approximate
 
         return 0;
+    }
     case 0x4605: // FBIOPUTCMAP, ignore so no xorg.log spam
         return 0;
-    case 0x5413:
+    case 0x5413: {
         struct winsize *win = (struct winsize *)arg;
         win->ws_col = framebuffer->width / 8;
         win->ws_row = framebuffer->height / 16;
@@ -90,8 +92,8 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
         win->ws_ypixel = (uint16_t)framebuffer->height;
 
         return 0;
+    }
     case 0x4601: // FBIOPUT_VSCREENINFO
-        struct fb_var_screeninfo *fb_var_user = (struct fb_var_screeninfo *)arg;
         return 0;
     default:
         return (uint64_t)-ENOTTY;

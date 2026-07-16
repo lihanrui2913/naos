@@ -2528,7 +2528,9 @@ int task_kill_process_group(int pgid, int sig) {
 }
 
 void schedule(uint64_t sched_flags) {
-    jiffies = (unsigned long)(nano_time() / (1000000000ULL / SCHED_HZ));
+    uint64_t now_ns = nano_time();
+
+    jiffies = (unsigned long)(now_ns / (1000000000ULL / SCHED_HZ));
 
     bool state = arch_interrupt_enabled();
     task_t *prev = current_task;
@@ -2540,7 +2542,6 @@ void schedule(uint64_t sched_flags) {
     }
 
     int cpu_id = prev->cpu_id;
-    uint64_t now_ns = nano_time();
 
     if (!prev->last_sched_in_ns && prev->current_state == TASK_RUNNING)
         prev->last_sched_in_ns = now_ns;

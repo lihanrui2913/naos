@@ -59,6 +59,9 @@ int blkdev_mount(blkdev_t *dev) {
         return -1;
 
     uint64_t lba_size = dev->block_size ? dev->block_size : 512;
+    char *iso9660_detect;
+    bool is_iso9660;
+    struct MBR_DPT *boot_sector;
 
     struct GPT_DPT *buffer = (struct GPT_DPT *)malloc(sizeof(struct GPT_DPT));
     if (!buffer)
@@ -120,12 +123,12 @@ int blkdev_mount(blkdev_t *dev) {
     return 0;
 
 probe_mbr:
-    char *iso9660_detect = (char *)malloc(5);
+    iso9660_detect = (char *)malloc(5);
     if (!iso9660_detect)
         return -ENOMEM;
     memset(iso9660_detect, 0, 5);
-    bool is_iso9660 = blkdev_read(dev->id, 0x8001, iso9660_detect, 5) == 5 &&
-                      !memcmp(iso9660_detect, "CD001", 5);
+    is_iso9660 = blkdev_read(dev->id, 0x8001, iso9660_detect, 5) == 5 &&
+                 !memcmp(iso9660_detect, "CD001", 5);
     if (is_iso9660) {
         if (partition_num >= MAX_PARTITIONS_NUM) {
             free(iso9660_detect);
@@ -152,8 +155,7 @@ probe_mbr:
     }
     free(iso9660_detect);
 
-    struct MBR_DPT *boot_sector =
-        (struct MBR_DPT *)malloc(sizeof(struct MBR_DPT));
+    boot_sector = (struct MBR_DPT *)malloc(sizeof(struct MBR_DPT));
     if (!boot_sector)
         return -ENOMEM;
     if (blkdev_read(dev->id, 0, boot_sector, sizeof(struct MBR_DPT)) !=

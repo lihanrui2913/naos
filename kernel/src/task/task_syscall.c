@@ -385,7 +385,7 @@ static uint64_t task_user_translate_access(task_t *task, uint64_t uaddr,
         return 0;
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++)
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(uaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(uaddr, i + 1, levels);
 
     for (uint64_t i = 0; i < levels - 1; i++) {
         uint64_t entry = pgdir[indexs[i]];
@@ -395,8 +395,8 @@ static uint64_t task_user_translate_access(task_t *task, uint64_t uaddr,
                 return 0;
             if (write && !arch_page_table_flags_writable(flags))
                 return 0;
-            return (ARCH_READ_PTE(entry) & ~PAGE_CALC_PAGE_TABLE_MASK(i + 1)) +
-                   (uaddr & PAGE_CALC_PAGE_TABLE_MASK(i + 1));
+            uint64_t mask = PAGE_TABLE_LEVEL_MASK(i + 1, levels);
+            return (ARCH_READ_PTE(entry) & ~mask) + (uaddr & mask);
         }
         if (!ARCH_PT_IS_TABLE(entry))
             return 0;
@@ -413,7 +413,7 @@ static uint64_t task_user_translate_access(task_t *task, uint64_t uaddr,
     if (write && !arch_page_table_flags_writable(flags))
         return 0;
 
-    return ARCH_READ_PTE(pte) + (uaddr & PAGE_CALC_PAGE_TABLE_MASK(levels));
+    return ARCH_READ_PTE(pte) + (uaddr & PAGE_TABLE_LEVEL_MASK(levels, levels));
 }
 
 static uint64_t task_user_translate_or_fault(task_t *task, uint64_t uaddr,

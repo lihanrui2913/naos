@@ -17,6 +17,8 @@ typedef struct rb_root {
     struct rb_node *rb_node;
 } rb_root_t;
 
+typedef void (*rb_augment_f)(rb_node_t *node);
+
 #define RB_ROOT_INIT ((rb_root_t){NULL})
 #define rb_parent(r) ((struct rb_node *)((r)->rb_parent_color & ~3))
 #define rb_color(r) ((r)->rb_parent_color & 1)
@@ -42,6 +44,9 @@ static inline void rb_set_color(rb_node_t *rb, int color) {
 #define rb_entry(ptr, type, member) container_of_or_null(ptr, type, member)
 
 void rb_erase(rb_node_t *node, rb_root_t *root);
+void rb_erase_augmented(rb_node_t *node, rb_root_t *root, rb_augment_f augment);
 void rb_insert_color(rb_node_t *node, rb_root_t *root);
+void rb_insert_augmented(rb_node_t *node, rb_root_t *root,
+                         rb_augment_f augment);
 rb_node_t *rb_first(const rb_root_t *root);
 rb_node_t *rb_next(const rb_node_t *node);

@@ -12,8 +12,10 @@ GLOBAL_CFLAGS := -fno-stack-protector -Wno-address-of-packed-member -fPIC -fno-b
 
 ifeq ($(BUILD_MODE), debug)
 CFLAGS := -g3 -O0 $(GLOBAL_CFLAGS)
-else
+else ifeq ($(BUILD_MODE), release)
 CFLAGS := -O3 $(GLOBAL_CFLAGS)
+else
+    $(error Build mode $(BUILD_MODE) not supported)
 endif
 export CFLAGS
 

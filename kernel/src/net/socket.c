@@ -2662,6 +2662,8 @@ size_t unix_socket_sendmsg(uint64_t fd, const struct msghdr *msg, int flags) {
     socket_t *sock = handle->sock;
     socket_t *peer = unix_socket_get_peer_ref(sock);
     bool peer_needs_unref = false;
+    size_t total_len = 0;
+    int total_ret;
 
     if (!peer) {
         if (unix_socket_is_connected_type(sock->type) && sock->established) {
@@ -2701,8 +2703,7 @@ size_t unix_socket_sendmsg(uint64_t fd, const struct msghdr *msg, int flags) {
     }
 
 done:
-    size_t total_len = 0;
-    int total_ret =
+    total_ret =
         unix_socket_iov_total_len(msg->msg_iov, msg->msg_iovlen, &total_len);
     if (total_ret < 0) {
         unix_socket_put_peer_ref(peer, peer_needs_unref);

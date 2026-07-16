@@ -28,9 +28,15 @@ typedef struct SourceLocation {
     uint32_t col;
 } SourceLocation;
 
+#if __has_attribute(access)
+#define LOG_MEMEQ_ACCESS                                                       \
+    __attribute__((access(read_only, 1, 3), access(read_only, 2, 3)))
+#else
+#define LOG_MEMEQ_ACCESS
+#endif
+
 static inline
-    __attribute__((always_inline, nonnull(1, 2), access(read_only, 1, 3),
-                   access(read_only, 2, 3))) bool
+    __attribute__((always_inline, nonnull(1, 2))) LOG_MEMEQ_ACCESS bool
     _log_memeq_(const void *a, const void *b, __UINTPTR_TYPE__ size) {
     const __UINT8_TYPE__ *p = (const __UINT8_TYPE__ *)a;
     const __UINT8_TYPE__ *q = (const __UINT8_TYPE__ *)b;

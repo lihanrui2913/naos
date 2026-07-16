@@ -315,7 +315,7 @@ map_cow_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     }
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(aligned_vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(aligned_vaddr, i + 1, levels);
     }
 
     for (uint64_t i = 0; i < levels - 1; i++) {
@@ -447,7 +447,7 @@ static page_fault_result_t handle_page_fault_flags_once(task_t *task,
     }
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(aligned_vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(aligned_vaddr, i + 1, levels);
     }
 
     bool has_leaf = true;

@@ -1,6 +1,17 @@
 #include <libs/rbtree.h>
 
-static void __rb_rotate_left(rb_node_t *node, rb_root_t *root) {
+static void rb_augment_path(rb_node_t *node, rb_augment_f augment) {
+    if (!augment)
+        return;
+
+    while (node) {
+        augment(node);
+        node = rb_parent(node);
+    }
+}
+
+static void __rb_rotate_left(rb_node_t *node, rb_root_t *root,
+                             rb_augment_f augment) {
     rb_node_t *right = node->rb_right;
     rb_node_t *parent = rb_parent(node);
 
@@ -18,9 +29,15 @@ static void __rb_rotate_left(rb_node_t *node, rb_root_t *root) {
     } else
         root->rb_node = right;
     rb_set_parent(node, right);
+
+    if (augment) {
+        augment(node);
+        augment(right);
+    }
 }
 
-static void __rb_rotate_right(rb_node_t *node, rb_root_t *root) {
+static void __rb_rotate_right(rb_node_t *node, rb_root_t *root,
+                              rb_augment_f augment) {
     rb_node_t *left = node->rb_left;
     rb_node_t *parent = rb_parent(node);
 
@@ -38,9 +55,15 @@ static void __rb_rotate_right(rb_node_t *node, rb_root_t *root) {
     } else
         root->rb_node = left;
     rb_set_parent(node, left);
+
+    if (augment) {
+        augment(node);
+        augment(left);
+    }
 }
 
-void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
+static void __rb_erase_color(rb_node_t *node, rb_node_t *parent,
+                             rb_root_t *root, rb_augment_f augment) {
     rb_node_t *other;
 
     while ((!node || rb_is_black(node)) && node != root->rb_node) {
@@ -49,7 +72,7 @@ void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
             if (rb_is_red(other)) {
                 rb_set_black(other);
                 rb_set_red(parent);
-                __rb_rotate_left(parent, root);
+                __rb_rotate_left(parent, root, augment);
                 other = parent->rb_right;
             }
             if ((!other->rb_left || rb_is_black(other->rb_left)) &&
@@ -61,13 +84,13 @@ void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
                 if (!other->rb_right || rb_is_black(other->rb_right)) {
                     rb_set_black(other->rb_left);
                     rb_set_red(other);
-                    __rb_rotate_right(other, root);
+                    __rb_rotate_right(other, root, augment);
                     other = parent->rb_right;
                 }
                 rb_set_color(other, rb_color(parent));
                 rb_set_black(parent);
                 rb_set_black(other->rb_right);
-                __rb_rotate_left(parent, root);
+                __rb_rotate_left(parent, root, augment);
                 node = root->rb_node;
                 break;
             }
@@ -76,7 +99,7 @@ void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
             if (rb_is_red(other)) {
                 rb_set_black(other);
                 rb_set_red(parent);
-                __rb_rotate_right(parent, root);
+                __rb_rotate_right(parent, root, augment);
                 other = parent->rb_left;
             }
             if ((!other->rb_left || rb_is_black(other->rb_left)) &&
@@ -88,13 +111,13 @@ void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
                 if (!other->rb_left || rb_is_black(other->rb_left)) {
                     rb_set_black(other->rb_right);
                     rb_set_red(other);
-                    __rb_rotate_left(other, root);
+                    __rb_rotate_left(other, root, augment);
                     other = parent->rb_left;
                 }
                 rb_set_color(other, rb_color(parent));
                 rb_set_black(parent);
                 rb_set_black(other->rb_left);
-                __rb_rotate_right(parent, root);
+                __rb_rotate_right(parent, root, augment);
                 node = root->rb_node;
                 break;
             }
@@ -104,7 +127,8 @@ void __rb_erase_color(rb_node_t *node, rb_node_t *parent, rb_root_t *root) {
         rb_set_black(node);
 }
 
-void rb_insert_color(rb_node_t *node, rb_root_t *root) {
+static void __rb_insert_color(rb_node_t *node, rb_root_t *root,
+                              rb_augment_f augment) {
     rb_node_t *parent, *gparent;
 
     while ((parent = rb_parent(node)) && rb_is_red(parent)) {
@@ -124,7 +148,7 @@ void rb_insert_color(rb_node_t *node, rb_root_t *root) {
 
             if (parent->rb_right == node) {
                 register rb_node_t *tmp;
-                __rb_rotate_left(parent, root);
+                __rb_rotate_left(parent, root, augment);
                 tmp = parent;
                 parent = node;
                 node = tmp;
@@ -132,7 +156,7 @@ void rb_insert_color(rb_node_t *node, rb_root_t *root) {
 
             rb_set_black(parent);
             rb_set_red(gparent);
-            __rb_rotate_right(gparent, root);
+            __rb_rotate_right(gparent, root, augment);
         } else {
             {
                 register rb_node_t *uncle = gparent->rb_left;
@@ -147,7 +171,7 @@ void rb_insert_color(rb_node_t *node, rb_root_t *root) {
 
             if (parent->rb_left == node) {
                 register rb_node_t *tmp;
-                __rb_rotate_right(parent, root);
+                __rb_rotate_right(parent, root, augment);
                 tmp = parent;
                 parent = node;
                 node = tmp;
@@ -155,15 +179,26 @@ void rb_insert_color(rb_node_t *node, rb_root_t *root) {
 
             rb_set_black(parent);
             rb_set_red(gparent);
-            __rb_rotate_left(gparent, root);
+            __rb_rotate_left(gparent, root, augment);
         }
     }
 
     rb_set_black(root->rb_node);
 }
 
-void rb_erase(rb_node_t *node, rb_root_t *root) {
+void rb_insert_color(rb_node_t *node, rb_root_t *root) {
+    __rb_insert_color(node, root, NULL);
+}
+
+void rb_insert_augmented(rb_node_t *node, rb_root_t *root,
+                         rb_augment_f augment) {
+    rb_augment_path(node, augment);
+    __rb_insert_color(node, root, augment);
+}
+
+static void __rb_erase(rb_node_t *node, rb_root_t *root, rb_augment_f augment) {
     rb_node_t *child, *parent;
+    rb_node_t *augment_from;
     int color;
 
     if (!node->rb_left)
@@ -191,7 +226,9 @@ void rb_erase(rb_node_t *node, rb_root_t *root) {
 
         if (parent == old) {
             parent = node;
+            augment_from = node;
         } else {
+            augment_from = parent;
             if (child)
                 rb_set_parent(child, parent);
             parent->rb_left = child;
@@ -208,6 +245,7 @@ void rb_erase(rb_node_t *node, rb_root_t *root) {
     }
 
     parent = rb_parent(node);
+    augment_from = parent;
     color = rb_color(node);
 
     if (child)
@@ -221,8 +259,18 @@ void rb_erase(rb_node_t *node, rb_root_t *root) {
         root->rb_node = child;
 
 color:
+    rb_augment_path(augment_from, augment);
     if (color == KRB_BLACK)
-        __rb_erase_color(child, parent, root);
+        __rb_erase_color(child, parent, root, augment);
+}
+
+void rb_erase(rb_node_t *node, rb_root_t *root) {
+    __rb_erase(node, root, NULL);
+}
+
+void rb_erase_augmented(rb_node_t *node, rb_root_t *root,
+                        rb_augment_f augment) {
+    __rb_erase(node, root, augment);
 }
 
 rb_node_t *rb_first(const rb_root_t *root) {

@@ -15,7 +15,12 @@ ifeq ($(filter $(ARCH),aarch64 loongarch64 riscv64 x86_64),)
     $(error Architecture $(ARCH) not supported)
 endif
 
-GLOBAL_CFLAGS := -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-cast-function-type -Wno-sign-compare -Wno-discarded-qualifiers -Wno-address-of-packed-member
+GLOBAL_CFLAGS := -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-cast-function-type -Wno-sign-compare -Wno-address-of-packed-member
+ifeq ($(CC_IS_CLANG),1)
+    GLOBAL_CFLAGS += -Wno-incompatible-pointer-types-discards-qualifiers
+else
+    GLOBAL_CFLAGS += -Wno-discarded-qualifiers
+endif
 ifeq ($(BOOT_PROTOCOL), limine)
     GLOBAL_CFLAGS += -DCONFIG_BOOT_LIMINE
 else ifeq ($(BOOT_PROTOCOL), sbi)
@@ -32,9 +37,11 @@ endif
 
 # User controllable C flags.
 ifeq ($(BUILD_MODE), debug)
-CFLAGS := -g3 -O0 $(GLOBAL_CFLAGS) -DDEBUG
+CFLAGS := -g3 -O0 -DDEBUG
+else ifeq ($(BUILD_MODE), release)
+CFLAGS := -O3
 else
-CFLAGS := -O3 $(GLOBAL_CFLAGS)
+    $(error Build mode $(BUILD_MODE) not supported)
 endif
 
 # User controllable C preprocessor flags. We set none by default.
@@ -64,6 +71,7 @@ endif
 override CFLAGS += \
     -Wall \
     -Wextra \
+    $(GLOBAL_CFLAGS) \
     -std=gnu11 \
     -nostdinc \
     -ffreestanding \
@@ -194,10 +202,13 @@ override SRCFILES += src/boot/la_boot.c
 endif
 override CFILES := $(filter %.c,$(SRCFILES))
 override ASFILES := $(filter %.S,$(SRCFILES))
-override OBJ := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o))
-override HEADER_DEPS := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
+MODULE_VERIFY_MODE := $(if $(filter 0,$(MODULE_VERIFY)),unsigned,verified)
+KERNEL_OBJ_DIR := obj-$(ARCH)/$(BUILD_MODE)/$(BOOT_PROTOCOL)/$(MODULE_VERIFY_MODE)
 
-GENERATED_DIR := obj-$(ARCH)/generated
+override OBJ := $(addprefix $(KERNEL_OBJ_DIR)/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o))
+override HEADER_DEPS := $(addprefix $(KERNEL_OBJ_DIR)/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
+
+GENERATED_DIR := $(KERNEL_OBJ_DIR)/generated
 KALLSYMS_C := $(GENERATED_DIR)/kallsyms.c
 KALLSYMS_OBJ := $(KALLSYMS_C).o
 KALLSYMS_PRELINK := $(GENERATED_DIR)/kernel.prelink
@@ -289,13 +300,13 @@ $(KALLSYMS_OBJ): $(KALLSYMS_C)
 	$(Q)$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Compilation rules for *.c files.
-obj-$(ARCH)/src/%.c.o: src/%.c GNUmakefile
+$(KERNEL_OBJ_DIR)/src/%.c.o: src/%.c GNUmakefile
 	$(call PRINT_STEP,CC,$<)
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Compilation rules for *.S files.
-obj-$(ARCH)/src/%.S.o: src/%.S GNUmakefile
+$(KERNEL_OBJ_DIR)/src/%.S.o: src/%.S GNUmakefile
 	$(call PRINT_STEP,AS,$<)
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(CC) $(CFLAGS) $(CPPFLAGS) -DASM_FILE -c $< -o $@

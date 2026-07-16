@@ -1391,7 +1391,7 @@ static bool mremap_get_mapped_page(uint64_t *pgdir, uint64_t vaddr,
 
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++)
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
 
     for (uint64_t i = 0; i < levels - 1; i++) {
         uint64_t entry = pgdir[indexs[i]];

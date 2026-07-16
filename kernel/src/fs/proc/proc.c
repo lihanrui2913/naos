@@ -1185,12 +1185,13 @@ static int procfs_iterate_shared(struct vfs_file *file,
             ctx, &index, "memory", DT_REG,
             procfs_ino_for(PROCFS_INO_FILE, NULL, -1, "proc_pressure_memory"));
         break;
-    case PROCFS_INO_TASK_DIR:
+    case PROCFS_INO_TASK_DIR: {
         task_t *task_dir_task = procfs_info_task(info);
         if (!procfs_task_is_alive(task_dir_task))
             return -ENOENT;
         procfs_iterate_task_entries(ctx, &index, task_dir_task);
         break;
+    }
     case PROCFS_INO_TASK_THREADS_DIR: {
         task_t *owner = procfs_info_task(info);
         if (!procfs_task_is_alive(owner))
@@ -1217,7 +1218,7 @@ static int procfs_iterate_shared(struct vfs_file *file,
         free(snapshot);
         break;
     }
-    case PROCFS_INO_NS_DIR:
+    case PROCFS_INO_NS_DIR: {
         task_t *task = procfs_info_task(info);
         if (!procfs_task_is_alive(task))
             return -ENOENT;
@@ -1233,9 +1234,10 @@ static int procfs_iterate_shared(struct vfs_file *file,
             break;
         }
         break;
+    }
     case PROCFS_INO_FD_DIR:
-    case PROCFS_INO_FDINFO_DIR:
-        task = procfs_info_task(info);
+    case PROCFS_INO_FDINFO_DIR: {
+        task_t *task = procfs_info_task(info);
         if (procfs_task_is_alive(task)) {
             for (int fd_num = 0; fd_num < MAX_FD_NUM; ++fd_num) {
                 char name[16];
@@ -1261,6 +1263,7 @@ static int procfs_iterate_shared(struct vfs_file *file,
             }
         }
         break;
+    }
     default:
         return -ENOTDIR;
     }

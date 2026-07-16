@@ -606,8 +606,9 @@ static uint64_t mm_page_table_entries_per_level(void) {
     return (uint64_t)1 << ARCH_PT_OFFSET_PER_LEVEL;
 }
 
-static uint64_t mm_page_table_level_region_size(uint64_t level) {
-    uint64_t span = PAGE_CALC_PAGE_TABLE_SIZE(level);
+static uint64_t mm_page_table_level_region_size(uint64_t level,
+                                                uint64_t levels) {
+    uint64_t span = PAGE_TABLE_LEVEL_SIZE(level, levels);
     uint64_t entries = mm_page_table_entries_per_level();
 
     if (!span || span > UINT64_MAX / entries)
@@ -627,13 +628,13 @@ static void map_change_attribute_present_range(uint64_t *table, uint64_t level,
     if (!table || start >= end || level == 0 || level > levels)
         return;
 
-    uint64_t span = PAGE_CALC_PAGE_TABLE_SIZE(level);
+    uint64_t span = PAGE_TABLE_LEVEL_SIZE(level, levels);
     if (!span)
         return;
 
     uint64_t entries = mm_page_table_entries_per_level();
-    uint64_t first = PAGE_CALC_PAGE_TABLE_INDEX(start, level);
-    uint64_t last = PAGE_CALC_PAGE_TABLE_INDEX(end - 1, level);
+    uint64_t first = PAGE_TABLE_LEVEL_INDEX(start, level, levels);
+    uint64_t last = PAGE_TABLE_LEVEL_INDEX(end - 1, level, levels);
     if (first >= entries)
         first = entries - 1;
     if (last >= entries)
@@ -690,7 +691,7 @@ uint64_t map_change_attribute_range(uint64_t *pgdir, uint64_t vaddr,
     if (!levels || levels > ARCH_MAX_PT_LEVEL)
         return 0;
 
-    uint64_t region_size = mm_page_table_level_region_size(1);
+    uint64_t region_size = mm_page_table_level_region_size(1, levels);
     uint64_t arch_flags = get_arch_page_table_flags(flags);
     uint64_t cursor = vaddr;
 

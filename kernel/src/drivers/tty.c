@@ -691,6 +691,8 @@ char *default_console = NULL;
 
 void parse_cmdline_console(const char *cmdline) {
     static char console_name[64];
+    char buf[64];
+
     memset(console_name, 0, sizeof(console_name));
 
     boot_framebuffer_t *boot_fb = boot_get_framebuffer();
@@ -720,7 +722,6 @@ void parse_cmdline_console(const char *cmdline) {
     console_name[i] = '\0';
 
 next:
-    char buf[64];
     sprintf(buf, "/dev/%s", console_name);
 
     default_console = strdup(buf);

@@ -795,9 +795,10 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
         };
         uint32_t bucket_id;
         futex_bucket_t *bucket = futex_bucket_for_key(&key, &bucket_id);
+        int owner;
 
     retry:
-        int owner = 0;
+        owner = 0;
         if (!futex_read_user_word(uaddr, &owner))
             return (uint64_t)-EFAULT;
 

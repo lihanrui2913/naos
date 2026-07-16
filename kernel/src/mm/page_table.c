@@ -17,16 +17,15 @@ uint64_t translate_address(uint64_t *pgdir, uint64_t vaddr) {
         return 0;
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
     }
 
     for (uint64_t i = 0; i < levels - 1; i++) {
         uint64_t index = indexs[i];
         uint64_t addr = pgdir[index];
         if (ARCH_PT_IS_LARGE(addr)) {
-            return (ARCH_READ_PTE(pgdir[index]) &
-                    ~PAGE_CALC_PAGE_TABLE_MASK(i + 1)) +
-                   (vaddr & PAGE_CALC_PAGE_TABLE_MASK(i + 1));
+            uint64_t mask = PAGE_TABLE_LEVEL_MASK(i + 1, levels);
+            return (ARCH_READ_PTE(pgdir[index]) & ~mask) + (vaddr & mask);
         }
         if (!ARCH_PT_IS_TABLE(addr)) {
             return 0;
@@ -39,7 +38,7 @@ uint64_t translate_address(uint64_t *pgdir, uint64_t vaddr) {
     if (!(pte & ARCH_PT_FLAG_VALID))
         return 0;
 
-    return ARCH_READ_PTE(pte) + (vaddr & PAGE_CALC_PAGE_TABLE_MASK(levels));
+    return ARCH_READ_PTE(pte) + (vaddr & PAGE_TABLE_LEVEL_MASK(levels, levels));
 }
 
 uint64_t *kernel_page_dir = NULL;
@@ -170,7 +169,7 @@ uint64_t map_page(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
     uint64_t created_table_addrs[ARCH_MAX_PT_LEVEL - 1] = {0};
     size_t created_tables = 0;
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
     }
 
     for (uint64_t i = 0; i < levels - 1; i++) {
@@ -258,7 +257,7 @@ uint64_t unmap_page_defer_release(uint64_t *pgdir, uint64_t vaddr,
     uint64_t table_indices[ARCH_MAX_PT_LEVEL];
 
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
     }
 
     // 保存每一级页表的指针和索引
@@ -339,8 +338,8 @@ static uint64_t page_table_entries_per_level(void) {
     return (uint64_t)1 << ARCH_PT_OFFSET_PER_LEVEL;
 }
 
-static uint64_t page_table_region_size(uint64_t level) {
-    uint64_t span = PAGE_CALC_PAGE_TABLE_SIZE(level);
+static uint64_t page_table_region_size(uint64_t level, uint64_t levels) {
+    uint64_t span = PAGE_TABLE_LEVEL_SIZE(level, levels);
     uint64_t entries = page_table_entries_per_level();
 
     if (!span || span > UINT64_MAX / entries)
@@ -360,13 +359,13 @@ static uint64_t unmap_present_range(uint64_t *table, uint64_t level,
     if (!table || start >= end || level == 0 || level > levels)
         return end;
 
-    uint64_t span = PAGE_CALC_PAGE_TABLE_SIZE(level);
+    uint64_t span = PAGE_TABLE_LEVEL_SIZE(level, levels);
     if (!span)
         return end;
 
     uint64_t entries = page_table_entries_per_level();
-    uint64_t first = PAGE_CALC_PAGE_TABLE_INDEX(start, level);
-    uint64_t last = PAGE_CALC_PAGE_TABLE_INDEX(end - 1, level);
+    uint64_t first = PAGE_TABLE_LEVEL_INDEX(start, level, levels);
+    uint64_t last = PAGE_TABLE_LEVEL_INDEX(end - 1, level, levels);
     if (first >= entries)
         first = entries - 1;
     if (last >= entries)
@@ -437,7 +436,7 @@ uint64_t unmap_page_range_defer_release(uint64_t *pgdir, uint64_t vaddr,
     if (!page_table_levels_valid(levels))
         return end;
 
-    uint64_t region_size = page_table_region_size(1);
+    uint64_t region_size = page_table_region_size(1, levels);
     uint64_t cursor = vaddr;
     uint64_t scanned = 0;
 
@@ -469,7 +468,7 @@ uint64_t map_change_attribute(uint64_t *pgdir, uint64_t vaddr, uint64_t flags,
         return 0;
     uint64_t indexs[ARCH_MAX_PT_LEVEL];
     for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, i + 1);
+        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
     }
 
     for (uint64_t i = 0; i < levels - 1; i++) {
@@ -515,7 +514,7 @@ static uint64_t page_table_entry_span(int level) {
     if (!page_table_levels_valid(levels) || level <= 0 ||
         (uint64_t)level > levels)
         return 0;
-    return PAGE_CALC_PAGE_TABLE_SIZE(levels - level + 1);
+    return PAGE_TABLE_LEVEL_SIZE(levels - level + 1, levels);
 }
 
 static bool vma_is_private_mapping(vma_t *vma) {

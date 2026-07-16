@@ -33,4 +33,4 @@ Programs supported on aether-os include [Weston](https://gitlab.freedesktop.org/
 
 ## Running naos
 
-Running `make prepare` and `make run` will build the kernel and a bootable image and a rootfs image, and then run it using `qemu` (if installed).
+Running `make prepare` and `make run` will build the optimized kernel and a bootable image and a rootfs image, and then run it using `qemu` (if installed). Use `BUILD_MODE=debug make run` for an unoptimized kernel with debug symbols.

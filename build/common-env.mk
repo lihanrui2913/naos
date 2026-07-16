@@ -3,7 +3,7 @@
 NAOS_BUILD_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 PROJECT_ROOT ?= $(abspath $(NAOS_BUILD_DIR)/..)
-BUILD_MODE ?= debug
+BUILD_MODE ?= release
 BOOT_PROTOCOL ?= limine
 MODULE_VERIFY ?= 0
 BUILD_LINUX_DRIVERS ?= 0

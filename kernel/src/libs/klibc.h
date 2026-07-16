@@ -87,11 +87,14 @@
 #define _IOC_NR(nr) (((nr) >> _IOC_NRSHIFT) & _IOC_NRMASK)
 #define _IOC_SIZE(nr) (((nr) >> _IOC_SIZESHIFT) & _IOC_SIZEMASK)
 
-void panic(const char *file, int line, const char *func, const char *cond);
+__attribute__((noreturn)) void panic(const char *file, int line,
+                                     const char *func, const char *cond);
 
 #define ASSERT(condition)                                                      \
-    if (!(condition))                                                          \
-    panic(__FILE__, __LINE__, __func__, #condition)
+    do {                                                                       \
+        if (!(condition))                                                      \
+            panic(__FILE__, __LINE__, __func__, #condition);                   \
+    } while (0)
 
 typedef long ssize_t;
 #define SSIZE_MAX __LONG_MAX__

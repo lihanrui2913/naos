@@ -18,6 +18,7 @@ typedef struct kmem_cache {
     size_t order;
     spinlock_t lock;
     uint64_t partial_head_pfn;
+    uint64_t empty_slab_pfn;
 } kmem_cache_t;
 
 static const size_t kmalloc_cache_sizes[] = {
@@ -131,6 +132,14 @@ static void clear_slab_pages(page_t *head) {
     }
 }
 
+static void release_slab(page_t *slab) {
+    uintptr_t phys = page_to_phys(slab);
+    size_t order = slab->order;
+
+    clear_slab_pages(slab);
+    buddy_free_zone(get_zone(ZONE_NORMAL), phys, order);
+}
+
 static void clear_claimed_large_pages(page_t *head) {
     size_t pages = order_pages(head->order);
     uintptr_t phys = page_to_phys(head);
@@ -215,6 +224,7 @@ void kmalloc_init(void) {
             return;
         }
         cache->partial_head_pfn = PAGE_LIST_NONE;
+        cache->empty_slab_pfn = PAGE_LIST_NONE;
         spin_init(&cache->lock);
     }
 }
@@ -294,6 +304,7 @@ retry:
             spin_unlock(&cache->lock);
             if (!reclaimed) {
                 reclaimed = true;
+                (void)malloc_trim(0);
                 (void)page_cache_reclaim_half();
                 goto retry;
             }
@@ -301,6 +312,10 @@ retry:
         }
         list_push(cache, slab);
     }
+
+    if (cache->empty_slab_pfn != PAGE_LIST_NONE &&
+        cache->empty_slab_pfn == page_to_pfn(slab))
+        cache->empty_slab_pfn = PAGE_LIST_NONE;
 
     slab_object_t *object = slab->freelist;
     slab->freelist = object->next;
@@ -370,14 +385,18 @@ static void cache_free(page_t *page, void *ptr) {
     slab_set_state(slab, inuse, objects);
 
     if (inuse == 0) {
+        if (cache->empty_slab_pfn == PAGE_LIST_NONE) {
+            if (was_full)
+                list_push(cache, slab);
+            cache->empty_slab_pfn = page_to_pfn(slab);
+            spin_unlock(&cache->lock);
+            return;
+        }
+
         if (!was_full)
             list_remove(cache, slab);
         spin_unlock(&cache->lock);
-
-        uintptr_t phys = page_to_phys(slab);
-        size_t order = slab->order;
-        clear_slab_pages(slab);
-        buddy_free_zone(get_zone(ZONE_NORMAL), phys, order);
+        release_slab(slab);
         return;
     }
 
@@ -437,6 +456,7 @@ static void *large_alloc_aligned(size_t size, size_t alignment) {
     uintptr_t phys =
         buddy_alloc_zone_pages(zone, order_pages(order), &allocated_pages);
     if (!phys || allocated_pages != order_pages(order)) {
+        (void)malloc_trim(0);
         (void)page_cache_reclaim_half();
         phys =
             buddy_alloc_zone_pages(zone, order_pages(order), &allocated_pages);
@@ -645,8 +665,35 @@ void *pvalloc(size_t size) {
 }
 
 int malloc_trim(size_t pad) {
-    (void)pad;
-    return 0;
+    size_t retained = 0;
+    bool released = false;
+
+    for (size_t i = 0; i < KMALLOC_NR_CACHES; i++) {
+        kmem_cache_t *cache = &kmalloc_caches[i];
+        size_t bytes = order_bytes(cache->order);
+
+        spin_lock(&cache->lock);
+        page_t *slab = page_from_pfn(cache->empty_slab_pfn);
+        if (!slab) {
+            cache->empty_slab_pfn = PAGE_LIST_NONE;
+            spin_unlock(&cache->lock);
+            continue;
+        }
+        if (retained < pad && bytes <= pad - retained) {
+            retained += bytes;
+            spin_unlock(&cache->lock);
+            continue;
+        }
+
+        list_remove(cache, slab);
+        cache->empty_slab_pfn = PAGE_LIST_NONE;
+        spin_unlock(&cache->lock);
+
+        release_slab(slab);
+        released = true;
+    }
+
+    return released;
 }
 
 int mallopt(int param, int value) {

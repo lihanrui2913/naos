@@ -30,7 +30,10 @@ void uacpi_kernel_unmap(void *addr, uacpi_size len) {
     //                  (uint64_t)addr & ~(PAGE_SIZE - 1), len);
 }
 
-void uacpi_kernel_log(uacpi_log_level, const uacpi_char *str) { printk(str); }
+void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str) {
+    (void)level;
+    printk(str);
+}
 
 uacpi_status uacpi_kernel_pci_device_open(uacpi_pci_address address,
                                           uacpi_handle *out_handle) {
@@ -44,7 +47,7 @@ uacpi_status uacpi_kernel_pci_device_open(uacpi_pci_address address,
     return UACPI_STATUS_NOT_FOUND;
 }
 
-void uacpi_kernel_pci_device_close(uacpi_handle) {}
+void uacpi_kernel_pci_device_close(uacpi_handle handle) { (void)handle; }
 
 uacpi_status uacpi_kernel_pci_read8(uacpi_handle device, uacpi_size offset,
                                     uacpi_u8 *value) {
@@ -293,8 +296,11 @@ uacpi_status uacpi_kernel_install_interrupt_handler(
 
 #endif
 
-uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler,
-                                                      uacpi_handle irq_handle) {
+uacpi_status
+uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler handler,
+                                         uacpi_handle irq_handle) {
+    (void)handler;
+    (void)irq_handle;
     return UACPI_STATUS_UNIMPLEMENTED;
 }
 

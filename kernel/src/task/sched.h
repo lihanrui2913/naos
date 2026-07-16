@@ -14,6 +14,7 @@ struct sched_entity {
     uint64_t deadline;
     uint64_t slice_ns;
     uint64_t exec_start_ns;
+    uint64_t subtree_min_vruntime;
     bool on_rq;
 };
 
@@ -21,7 +22,6 @@ typedef struct sched_rq {
     rb_root_t run_tree;
     struct sched_entity *idle;
     struct sched_entity *curr;
-    struct sched_entity *min_vruntime_entity;
     uint64_t min_vruntime;
     uint64_t load_weight;
     size_t nr_running;

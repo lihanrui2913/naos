@@ -5,7 +5,8 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -15,7 +16,8 @@
       forAllSystems = f: lib.genAttrs systems (system: f system);
     in
     {
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
 
@@ -42,9 +44,9 @@
             esac
 
             case "$kind" in
-              gcc) exec ${pkgs.clang}/bin/clang "$@" ;;
+              gcc) exec ${pkgs.llvmPackages.clang-unwrapped}/bin/clang "$@" ;;
               g++)
-                exec ${pkgs.clang}/bin/clang++ "$@"
+                exec ${pkgs.llvmPackages.clang-unwrapped}/bin/clang++ "$@"
                 ;;
               ld)
                 rewritten=(-m "$ld_emulation")
@@ -85,7 +87,7 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              bash
+              zsh
               binutils
               clang
               cpio
@@ -115,19 +117,25 @@
 
             shellHook = ''
               export ARCH="''${ARCH:-x86_64}"
-              export BUILD_MODE="''${BUILD_MODE:-debug}"
+              export BUILD_MODE="''${BUILD_MODE:-release}"
 
               echo "naos dev shell"
               echo "default ARCH=$ARCH"
               echo "host tools are available; project scripts still invoke sudo for image/rootfs steps"
+              if [[ $- == *i* ]]; then
+                exec zsh
+              fi
             '';
           };
-        });
+        }
+      );
 
-      formatter = forAllSystems (system:
+      formatter = forAllSystems (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
         in
-        pkgs.nixfmt);
+        pkgs.nixfmt
+      );
     };
 }

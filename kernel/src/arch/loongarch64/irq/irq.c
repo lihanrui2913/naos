@@ -139,7 +139,8 @@ static bool loongarch64_fault_access_allowed_now(task_t *task, uint64_t vaddr,
     uint64_t entry = 0;
 
     for (uint64_t level = 0; level < ARCH_MAX_PT_LEVEL; level++) {
-        uint64_t index = PAGE_CALC_PAGE_TABLE_INDEX(vaddr, level + 1);
+        uint64_t index =
+            PAGE_TABLE_LEVEL_INDEX(vaddr, level + 1, ARCH_MAX_PT_LEVEL);
         entry = table[index];
 
         if (level == ARCH_MAX_PT_LEVEL - 1 || ARCH_PT_IS_LARGE(entry))
