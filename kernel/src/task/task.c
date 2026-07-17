@@ -1374,7 +1374,7 @@ void task_complete_vfork(task_t *task) {
         return;
     }
 
-    uint64_t parent_pid = task_parent_pid(task);
+    uint64_t parent_pid = task->vfork_parent_pid;
     if (!parent_pid) {
         return;
     }
@@ -1382,11 +1382,13 @@ void task_complete_vfork(task_t *task) {
     spin_lock(&task_queue_lock);
     task_t *parent = task_lookup_by_pid_nolock(parent_pid);
     if (!parent || parent->child_vfork_done) {
+        task->vfork_parent_pid = 0;
         spin_unlock(&task_queue_lock);
         return;
     }
 
     parent->child_vfork_done = true;
+    task->vfork_parent_pid = 0;
     if (parent->state == TASK_BLOCKING || parent->block_preparing) {
         task_unblock(parent, EOK);
     }

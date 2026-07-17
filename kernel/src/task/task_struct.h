@@ -427,6 +427,7 @@ typedef struct task {
     bool is_kernel;
     bool is_clone;
     bool child_vfork_done;
+    uint64_t vfork_parent_pid;
     bool orphaned_to_init;
     bool exit_reaped;
     bool on_cpu;

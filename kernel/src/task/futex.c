@@ -441,7 +441,14 @@ static inline bool futex_should_interrupt_before_sleep(void) {
 
 static int futex_wait_poll(struct futex_wait *wait, uint64_t deadline_ns,
                            bool has_timeout, bool realtime_clock) {
+    bool block_prepared = true;
+
     while (true) {
+        if (!block_prepared) {
+            task_prepare_block(current_task);
+            block_prepared = true;
+        }
+
         futex_bucket_t *bucket = futex_lock_wait_bucket(wait);
         bool queued = futex_wait_queued_locked(wait);
         spin_unlock(&bucket->lock);
@@ -472,6 +479,7 @@ static int futex_wait_poll(struct futex_wait *wait, uint64_t deadline_ns,
 
         int reason =
             task_block(current_task, TASK_BLOCKING, sleep_ns, "futex_wait");
+        block_prepared = false;
         if (reason < 0) {
             bucket = futex_lock_wait_bucket(wait);
             bool removed = futex_dequeue_from_bucket_locked(bucket, wait);

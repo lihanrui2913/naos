@@ -3536,6 +3536,7 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     memcpy(child->rlim, self->rlim, sizeof(child->rlim));
 
     child->child_vfork_done = false;
+    child->vfork_parent_pid = (flags & CLONE_VFORK) ? self->pid : 0;
 
     child->clone_flags = flags;
     child->is_clone = !!(flags & CLONE_THREAD);

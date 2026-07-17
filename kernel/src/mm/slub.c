@@ -368,7 +368,11 @@ static void cache_free(page_t *page, void *ptr) {
 
     if (!slab_object_allocated(slab, index)) {
         spin_unlock(&cache->lock);
+#ifdef DEBUG
         ASSERT(!"double free or invalid slab free");
+#else
+        return;
+#endif
     }
 
     uint16_t inuse = slab_inuse(slab);
