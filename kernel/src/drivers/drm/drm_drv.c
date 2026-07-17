@@ -26,37 +26,60 @@ static drm_event_node_binding_t
 static spinlock_t drm_event_node_bindings_lock = SPIN_INIT;
 static drm_device_t *drm_devices[DRM_MAX_TRACKED_DEVICES];
 static spinlock_t drm_devices_lock = SPIN_INIT;
+static drm_file_t *drm_current_file(void *data, fd_t *fd) {
+    drm_file_t *file = (drm_file_t *)device_file_private(fd);
 
-static void drm_event_file_from_node(vfs_node_t *node, struct vfs_file *file) {
-    memset(file, 0, sizeof(*file));
-    file->f_inode = node;
-    file->node = node;
-    file->f_op = node ? node->i_fop : NULL;
+    if (!file && fd)
+        file = (drm_file_t *)fd->private_data;
+
+    if (file && file->magic == DRM_FILE_MAGIC && file->dev)
+        return file;
+
+    file = (drm_file_t *)data;
+    if (file && file->magic == DRM_FILE_MAGIC && file->dev)
+        return file;
+
+    return NULL;
 }
 
-static bool drm_queue_ready_event_locked(drm_device_t *dev, uint32_t type,
+static bool drm_queue_ready_event_locked(drm_file_t *file, uint32_t type,
                                          uint64_t user_data,
                                          uint64_t timestamp_ns,
                                          uint64_t sequence) {
     uint32_t slot = 0;
 
-    if (!dev)
+    if (!file)
         return false;
 
-    if (dev->drm_event_count == DRM_MAX_EVENTS_COUNT) {
-        dev->drm_event_head = (dev->drm_event_head + 1) % DRM_MAX_EVENTS_COUNT;
-        dev->drm_event_count--;
+    if (file->drm_event_count == DRM_MAX_EVENTS_COUNT) {
+        file->drm_event_head =
+            (file->drm_event_head + 1) % DRM_MAX_EVENTS_COUNT;
+        file->drm_event_count--;
     }
 
-    slot = (dev->drm_event_head + dev->drm_event_count) % DRM_MAX_EVENTS_COUNT;
-    dev->drm_events[slot].type = type;
-    dev->drm_events[slot].user_data = user_data;
-    dev->drm_events[slot].timestamp.tv_sec = timestamp_ns / 1000000000ULL;
-    dev->drm_events[slot].timestamp.tv_nsec = timestamp_ns % 1000000000ULL;
-    dev->drm_events[slot].sequence = sequence;
-    dev->drm_event_count++;
+    slot =
+        (file->drm_event_head + file->drm_event_count) % DRM_MAX_EVENTS_COUNT;
+    file->drm_events[slot].type = type;
+    file->drm_events[slot].user_data = user_data;
+    file->drm_events[slot].timestamp.tv_sec = timestamp_ns / 1000000000ULL;
+    file->drm_events[slot].timestamp.tv_nsec = timestamp_ns % 1000000000ULL;
+    file->drm_events[slot].sequence = sequence;
+    file->drm_events[slot].file = file;
+    file->drm_event_count++;
 
     return true;
+}
+
+static vfs_node_t *drm_file_event_node_get_locked(drm_file_t *file) {
+    return file && file->event_node ? vfs_igrab(file->event_node) : NULL;
+}
+
+static void drm_notify_file_event_node(vfs_node_t *node) {
+    if (!node)
+        return;
+
+    vfs_poll_notify_inode(node, EPOLLIN | EPOLLRDNORM);
+    vfs_iput(node);
 }
 
 static void drm_device_track(drm_device_t *dev) {
@@ -114,10 +137,6 @@ static void drm_notify_event_node_flags(drm_device_t *dev, uint32_t events) {
         vfs_poll_notify_inode(event_node, events);
         vfs_iput(event_node);
     }
-}
-
-static void drm_notify_event_node(drm_device_t *dev) {
-    drm_notify_event_node_flags(dev, EPOLLIN | EPOLLRDNORM);
 }
 
 static vfs_node_t *drm_lookup_inode(const char *path) {
@@ -206,20 +225,20 @@ static void drm_event_node_unregister(drm_device_t *dev) {
  * @buf: User buffer
  * @offset: Offset in file
  * @len: Length to read
- * @flags: File flags
+ * @fd: Open DRM file
  *
  * Handles reading of DRM events (vblank, flip complete, etc.)
  */
 ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
-                 uint64_t flags) {
+                 fd_t *fd) {
     (void)offset;
 
-    drm_device_t *dev = drm_data_to_device(data);
-    if (!dev) {
-        return -ENODEV;
-    }
+    drm_file_t *drm_file = drm_current_file(data, fd);
+    drm_device_t *dev = drm_file ? drm_file->dev : NULL;
+    if (!drm_file || !dev)
+        return -EBADF;
 
-    if (drm_data_is_render_node(data)) {
+    if (drm_file->type == DRM_MINOR_RENDER) {
         return -EINVAL;
     }
 
@@ -231,11 +250,11 @@ ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
         arch_enable_interrupt();
 
         spin_lock(&dev->event_lock);
-        if (dev->drm_event_count != 0) {
-            event = dev->drm_events[dev->drm_event_head];
-            dev->drm_event_head =
-                (dev->drm_event_head + 1) % DRM_MAX_EVENTS_COUNT;
-            dev->drm_event_count--;
+        if (drm_file->drm_event_count != 0) {
+            event = drm_file->drm_events[drm_file->drm_event_head];
+            drm_file->drm_event_head =
+                (drm_file->drm_event_head + 1) % DRM_MAX_EVENTS_COUNT;
+            drm_file->drm_event_count--;
             have_event = true;
         }
         spin_unlock(&dev->event_lock);
@@ -243,38 +262,13 @@ ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
         if (have_event)
             break;
 
-        if (flags & O_NONBLOCK)
+        if (fd_get_flags(fd) & O_NONBLOCK)
             return -EWOULDBLOCK;
 
-        vfs_node_t *event_node = drm_event_node_get(dev);
-        if (!event_node) {
-            arch_wait_for_interrupt();
-            continue;
-        }
-
         const uint32_t want = EPOLLIN | EPOLLERR | EPOLLHUP;
-        struct vfs_file event_file;
-        drm_event_file_from_node(event_node, &event_file);
-        int events = vfs_poll(&event_file, want);
-        if (events < 0) {
-            vfs_iput(event_node);
-            return events;
-        }
-
-        if (events & (EPOLLERR | EPOLLHUP)) {
-            vfs_iput(event_node);
-            return -EIO;
-        }
-
-        if (!(events & EPOLLIN)) {
-            int reason = vfs_poll_wait_interruptible(&event_file, want);
-            vfs_iput(event_node);
-            if (reason < 0)
-                return reason;
-            continue;
-        }
-
-        vfs_iput(event_node);
+        int reason = vfs_poll_wait_interruptible(fd, want);
+        if (reason < 0)
+            return reason;
     }
 
     struct drm_event_vblank vbl = {
@@ -307,13 +301,13 @@ ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
  *
  * Returns events that are ready
  */
-ssize_t drm_poll(void *data, size_t event) {
-    drm_device_t *dev = drm_data_to_device(data);
-    if (!dev) {
-        return -ENODEV;
-    }
+ssize_t drm_poll(void *data, size_t event, fd_t *fd) {
+    drm_file_t *drm_file = drm_current_file(data, fd);
+    drm_device_t *dev = drm_file ? drm_file->dev : NULL;
+    if (!drm_file || !dev)
+        return -EBADF;
 
-    if (drm_data_is_render_node(data)) {
+    if (drm_file->type == DRM_MINOR_RENDER) {
         return 0;
     }
 
@@ -327,7 +321,7 @@ ssize_t drm_poll(void *data, size_t event) {
 
     spin_lock(&dev->event_lock);
     if (event & EPOLLIN) {
-        has_event = (dev->drm_event_count != 0);
+        has_event = (drm_file->drm_event_count != 0);
     }
     if (event & EPOLLPRI) {
         has_hotplug = dev->hotplug_pending;
@@ -464,21 +458,49 @@ ssize_t drm_open(void *data, void *arg) {
     drm_file->magic = DRM_FILE_MAGIC;
     drm_file->dev = node->dev;
     drm_file->type = node->type;
+    drm_file->event_node = vfs_igrab(file->f_inode);
     if (node->dev && node->dev->op && node->dev->op->open) {
         int ret = node->dev->op->open(node->dev, drm_file);
         if (ret != 0) {
+            if (drm_file->event_node)
+                vfs_iput(drm_file->event_node);
             memset(drm_file, 0, sizeof(*drm_file));
             free(drm_file);
             return ret;
         }
     }
-    file->private_data = drm_file;
+    if (device_file_set_private(file, drm_file) < 0) {
+        if (drm_file->event_node)
+            vfs_iput(drm_file->event_node);
+        if (node->dev && node->dev->op && node->dev->op->close)
+            node->dev->op->close(node->dev, drm_file);
+        memset(drm_file, 0, sizeof(*drm_file));
+        free(drm_file);
+        return -EBADF;
+    }
     return 0;
+}
+
+void drm_cancel_file_events(drm_file_t *file) {
+    drm_device_t *dev = file ? file->dev : NULL;
+
+    if (!dev)
+        return;
+
+    spin_lock(&dev->event_lock);
+    for (uint32_t i = 0; i < dev->pending_event_count; i++) {
+        uint32_t slot = (dev->pending_event_head + i) % DRM_MAX_EVENTS_COUNT;
+        if (dev->pending_events[slot].file == file)
+            dev->pending_events[slot].file = NULL;
+    }
+    file->drm_event_head = 0;
+    file->drm_event_count = 0;
+    spin_unlock(&dev->event_lock);
 }
 
 ssize_t drm_close(void *data, void *arg) {
     struct vfs_file *file = (struct vfs_file *)arg;
-    drm_file_t *drm_file = file ? (drm_file_t *)file->private_data : NULL;
+    drm_file_t *drm_file = (drm_file_t *)device_file_private(file);
     drm_device_t *dev = drm_file ? drm_file->dev : drm_data_to_device(data);
 
     if (!drm_file || drm_file->magic != DRM_FILE_MAGIC) {
@@ -501,7 +523,14 @@ ssize_t drm_close(void *data, void *arg) {
         dev->op->close(dev, drm_file);
     }
 
-    file->private_data = NULL;
+    drm_cancel_file_events(drm_file);
+
+    if (drm_file->event_node) {
+        vfs_iput(drm_file->event_node);
+        drm_file->event_node = NULL;
+    }
+
+    device_file_set_private(file, NULL);
     memset(drm_file, 0, sizeof(*drm_file));
     free(drm_file);
     return 0;
@@ -984,12 +1013,15 @@ void drm_init_after_pci_sysfs() {
  * Posts an event to the DRM device's event queue.
  * Returns 0 on success, drops oldest event when the queue is full.
  */
-int drm_post_event(drm_device_t *dev, uint32_t type, uint64_t user_data) {
+int drm_post_event(drm_device_t *dev, fd_t *fd, uint32_t type,
+                   uint64_t user_data) {
+    drm_file_t *file = drm_current_file(NULL, fd);
+    vfs_node_t *event_node = NULL;
     uint64_t now = nano_time();
     uint64_t sequence = 0;
 
-    if (!dev)
-        return -ENODEV;
+    if (!dev || !file || file->dev != dev)
+        return -EBADF;
 
     spin_lock(&dev->event_lock);
 
@@ -997,28 +1029,33 @@ int drm_post_event(drm_device_t *dev, uint32_t type, uint64_t user_data) {
         dev->vblank_counter++;
     }
     sequence = dev->vblank_counter;
-    drm_queue_ready_event_locked(dev, type, user_data, now, sequence);
+    if (drm_queue_ready_event_locked(file, type, user_data, now, sequence))
+        event_node = drm_file_event_node_get_locked(file);
 
     spin_unlock(&dev->event_lock);
-    drm_notify_event_node(dev);
+    drm_notify_file_event_node(event_node);
 
     return 0;
 }
 
-int drm_defer_event(drm_device_t *dev, uint32_t type, uint64_t user_data) {
+int drm_defer_event(drm_device_t *dev, fd_t *fd, uint32_t type,
+                    uint64_t user_data) {
+    drm_file_t *file = drm_current_file(NULL, fd);
     uint32_t slot = 0;
 
-    if (!dev)
-        return -ENODEV;
+    if (!dev || !file || file->dev != dev)
+        return -EBADF;
 
     spin_lock(&dev->event_lock);
 
     if (!dev->vblank_period_ns) {
         uint64_t now = nano_time();
-        drm_queue_ready_event_locked(dev, type, user_data, now,
-                                     dev->vblank_counter);
+        vfs_node_t *event_node = NULL;
+        if (drm_queue_ready_event_locked(file, type, user_data, now,
+                                         dev->vblank_counter))
+            event_node = drm_file_event_node_get_locked(file);
         spin_unlock(&dev->event_lock);
-        drm_notify_event_node(dev);
+        drm_notify_file_event_node(event_node);
         return 0;
     }
 
@@ -1032,6 +1069,7 @@ int drm_defer_event(drm_device_t *dev, uint32_t type, uint64_t user_data) {
            DRM_MAX_EVENTS_COUNT;
     dev->pending_events[slot].type = type;
     dev->pending_events[slot].user_data = user_data;
+    dev->pending_events[slot].file = file;
     dev->pending_event_count++;
 
     spin_unlock(&dev->event_lock);
@@ -1062,7 +1100,8 @@ void drm_handle_vblank_tick(void) {
 
     for (uint32_t i = 0; i < DRM_MAX_TRACKED_DEVICES; i++) {
         drm_device_t *dev = devices[i];
-        bool notify = false;
+        vfs_node_t *notify_nodes[DRM_MAX_EVENTS_COUNT] = {0};
+        uint32_t notify_count = 0;
 
         if (!dev)
             continue;
@@ -1089,9 +1128,17 @@ void drm_handle_vblank_tick(void) {
         while (dev->pending_event_count) {
             struct k_drm_event *pending =
                 &dev->pending_events[dev->pending_event_head];
-            notify |= drm_queue_ready_event_locked(dev, pending->type,
-                                                   pending->user_data, now,
-                                                   dev->vblank_counter);
+            if (pending->file) {
+                if (drm_queue_ready_event_locked(pending->file, pending->type,
+                                                 pending->user_data, now,
+                                                 dev->vblank_counter)) {
+                    vfs_node_t *node =
+                        drm_file_event_node_get_locked(pending->file);
+                    if (node)
+                        notify_nodes[notify_count++] = node;
+                }
+            }
+            pending->file = NULL;
             dev->pending_event_head =
                 (dev->pending_event_head + 1) % DRM_MAX_EVENTS_COUNT;
             dev->pending_event_count--;
@@ -1099,7 +1146,7 @@ void drm_handle_vblank_tick(void) {
 
         spin_unlock(&dev->event_lock);
 
-        if (notify)
-            drm_notify_event_node(dev);
+        for (uint32_t j = 0; j < notify_count; j++)
+            drm_notify_file_event_node(notify_nodes[j]);
     }
 }

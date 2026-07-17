@@ -89,7 +89,7 @@ typedef struct tty_session { // 一个 TTY 会话
 extern tty_t *kernel_session;
 
 int tty_ioctl(void *dev, int cmd, void *args);
-int tty_poll(void *dev, int events);
+int tty_poll(void *dev, int events, fd_t *fd);
 int tty_read(void *dev, void *buf, uint64_t offset, size_t size, fd_t *fd);
 int tty_write(void *dev, const void *buf, uint64_t offset, size_t size,
               fd_t *fd);

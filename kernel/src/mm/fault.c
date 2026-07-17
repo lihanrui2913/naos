@@ -157,21 +157,17 @@ map_anon_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     spin_lock(&task->mm->lock);
 
     uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
-    if (translate_address(pgdir, aligned_vaddr)) {
-        spin_unlock(&task->mm->lock);
-        spin_unlock(&mgr->lock);
-        address_release(page_paddr);
-        return PF_RES_OK;
-    }
-
+    bool new_mapping = false;
     if (map_page(pgdir, aligned_vaddr, page_paddr,
-                 get_arch_page_table_flags(final_pt_flags), true, false) != 0) {
+                 get_arch_page_table_flags(final_pt_flags), false, false,
+                 &new_mapping) != 0) {
         spin_unlock(&task->mm->lock);
         spin_unlock(&mgr->lock);
         address_release(page_paddr);
         return PF_RES_NOMEM;
     }
-    __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
+    if (new_mapping)
+        __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
 
     spin_unlock(&task->mm->lock);
     spin_unlock(&mgr->lock);
@@ -262,21 +258,17 @@ map_file_fault_page_snapshot(task_t *task, const fault_vma_snapshot_t *snapshot,
     spin_lock(&task->mm->lock);
 
     uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
-    if (translate_address(pgdir, aligned_vaddr)) {
-        spin_unlock(&task->mm->lock);
-        spin_unlock(&mgr->lock);
-        address_release(page_paddr);
-        return PF_RES_OK;
-    }
-
+    bool new_mapping = false;
     if (map_page(pgdir, aligned_vaddr, page_paddr,
-                 get_arch_page_table_flags(final_pt_flags), true, false) != 0) {
+                 get_arch_page_table_flags(final_pt_flags), false, false,
+                 &new_mapping) != 0) {
         spin_unlock(&task->mm->lock);
         spin_unlock(&mgr->lock);
         address_release(page_paddr);
         return PF_RES_NOMEM;
     }
-    __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
+    if (new_mapping)
+        __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
 
     spin_unlock(&task->mm->lock);
     spin_unlock(&mgr->lock);
@@ -410,18 +402,16 @@ static page_fault_result_t map_shm_fault_page_locked(task_t *task, vma_t *vma,
     spin_lock(&task->mm->lock);
 
     uint64_t *pgdir = (uint64_t *)phys_to_virt(task->mm->page_table_addr);
-    if (translate_address(pgdir, aligned_vaddr)) {
-        spin_unlock(&task->mm->lock);
-        return PF_RES_OK;
-    }
-
+    bool new_mapping = false;
     if (map_page(pgdir, aligned_vaddr, paddr,
-                 get_arch_page_table_flags(pt_flags), true, false) != 0) {
+                 get_arch_page_table_flags(pt_flags), false, false,
+                 &new_mapping) != 0) {
         spin_unlock(&task->mm->lock);
         return PF_RES_NOMEM;
     }
 
-    __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
+    if (new_mapping)
+        __atomic_add_fetch(&task->mm->resident_pages, 1, __ATOMIC_RELAXED);
     spin_unlock(&task->mm->lock);
     return PF_RES_OK;
 }

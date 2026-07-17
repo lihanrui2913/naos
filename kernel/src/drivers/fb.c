@@ -7,31 +7,110 @@
 #include <fs/sys.h>
 #include <boot/boot.h>
 
-ssize_t fb_read(void *data, uint64_t offset, void *buf, uint64_t len,
-                uint64_t flags) {
-    boot_framebuffer_t *fb = (boot_framebuffer_t *)data;
-    (void)fb;
-    (void)offset;
-    (void)buf;
-    (void)len;
+typedef struct fb_file {
+    boot_framebuffer_t *framebuffer;
+    struct fb_var_screeninfo var;
+} fb_file_t;
+
+static void fb_init_var(boot_framebuffer_t *framebuffer,
+                        struct fb_var_screeninfo *var) {
+    memset(var, 0, sizeof(*var));
+    var->xres = framebuffer->width;
+    var->yres = framebuffer->height;
+    var->xres_virtual = framebuffer->width;
+    var->yres_virtual = framebuffer->height;
+    var->red = (struct fb_bitfield){.offset = framebuffer->red_mask_shift,
+                                    .length = framebuffer->red_mask_size};
+    var->green = (struct fb_bitfield){.offset = framebuffer->green_mask_shift,
+                                      .length = framebuffer->green_mask_size};
+    var->blue = (struct fb_bitfield){.offset = framebuffer->blue_mask_shift,
+                                     .length = framebuffer->blue_mask_size};
+    var->transp = (struct fb_bitfield){.offset = 24, .length = 8};
+    var->bits_per_pixel = framebuffer->bpp;
+    var->height = framebuffer->height / 4;
+    var->width = framebuffer->width / 4;
+}
+
+static fb_file_t *fb_file_from_fd(fd_t *fd) {
+    return (fb_file_t *)device_file_private(fd);
+}
+
+ssize_t fb_open(void *data, void *arg) {
+    boot_framebuffer_t *framebuffer = data;
+    fd_t *fd = arg;
+    fb_file_t *file;
+
+    if (!framebuffer || !fd)
+        return -EINVAL;
+    file = calloc(1, sizeof(*file));
+    if (!file)
+        return -ENOMEM;
+    file->framebuffer = framebuffer;
+    fb_init_var(framebuffer, &file->var);
+    if (device_file_set_private(fd, file) < 0) {
+        free(file);
+        return -EBADF;
+    }
     return 0;
 }
 
-ssize_t fb_write(void *data, uint64_t offset, const void *buf, uint64_t len,
-                 uint64_t flags) {
-    boot_framebuffer_t *fb = (boot_framebuffer_t *)data;
-    memcpy((char *)fb->address + offset, buf, len);
+ssize_t fb_close(void *data, void *arg) {
+    fd_t *fd = arg;
+    fb_file_t *file = fb_file_from_fd(fd);
+
+    (void)data;
+    if (file) {
+        device_file_set_private(fd, NULL);
+        free(file);
+    }
+    return 0;
+}
+
+ssize_t fb_read(void *data, void *buf, uint64_t offset, size_t len, fd_t *fd) {
+    fb_file_t *file = fb_file_from_fd(fd);
+    boot_framebuffer_t *framebuffer = file ? file->framebuffer : data;
+    uint64_t size;
+
+    if (!framebuffer || !buf)
+        return -EINVAL;
+    size = framebuffer->pitch * framebuffer->height;
+    if (offset >= size)
+        return 0;
+    len = MIN(len, size - offset);
+    memcpy(buf, (char *)framebuffer->address + offset, len);
+    return (ssize_t)len;
+}
+
+ssize_t fb_write(void *data, void *buf, uint64_t offset, size_t len, fd_t *fd) {
+    fb_file_t *file = fb_file_from_fd(fd);
+    boot_framebuffer_t *framebuffer = file ? file->framebuffer : data;
+    uint64_t size;
+
+    if (!framebuffer || !buf)
+        return -EINVAL;
+    size = framebuffer->pitch * framebuffer->height;
+    if (offset >= size)
+        return -ENOSPC;
+    len = MIN(len, size - offset);
+    memcpy((char *)framebuffer->address + offset, buf, len);
     return len;
 }
 
-ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
-    boot_framebuffer_t *framebuffer = (boot_framebuffer_t *)data;
+ssize_t fb_ioctl(void *data, int cmd, void *arg, fd_t *fd) {
+    fb_file_t *file = fb_file_from_fd(fd);
+    boot_framebuffer_t *framebuffer = file ? file->framebuffer : data;
+
+    if (!framebuffer || !file)
+        return -EBADF;
 
     cmd = cmd & 0xFFFFFFFF;
 
     switch (cmd) {
     case FBIOGET_FSCREENINFO: {
-        struct fb_fix_screeninfo *fb_fix = (struct fb_fix_screeninfo *)arg;
+        struct fb_fix_screeninfo *fb_fix = arg;
+        if (!fb_fix)
+            return -EFAULT;
+        memset(fb_fix, 0, sizeof(*fb_fix));
         memcpy(fb_fix->id, "NAOS-FBDEV", 10);
         fb_fix->smem_start = translate_address(get_current_page_dir(false),
                                                (uint64_t)framebuffer->address);
@@ -50,41 +129,18 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
         return 0;
     }
     case FBIOGET_VSCREENINFO: {
-        struct fb_var_screeninfo *fb_var = (struct fb_var_screeninfo *)arg;
-        fb_var->xres = framebuffer->width;
-        fb_var->yres = framebuffer->height;
-
-        fb_var->xres_virtual = framebuffer->width;
-        fb_var->yres_virtual = framebuffer->height;
-
-        fb_var->red =
-            (struct fb_bitfield){.offset = framebuffer->red_mask_shift,
-                                 .length = framebuffer->red_mask_size,
-                                 .msb_right = 0};
-        fb_var->green =
-            (struct fb_bitfield){.offset = framebuffer->green_mask_shift,
-                                 .length = framebuffer->green_mask_size,
-                                 .msb_right = 0};
-        fb_var->blue =
-            (struct fb_bitfield){.offset = framebuffer->blue_mask_shift,
-                                 .length = framebuffer->blue_mask_size,
-                                 .msb_right = 0};
-        fb_var->transp =
-            (struct fb_bitfield){.offset = 24, .length = 8, .msb_right = 0};
-
-        fb_var->bits_per_pixel = framebuffer->bpp;
-        fb_var->grayscale = 0;
-        fb_var->nonstd = 0;
-        fb_var->activate = 0;                     // idek
-        fb_var->height = framebuffer->height / 4; // VERY approximate
-        fb_var->width = framebuffer->width / 4;   // VERY approximate
-
+        struct fb_var_screeninfo *fb_var = arg;
+        if (!fb_var)
+            return -EFAULT;
+        *fb_var = file->var;
         return 0;
     }
     case 0x4605: // FBIOPUTCMAP, ignore so no xorg.log spam
         return 0;
     case 0x5413: {
-        struct winsize *win = (struct winsize *)arg;
+        struct winsize *win = arg;
+        if (!win)
+            return -EFAULT;
         win->ws_col = framebuffer->width / 8;
         win->ws_row = framebuffer->height / 16;
 
@@ -93,24 +149,43 @@ ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg) {
 
         return 0;
     }
-    case 0x4601: // FBIOPUT_VSCREENINFO
+    case FBIOPUT_VSCREENINFO:
+    case FBIOPAN_DISPLAY: {
+        struct fb_var_screeninfo *requested = arg;
+        if (!requested)
+            return -EFAULT;
+        if (requested->xoffset >= file->var.xres_virtual ||
+            requested->yoffset >= file->var.yres_virtual)
+            return -EINVAL;
+        file->var.xoffset = requested->xoffset;
+        file->var.yoffset = requested->yoffset;
+        file->var.activate = requested->activate;
         return 0;
+    }
     default:
         return (uint64_t)-ENOTTY;
     }
 }
 
-void *fb_map(void *data, void *addr, uint64_t offset, uint64_t len) {
-    boot_framebuffer_t *framebuffer = (boot_framebuffer_t *)data;
+void *fb_map(void *data, void *addr, size_t offset, size_t len, size_t prot,
+             fd_t *fd) {
+    fb_file_t *file = fb_file_from_fd(fd);
+    boot_framebuffer_t *framebuffer = file ? file->framebuffer : data;
+    uint64_t size;
+
+    (void)prot;
+    if (!framebuffer || !file)
+        return (void *)(int64_t)-EBADF;
+    size = framebuffer->pitch * framebuffer->height;
+    if (offset > size || len > size - offset)
+        return (void *)(int64_t)-EINVAL;
 
     uint64_t fb_addr = translate_address(get_current_page_dir(false),
                                          (uint64_t)framebuffer->address) +
                        offset;
 
     map_page_range((uint64_t *)phys_to_virt(current_task->mm->page_table_addr),
-                   (uint64_t)addr, (uint64_t)fb_addr,
-                   framebuffer->width * framebuffer->height * framebuffer->bpp /
-                       8,
+                   (uint64_t)addr, (uint64_t)fb_addr, len,
                    PT_FLAG_R | PT_FLAG_W | PT_FLAG_U);
 
     return addr;
@@ -125,8 +200,8 @@ void fbdev_init() {
 
     char name[16];
     sprintf(name, "fb%d", 0);
-    device_install(DEV_CHAR, DEV_FB, framebuffer, name, 0, NULL, NULL, fb_ioctl,
-                   NULL, fb_read, fb_write, fb_map);
+    device_install(DEV_CHAR, DEV_FB, framebuffer, name, 0, fb_open, fb_close,
+                   fb_ioctl, NULL, fb_read, fb_write, fb_map);
 
     vfs_node_t *graphics = sysfs_ensure_dir("/sys/class/graphics");
 

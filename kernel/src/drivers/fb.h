@@ -94,11 +94,13 @@ struct fb_var_screeninfo {
 #define FBIOPUTCMAP 0x4605
 #define FBIOPAN_DISPLAY 0x4606
 
-ssize_t fb_read(void *data, uint64_t offset, void *buf, uint64_t len,
-                uint64_t flags);
-ssize_t fb_write(void *data, uint64_t offset, const void *buf, uint64_t len,
-                 uint64_t flags);
-ssize_t fb_ioctl(void *data, ssize_t cmd, ssize_t arg);
+ssize_t fb_open(void *data, void *arg);
+ssize_t fb_close(void *data, void *arg);
+ssize_t fb_read(void *data, void *buf, uint64_t offset, size_t len, fd_t *fd);
+ssize_t fb_write(void *data, void *buf, uint64_t offset, size_t len, fd_t *fd);
+ssize_t fb_ioctl(void *data, int cmd, void *arg, fd_t *fd);
+void *fb_map(void *data, void *addr, size_t offset, size_t len, size_t prot,
+             fd_t *fd);
 
 void fbdev_init();
 

@@ -465,8 +465,6 @@ static bool signal_ensure_user_trampoline(task_t *task) {
         map_page_range_mm(task->mm, trampoline_start, page_paddr, PAGE_SIZE,
                           PT_FLAG_U | PT_FLAG_R | PT_FLAG_X);
     spin_unlock(&task->mm->lock);
-    if (map_ret == 0)
-        task_mm_flush_tlb_all(task->mm);
     mapped = map_ret == 0;
 
     if (mapped) {

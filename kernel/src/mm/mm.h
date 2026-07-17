@@ -104,8 +104,6 @@ bool task_mm_flush_tlb_all(task_mm_info_t *mm);
 
 uint64_t map_page_range(uint64_t *pml4, uint64_t vaddr, uint64_t paddr,
                         uint64_t size, uint64_t flags);
-uint64_t map_page_range_unforce(uint64_t *pml4, uint64_t vaddr, uint64_t paddr,
-                                uint64_t size, uint64_t flags);
 void unmap_page_range(uint64_t *pml4, uint64_t vaddr, uint64_t size);
 uint64_t map_change_attribute(uint64_t *pml4, uint64_t vaddr, uint64_t flags,
                               bool flush);
@@ -114,9 +112,6 @@ uint64_t map_change_attribute_range(uint64_t *pgdir, uint64_t vaddr,
 uint64_t map_page_range_mm(task_mm_info_t *mm, uint64_t vaddr, uint64_t paddr,
                            uint64_t size, uint64_t flags);
 uint64_t map_page_range_mm_batched(task_mm_info_t *mm, uint64_t vaddr,
-                                   uint64_t paddr, uint64_t size,
-                                   uint64_t flags);
-uint64_t map_page_range_unforce_mm(task_mm_info_t *mm, uint64_t vaddr,
                                    uint64_t paddr, uint64_t size,
                                    uint64_t flags);
 void unmap_page_range_mm(task_mm_info_t *mm, uint64_t vaddr, uint64_t size);

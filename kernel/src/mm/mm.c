@@ -338,26 +338,15 @@ uint64_t map_page_range(uint64_t *pml4, uint64_t vaddr, uint64_t paddr,
     ASSERT((vaddr & 0xfff) == 0);
     ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
 
-    for (uint64_t va = vaddr; va < vaddr + size; va += PAGE_SIZE) {
-        uint64_t ret;
-        if (paddr == (uint64_t)-1) {
-            ret = map_page(pml4, va, (uint64_t)-1,
-                           get_arch_page_table_flags(flags), true, false);
-        } else {
-            ret = map_page(pml4, va, paddr + (va - vaddr),
-                           get_arch_page_table_flags(flags), true, false);
-        }
+    uint64_t arch_flags = get_arch_page_table_flags(flags);
+    uint64_t mapped = 0;
+    uint64_t ret =
+        map_pages(pml4, vaddr, paddr, size, arch_flags, true, &mapped);
+    uint64_t pages = size / PAGE_SIZE + ((size % PAGE_SIZE) != 0);
 
-        if (ret != 0) {
-            if (va != vaddr)
-                arch_flush_tlb_all();
-            return ret;
-        }
-    }
-
-    if (size)
+    if (ret != 0 || mapped < pages)
         arch_flush_tlb_all();
-    return 0;
+    return ret;
 }
 
 uint64_t map_page_range_mm(task_mm_info_t *mm, uint64_t vaddr, uint64_t paddr,
@@ -371,32 +360,13 @@ uint64_t map_page_range_mm(task_mm_info_t *mm, uint64_t vaddr, uint64_t paddr,
     ASSERT((vaddr & 0xfff) == 0);
     ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
 
-    for (uint64_t va = vaddr; va < vaddr + size; va += PAGE_SIZE) {
-        bool had_mapping = translate_address(pgdir, va) != 0;
-        uint64_t ret;
-
-        if (paddr == (uint64_t)-1) {
-            ret = map_page(pgdir, va, (uint64_t)-1,
-                           get_arch_page_table_flags(flags), true, false);
-        } else {
-            ret = map_page(pgdir, va, paddr + (va - vaddr),
-                           get_arch_page_table_flags(flags), true, false);
-        }
-
-        if (ret != 0) {
-            if (mapped)
-                __atomic_add_fetch(&mm->resident_pages, mapped,
-                                   __ATOMIC_RELAXED);
-            return ret;
-        }
-        if (!had_mapping && translate_address(pgdir, va)) {
-            mapped++;
-        }
-    }
+    uint64_t arch_flags = get_arch_page_table_flags(flags);
+    uint64_t ret =
+        map_pages(pgdir, vaddr, paddr, size, arch_flags, true, &mapped);
 
     if (mapped)
         __atomic_add_fetch(&mm->resident_pages, mapped, __ATOMIC_RELAXED);
-    return 0;
+    return ret;
 }
 
 uint64_t map_page_range_mm_batched(task_mm_info_t *mm, uint64_t vaddr,
@@ -411,6 +381,8 @@ uint64_t map_page_range_mm_batched(task_mm_info_t *mm, uint64_t vaddr,
     uint64_t end = vaddr + size;
     uint64_t cursor = vaddr;
     uint64_t mapped = 0;
+    uint64_t pages = size / PAGE_SIZE + ((size % PAGE_SIZE) != 0);
+    uint64_t arch_flags = get_arch_page_table_flags(flags);
 
     while (cursor < end) {
         uint64_t chunk_end = cursor + MM_ATTR_BATCH_MAX * PAGE_SIZE;
@@ -429,120 +401,53 @@ uint64_t map_page_range_mm_batched(task_mm_info_t *mm, uint64_t vaddr,
             return (uint64_t)-1;
         }
 
-        while (cursor < chunk_end) {
-            bool had_mapping = translate_address(pgdir, cursor) != 0;
-            uint64_t map_paddr =
-                paddr == (uint64_t)-1 ? (uint64_t)-1 : paddr + (cursor - vaddr);
-            uint64_t ret =
-                map_page(pgdir, cursor, map_paddr,
-                         get_arch_page_table_flags(flags), true, false);
-            if (ret != 0) {
-                spin_unlock(&mm->lock);
-                if (mapped)
-                    __atomic_add_fetch(&mm->resident_pages, mapped,
-                                       __ATOMIC_RELAXED);
-                if (cursor != vaddr)
-                    task_mm_flush_tlb_all(mm);
-                return ret;
-            }
-            if (!had_mapping && translate_address(pgdir, cursor))
-                mapped++;
-            cursor += PAGE_SIZE;
-        }
+        uint64_t chunk_paddr =
+            paddr == (uint64_t)-1 ? (uint64_t)-1 : paddr + (cursor - vaddr);
+        uint64_t chunk_mapped = 0;
+        uint64_t ret = map_pages(pgdir, cursor, chunk_paddr, chunk_end - cursor,
+                                 arch_flags, true, &chunk_mapped);
+        mapped += chunk_mapped;
         spin_unlock(&mm->lock);
-    }
-
-    if (mapped)
-        __atomic_add_fetch(&mm->resident_pages, mapped, __ATOMIC_RELAXED);
-    if (size)
-        task_mm_flush_tlb_all(mm);
-    return 0;
-}
-
-uint64_t map_page_range_unforce(uint64_t *pml4, uint64_t vaddr, uint64_t paddr,
-                                uint64_t size, uint64_t flags) {
-    ASSERT((vaddr & 0xfff) == 0);
-    ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
-
-    for (uint64_t va = vaddr; va < vaddr + size; va += PAGE_SIZE) {
-        uint64_t ret;
-        if (paddr == (uint64_t)-1) {
-            ret = map_page(pml4, va, (uint64_t)-1,
-                           get_arch_page_table_flags(flags), false, false);
-        } else {
-            ret = map_page(pml4, va, paddr + (va - vaddr),
-                           get_arch_page_table_flags(flags), false, false);
-        }
-
-        if (ret != 0) {
-            if (va != vaddr)
-                arch_flush_tlb_all();
-            return ret;
-        }
-    }
-
-    if (size)
-        arch_flush_tlb_all();
-    return 0;
-}
-
-uint64_t map_page_range_unforce_mm(task_mm_info_t *mm, uint64_t vaddr,
-                                   uint64_t paddr, uint64_t size,
-                                   uint64_t flags) {
-    uint64_t *pgdir = task_mm_pgdir(mm);
-    uint64_t mapped = 0;
-
-    if (!mm || !pgdir)
-        return (uint64_t)-1;
-
-    ASSERT((vaddr & 0xfff) == 0);
-    ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
-
-    for (uint64_t va = vaddr; va < vaddr + size; va += PAGE_SIZE) {
-        bool had_mapping = translate_address(pgdir, va) != 0;
-        uint64_t ret;
-
-        if (paddr == (uint64_t)-1) {
-            ret = map_page(pgdir, va, (uint64_t)-1,
-                           get_arch_page_table_flags(flags), false, false);
-        } else {
-            ret = map_page(pgdir, va, paddr + (va - vaddr),
-                           get_arch_page_table_flags(flags), false, false);
-        }
 
         if (ret != 0) {
             if (mapped)
                 __atomic_add_fetch(&mm->resident_pages, mapped,
                                    __ATOMIC_RELAXED);
+            if (size)
+                task_mm_flush_tlb_all(mm);
             return ret;
         }
-        if (!had_mapping && translate_address(pgdir, va)) {
-            mapped++;
-        }
+        cursor = chunk_end;
     }
 
     if (mapped)
         __atomic_add_fetch(&mm->resident_pages, mapped, __ATOMIC_RELAXED);
+    if (mapped < pages)
+        task_mm_flush_tlb_all(mm);
     return 0;
 }
 
 void unmap_page_range(uint64_t *pml4, uint64_t vaddr, uint64_t size) {
-    unmap_release_batch_t batch = {
-        .flush_start = vaddr,
-        .flush_end = vaddr + size,
-    };
+    if (!pml4 || !size)
+        return;
 
-    for (uint64_t va = vaddr; va < vaddr + size; va += PAGE_SIZE) {
-        if (batch.page_count == UNMAP_RELEASE_BATCH_MAX) {
-            unmap_release_batch_commit(&batch);
-            batch.flush_start = vaddr;
-            batch.flush_end = vaddr + size;
-        }
+    uint64_t end = vaddr + size;
+    if (end < vaddr)
+        end = UINT64_MAX;
 
-        unmap_page_defer_release(pml4, va, &batch, false, false);
+    uint64_t cursor = vaddr;
+    while (cursor < end) {
+        unmap_release_batch_t batch = {
+            .flush_start = vaddr,
+            .flush_end = end,
+        };
+        uint64_t next =
+            unmap_page_range_defer_release(pml4, cursor, end, &batch, 0, NULL);
+        unmap_release_batch_commit(&batch);
+        if (next <= cursor)
+            break;
+        cursor = next;
     }
-
-    unmap_release_batch_commit(&batch);
 }
 
 void task_mm_account_unmapped_pages(task_mm_info_t *mm, uint64_t pages) {

@@ -5047,7 +5047,8 @@ static __poll_t ext_poll(struct vfs_file *file, struct vfs_poll_table *pt) {
         return EPOLLNVAL;
     if (S_ISBLK(file->f_inode->i_mode) || S_ISCHR(file->f_inode->i_mode))
         return device_poll(file->f_inode->i_rdev,
-                           EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+                           EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM,
+                           file);
     return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
 }
 

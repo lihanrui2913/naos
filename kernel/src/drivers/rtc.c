@@ -175,14 +175,15 @@ int rtc_read_realtime(rtc_realtime_t *time) {
             return 0;
     }
 
+    mono_ns = nano_time();
+
     ret = rtc_read_time(&tm);
     if (ret == 0) {
         time->sec = rtc_time_to_seconds(&tm);
-        time->nsec = 0;
+        time->nsec = (uint32_t)(mono_ns % 1000000000ULL);
         return 0;
     }
 
-    mono_ns = nano_time();
     time->sec = boot_get_boottime() + mono_ns / 1000000000ULL;
     time->nsec = (uint32_t)(mono_ns % 1000000000ULL);
     return 0;

@@ -1153,11 +1153,14 @@ typedef enum {
 
 #include <fs/fs_syscall.h>
 
+struct drm_file;
+
 struct k_drm_event {
     uint32_t type;
     uint64_t user_data;
     struct timespec timestamp;
     uint64_t sequence;
+    struct drm_file *file;
 };
 
 #define DRM_MAX_EVENTS_COUNT 64
@@ -1204,10 +1207,14 @@ typedef struct drm_file {
     bool lessee;
     bool revoked;
     void *driver_priv;
+    vfs_node_t *event_node;
     uint32_t lease_id;
     uint32_t lessor_id;
     uint32_t object_count;
     uint32_t object_ids[DRM_MAX_LEASE_OBJECTS];
+    struct k_drm_event drm_events[DRM_MAX_EVENTS_COUNT];
+    uint32_t drm_event_head;
+    uint32_t drm_event_count;
 } drm_file_t;
 
 typedef struct drm_lease_entry {
@@ -1280,9 +1287,6 @@ struct drm_device {
     uint32_t render_minor;
     bool render_node_registered;
     spinlock_t event_lock;
-    struct k_drm_event drm_events[DRM_MAX_EVENTS_COUNT];
-    uint32_t drm_event_head;
-    uint32_t drm_event_count;
     struct k_drm_event pending_events[DRM_MAX_EVENTS_COUNT];
     uint32_t pending_event_head;
     uint32_t pending_event_count;
@@ -1367,14 +1371,17 @@ void drm_init_after_pci_sysfs();
 
 /* File operations */
 ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
-                 uint64_t flags);
-ssize_t drm_poll(void *data, size_t event);
+                 fd_t *fd);
+ssize_t drm_poll(void *data, size_t event, fd_t *fd);
 void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len);
 ssize_t drm_open(void *data, void *arg);
 ssize_t drm_close(void *data, void *arg);
 
 /* Event handling */
-int drm_post_event(drm_device_t *dev, uint32_t type, uint64_t user_data);
-int drm_defer_event(drm_device_t *dev, uint32_t type, uint64_t user_data);
+int drm_post_event(drm_device_t *dev, fd_t *fd, uint32_t type,
+                   uint64_t user_data);
+int drm_defer_event(drm_device_t *dev, fd_t *fd, uint32_t type,
+                    uint64_t user_data);
+void drm_cancel_file_events(drm_file_t *file);
 int drm_notify_hotplug(drm_device_t *dev);
 void drm_handle_vblank_tick(void);

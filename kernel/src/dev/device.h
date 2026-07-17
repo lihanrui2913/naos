@@ -42,7 +42,7 @@ typedef struct device_t {
     // 设备控制
     ssize_t (*ioctl)(void *dev, int cmd, void *args, fd_t *fd);
     // 轮询
-    ssize_t (*poll)(void *dev, int events);
+    ssize_t (*poll)(void *dev, int events, fd_t *fd);
     // 读设备
     ssize_t (*read)(void *dev, void *buf, uint64_t offset, size_t size,
                     fd_t *fd);
@@ -53,6 +53,8 @@ typedef struct device_t {
     void *(*map)(void *dev, void *addr, size_t offset, size_t size, size_t prot,
                  fd_t *fd);
 } device_t;
+
+typedef struct device_file device_file_t;
 
 enum device_cmd_t {
     DEV_CMD_SECTOR_START = 1, // 获得设备扇区开始位置 lba
@@ -76,14 +78,19 @@ device_t *device_find(int type, uint64_t idx);
 // 根据设备号查找设备
 device_t *device_get(uint64_t dev);
 
-ssize_t device_open(uint64_t dev, void *arg);
-ssize_t device_close(uint64_t dev, void *arg);
+ssize_t device_open(uint64_t dev, fd_t *fd);
+ssize_t device_close(uint64_t dev, fd_t *fd);
+
+device_file_t *device_file_context(fd_t *fd);
+device_t *device_file_device(fd_t *fd);
+void *device_file_private(fd_t *fd);
+int device_file_set_private(fd_t *fd, void *private_data);
 
 // 控制设备
 ssize_t device_ioctl(uint64_t dev, int cmd, void *args, fd_t *fd);
 
 // 轮询
-ssize_t device_poll(uint64_t dev, int events);
+ssize_t device_poll(uint64_t dev, int events, fd_t *fd);
 
 // 读设备
 ssize_t device_read(uint64_t dev, void *buf, uint64_t idx, size_t count,

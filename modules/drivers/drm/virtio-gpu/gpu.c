@@ -1,5 +1,6 @@
 #include "gpu.h"
 
+#include <dev/device.h>
 #include <drivers/drm/drm_ioctl.h>
 #include <drivers/logger.h>
 #include <fs/sys.h>
@@ -39,6 +40,13 @@ static uint32_t virtio_gpu_alloc_context_id(virtio_gpu_device_t *gpu) {
     if (id == 0) {
         id = gpu->next_context_id++;
     }
+    return id;
+}
+
+static uint64_t virtio_gpu_alloc_fence_id(virtio_gpu_device_t *gpu) {
+    uint64_t id = __atomic_fetch_add(&gpu->next_fence_id, 1, __ATOMIC_RELAXED);
+    if (id == 0)
+        id = __atomic_fetch_add(&gpu->next_fence_id, 1, __ATOMIC_RELAXED);
     return id;
 }
 
@@ -675,7 +683,9 @@ static int virtio_gpu_context_index(virtio_gpu_device_t *gpu, uint32_t ctx_id,
 }
 
 static virtio_gpu_file_t *virtio_gpu_file_from_fd(fd_t *fd) {
-    drm_file_t *drm_file = fd ? (drm_file_t *)fd->private_data : NULL;
+    drm_file_t *drm_file = (drm_file_t *)device_file_private(fd);
+    if (!drm_file && fd)
+        drm_file = (drm_file_t *)fd->private_data;
     if (!drm_file || drm_file->magic != DRM_FILE_MAGIC) {
         return NULL;
     }
@@ -797,6 +807,9 @@ static int virtio_gpu_submit_3d(virtio_gpu_device_t *gpu, uint32_t ctx_id,
     memset(&resp, 0, sizeof(resp));
 
     virtio_gpu_hdr_init_ctx(&req.hdr, VIRTIO_GPU_CMD_SUBMIT_3D, ctx_id);
+    uint64_t fence_id = virtio_gpu_alloc_fence_id(gpu);
+    req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+    req.hdr.fence_id = htole64(fence_id);
     req.size = htole32(size);
 
     int ret = virtio_gpu_ctl_send(gpu, &req, sizeof(req), &resp, sizeof(resp),
@@ -804,7 +817,12 @@ static int virtio_gpu_submit_3d(virtio_gpu_device_t *gpu, uint32_t ctx_id,
     if (ret != 0) {
         return ret;
     }
-    return virtio_gpu_resp_type(&resp) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -EIO;
+    if (virtio_gpu_resp_type(&resp) != VIRTIO_GPU_RESP_OK_NODATA ||
+        !(le32toh(resp.flags) & VIRTIO_GPU_FLAG_FENCE) ||
+        le64toh(resp.fence_id) != fence_id) {
+        return -EIO;
+    }
+    return 0;
 }
 
 static int virtio_gpu_transfer_host_3d(virtio_gpu_device_t *gpu,
@@ -1297,7 +1315,6 @@ static int virtio_gpu_drm_set_crtc(drm_device_t *drm_dev,
 static int virtio_gpu_drm_page_flip(drm_device_t *drm_dev,
                                     struct drm_mode_crtc_page_flip *flip,
                                     fd_t *fd) {
-    (void)fd;
     virtio_gpu_device_t *gpu = drm_dev->data;
     if (!gpu || !flip) {
         return -ENODEV;
@@ -1331,8 +1348,8 @@ static int virtio_gpu_drm_page_flip(drm_device_t *drm_dev,
     }
 
     if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) {
-        ret =
-            drm_defer_event(drm_dev, DRM_EVENT_FLIP_COMPLETE, flip->user_data);
+        ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
+                              flip->user_data);
         if (ret < 0) {
             return ret;
         }
@@ -1348,7 +1365,6 @@ static int virtio_gpu_drm_page_flip(drm_device_t *drm_dev,
 static int virtio_gpu_drm_atomic_commit(drm_device_t *drm_dev,
                                         struct drm_mode_atomic *atomic,
                                         fd_t *fd) {
-    (void)fd;
     virtio_gpu_device_t *gpu = drm_dev->data;
     if (!gpu || !atomic) {
         return -ENODEV;
@@ -1599,7 +1615,7 @@ static int virtio_gpu_drm_atomic_commit(drm_device_t *drm_dev,
     }
 
     if (atomic->flags & DRM_MODE_PAGE_FLIP_EVENT) {
-        ret = drm_defer_event(drm_dev, DRM_EVENT_FLIP_COMPLETE,
+        ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
                               atomic->user_data);
         if (ret < 0) {
             return ret;
@@ -1966,8 +1982,18 @@ static ssize_t virtio_gpu_drm_driver_ioctl(drm_device_t *drm_dev, uint32_t cmd,
             gpu, bo, &req->box, req->level, req->offset, req->stride,
             req->layer_stride, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D);
     }
-    case DRM_IOCTL_VIRTGPU_WAIT:
+    case DRM_IOCTL_VIRTGPU_WAIT: {
+        struct drm_virtgpu_3d_wait *wait = arg;
+        if (!wait || (wait->flags & ~VIRTGPU_WAIT_NOWAIT)) {
+            return -EINVAL;
+        }
+        virtio_gpu_buffer_t *bo = virtio_gpu_buffer_get(gpu, wait->handle);
+        virtio_gpu_file_t *vf = virtio_gpu_file_from_fd(fd);
+        if (!bo || !vf || !virtio_gpu_file_has_handle(vf, wait->handle)) {
+            return -ENOENT;
+        }
         return 0;
+    }
     case DRM_IOCTL_VIRTGPU_GET_CAPS: {
         struct drm_virtgpu_get_caps *caps = arg;
         if (!caps || caps->addr == 0 || caps->size == 0) {
@@ -2187,6 +2213,7 @@ int virtio_gpu_init(virtio_driver_t *driver) {
     gpu->negotiated_features = features;
     gpu->next_resource_id = 1;
     gpu->next_context_id = 1;
+    gpu->next_fence_id = 1;
     spin_init(&gpu->control_lock);
     drm_resource_manager_init(&gpu->resource_mgr);
     if ((features & VIRTIO_GPU_F_VIRGL) == 0) {

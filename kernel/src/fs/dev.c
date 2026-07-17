@@ -867,7 +867,7 @@ static __poll_t devtmpfs_poll_file(struct vfs_file *file,
         uint32_t events = pt ? pt->events
                              : (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLERR |
                                 EPOLLHUP | EPOLLNVAL);
-        return (__poll_t)device_poll(file->f_inode->i_rdev, events);
+        return (__poll_t)device_poll(file->f_inode->i_rdev, events, file);
     }
     return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
 }
@@ -1118,50 +1118,105 @@ static void devtmpfs_ensure_populated(struct vfs_super_block *sb) {
     spin_unlock(&fsi->populate_lock);
 }
 
+typedef struct inputdev_file {
+    struct llist_header node;
+    struct input_event *event_queue;
+    size_t event_queue_capacity;
+    size_t event_queue_head;
+    size_t event_queue_tail;
+    size_t event_queue_count;
+    bool event_queue_overflow;
+    spinlock_t event_queue_lock;
+    int clock_id;
+} inputdev_file_t;
+
 ssize_t inputdev_open(void *data, void *arg) {
     dev_input_event_t *event = data;
-    (void)arg;
+    fd_t *fd = arg;
+    inputdev_file_t *file;
+
+    if (!event || !fd)
+        return -EINVAL;
+
+    file = calloc(1, sizeof(*file));
+    if (!file)
+        return -ENOMEM;
+    file->event_queue_capacity =
+        INPUT_EVENT_RING_SIZE / sizeof(struct input_event);
+    if (file->event_queue_capacity == 0)
+        file->event_queue_capacity = 128;
+    file->event_queue =
+        calloc(file->event_queue_capacity, sizeof(struct input_event));
+    if (!file->event_queue) {
+        free(file);
+        return -ENOMEM;
+    }
+    spin_init(&file->event_queue_lock);
+    file->clock_id = CLOCK_MONOTONIC;
+    if (device_file_set_private(fd, file) < 0) {
+        free(file->event_queue);
+        free(file);
+        return -EBADF;
+    }
+
+    spin_lock(&event->open_files_lock);
+    llist_append(&event->open_files, &file->node);
     __atomic_add_fetch(&event->timesOpened, 1, __ATOMIC_ACQ_REL);
+    spin_unlock(&event->open_files_lock);
     return 0;
 }
 
 ssize_t inputdev_close(void *data, void *arg) {
     dev_input_event_t *event = data;
-    (void)arg;
-    size_t opened = __atomic_load_n(&event->timesOpened, __ATOMIC_ACQUIRE);
-    while (opened > 0 && !__atomic_compare_exchange_n(
-                             &event->timesOpened, &opened, opened - 1, false,
-                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-    }
+    fd_t *fd = arg;
+    inputdev_file_t *file = device_file_private(fd);
+
+    if (!event || !file)
+        return 0;
+
+    spin_lock(&event->open_files_lock);
+    llist_delete(&file->node);
+    __atomic_sub_fetch(&event->timesOpened, 1, __ATOMIC_ACQ_REL);
+    spin_unlock(&event->open_files_lock);
+
+    device_file_set_private(fd, NULL);
+    free(file->event_queue);
+    free(file);
     return 0;
 }
 
-static bool input_event_queue_push(dev_input_event_t *event,
+static bool input_event_queue_push(inputdev_file_t *file,
                                    const struct input_event *in,
                                    bool *wake_needed) {
-    if (!event || !in || !event->event_queue || !event->event_queue_capacity)
+    struct input_event queued;
+
+    if (!file || !in || !file->event_queue || !file->event_queue_capacity)
         return false;
 
-    spin_lock(&event->event_queue_lock);
-    bool was_empty =
-        event->event_queue_count == 0 && !event->event_queue_overflow;
+    queued = *in;
+    if (file->clock_id == CLOCK_REALTIME)
+        queued.sec += boot_get_boottime();
 
-    if (event->event_queue_count >= event->event_queue_capacity) {
-        event->event_queue_head =
-            (event->event_queue_head + 1) % event->event_queue_capacity;
-        event->event_queue_count--;
-        event->event_queue_overflow = true;
+    spin_lock(&file->event_queue_lock);
+    bool was_empty =
+        file->event_queue_count == 0 && !file->event_queue_overflow;
+
+    if (file->event_queue_count >= file->event_queue_capacity) {
+        file->event_queue_head =
+            (file->event_queue_head + 1) % file->event_queue_capacity;
+        file->event_queue_count--;
+        file->event_queue_overflow = true;
     }
 
-    event->event_queue[event->event_queue_tail] = *in;
-    event->event_queue_tail =
-        (event->event_queue_tail + 1) % event->event_queue_capacity;
-    event->event_queue_count++;
+    file->event_queue[file->event_queue_tail] = queued;
+    file->event_queue_tail =
+        (file->event_queue_tail + 1) % file->event_queue_capacity;
+    file->event_queue_count++;
 
     if (wake_needed)
-        *wake_needed = was_empty || event->event_queue_overflow;
+        *wake_needed = was_empty || file->event_queue_overflow;
 
-    spin_unlock(&event->event_queue_lock);
+    spin_unlock(&file->event_queue_lock);
     return true;
 }
 
@@ -1172,16 +1227,16 @@ static void inputdev_notify_readable(dev_input_event_t *event) {
     vfs_poll_notify_inode(event->devnode, EPOLLIN | EPOLLRDNORM);
 }
 
-static size_t input_event_queue_pop(dev_input_event_t *event,
+static size_t input_event_queue_pop(inputdev_file_t *file,
                                     struct input_event *out,
                                     size_t max_events) {
-    if (!event || !out || max_events == 0)
+    if (!file || !out || max_events == 0)
         return 0;
 
     size_t produced = 0;
-    spin_lock(&event->event_queue_lock);
+    spin_lock(&file->event_queue_lock);
 
-    if (event->event_queue_overflow && produced < max_events) {
+    if (file->event_queue_overflow && produced < max_events) {
         memset(&out[produced], 0, sizeof(struct input_event));
         uint64_t now_ns = nano_time();
         out[produced].sec = now_ns / 1000000000ULL;
@@ -1189,39 +1244,40 @@ static size_t input_event_queue_pop(dev_input_event_t *event,
         out[produced].type = EV_SYN;
         out[produced].code = 3;
         out[produced].value = 0;
-        event->event_queue_overflow = false;
+        file->event_queue_overflow = false;
         produced++;
     }
 
-    while (produced < max_events && event->event_queue_count > 0 &&
-           event->event_queue_capacity > 0) {
-        out[produced++] = event->event_queue[event->event_queue_head];
-        event->event_queue_head =
-            (event->event_queue_head + 1) % event->event_queue_capacity;
-        event->event_queue_count--;
+    while (produced < max_events && file->event_queue_count > 0 &&
+           file->event_queue_capacity > 0) {
+        out[produced++] = file->event_queue[file->event_queue_head];
+        file->event_queue_head =
+            (file->event_queue_head + 1) % file->event_queue_capacity;
+        file->event_queue_count--;
     }
 
-    spin_unlock(&event->event_queue_lock);
+    spin_unlock(&file->event_queue_lock);
     return produced;
 }
 
-static bool input_event_queue_has_data(dev_input_event_t *event) {
+static bool input_event_queue_has_data(inputdev_file_t *file) {
     bool has_data = false;
 
-    if (!event)
+    if (!file)
         return false;
 
-    spin_lock(&event->event_queue_lock);
-    has_data = (event->event_queue_count > 0) || event->event_queue_overflow;
-    spin_unlock(&event->event_queue_lock);
+    spin_lock(&file->event_queue_lock);
+    has_data = (file->event_queue_count > 0) || file->event_queue_overflow;
+    spin_unlock(&file->event_queue_lock);
     return has_data;
 }
 
 ssize_t inputdev_event_read(void *data, void *buf, uint64_t offset,
                             uint64_t len, fd_t *fd) {
     dev_input_event_t *event = data;
+    inputdev_file_t *file = device_file_private(fd);
     (void)offset;
-    if (!event || !buf || !fd)
+    if (!event || !file || !buf || !fd)
         return -EINVAL;
     if (len == 0)
         return 0;
@@ -1233,7 +1289,7 @@ ssize_t inputdev_event_read(void *data, void *buf, uint64_t offset,
     size_t max_events = len / sizeof(struct input_event);
 
     while (true) {
-        size_t cnt = input_event_queue_pop(event, events, max_events);
+        size_t cnt = input_event_queue_pop(file, events, max_events);
         if (cnt > 0)
             return cnt * sizeof(struct input_event);
         if (fd && (fd_get_flags(fd) & O_NONBLOCK))
@@ -1257,11 +1313,13 @@ ssize_t inputdev_event_write(void *data, const void *buf, uint64_t offset,
 
 ssize_t inputdev_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
     dev_input_event_t *event = data;
+    inputdev_file_t *file = device_file_private(fd);
     size_t number = _IOC_NR(request);
     size_t size = _IOC_SIZE(request);
     ssize_t ret = -ENOTTY;
 
-    (void)fd;
+    if (!event || !file)
+        return -EBADF;
 
     if (number >= 0x20 && number < (0x20 + EV_CNT))
         return event->event_bit(data, request, (void *)arg);
@@ -1324,9 +1382,19 @@ ssize_t inputdev_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
     case 0x18:
     case 0x19:
     case 0x1b:
-    case 0xa0:
         ret = event->event_bit(data, request, (void *)arg);
         break;
+    case 0xa0: {
+        int clock_id;
+        if (!arg || copy_from_user(&clock_id, (void *)arg, sizeof(clock_id)))
+            return -EFAULT;
+        if (clock_id != CLOCK_MONOTONIC && clock_id != CLOCK_REALTIME &&
+            clock_id != CLOCK_BOOTTIME)
+            return -EINVAL;
+        file->clock_id = clock_id;
+        ret = 0;
+        break;
+    }
     case 0x91:
         ret = 0;
         break;
@@ -1339,9 +1407,10 @@ ssize_t inputdev_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
     return ret;
 }
 
-ssize_t inputdev_poll(void *data, size_t event) {
-    dev_input_event_t *e = data;
-    if (input_event_queue_has_data(e) && (event & EPOLLIN))
+ssize_t inputdev_poll(void *data, size_t event, fd_t *fd) {
+    inputdev_file_t *file = device_file_private(fd);
+    (void)data;
+    if (input_event_queue_has_data(file) && (event & EPOLLIN))
         return EPOLLIN;
     return 0;
 }
@@ -1523,11 +1592,11 @@ static ssize_t ttydev_ioctl(void *data, ssize_t request, ssize_t arg,
     return tty_ioctl(tty, (int)request, (void *)arg);
 }
 
-static ssize_t ttydev_poll(void *data, int events) {
+static ssize_t ttydev_poll(void *data, int events, fd_t *fd) {
     tty_t *tty = ttydev_resolve(data);
     if (!tty)
         return -ENXIO;
-    return tty_poll(tty, events);
+    return tty_poll(tty, events, fd);
 }
 
 static ssize_t ttydev_read(void *data, void *buf, uint64_t offset, uint64_t len,
@@ -1561,8 +1630,9 @@ ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
     return logger_kmsg_read(fd, buf, len, fd ? fd->f_flags : 0);
 }
 
-ssize_t kmsg_poll(void *dev, int events) {
+ssize_t kmsg_poll(void *dev, int events, fd_t *fd) {
     (void)dev;
+    (void)fd;
     return logger_kmsg_poll(events);
 }
 
@@ -1643,9 +1713,10 @@ ssize_t rfkill_read(void *data, void *buf, uint64_t offset, uint64_t len,
     return 0;
 }
 
-ssize_t rfkill_poll(void *data, int events) {
+ssize_t rfkill_poll(void *data, int events, fd_t *fd) {
     (void)data;
     (void)events;
+    (void)fd;
     return 0;
 }
 
@@ -1697,6 +1768,14 @@ void input_generate_event(void *data, uint16_t type, uint16_t code,
     event.value = value;
 
     bool wake_needed = false;
-    if (input_event_queue_push(item, &event, &wake_needed) && wake_needed)
+    inputdev_file_t *file, *tmp;
+    spin_lock(&item->open_files_lock);
+    llist_for_each(file, tmp, &item->open_files, node) {
+        bool file_wake = false;
+        if (input_event_queue_push(file, &event, &file_wake) && file_wake)
+            wake_needed = true;
+    }
+    spin_unlock(&item->open_files_lock);
+    if (wake_needed)
         inputdev_notify_readable(item);
 }

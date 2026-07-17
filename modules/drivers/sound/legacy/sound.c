@@ -1143,10 +1143,11 @@ static ssize_t sound_pcm_write(void *dev, void *buf, uint64_t offset,
                    : sound_frames_to_bytes(&substream->runtime, xfer.result);
 }
 
-static ssize_t sound_pcm_poll(void *dev, int events) {
+static ssize_t sound_pcm_poll(void *dev, int events, fd_t *fd) {
     sound_pcm_substream_t *substream = sound_dev_to_substream(dev);
     sound_pcm_runtime_t *runtime = &substream->runtime;
     ssize_t ready = EPOLLERR;
+    (void)fd;
 
     spin_lock(&substream->lock);
     if (substream->ops && substream->ops->pump) {

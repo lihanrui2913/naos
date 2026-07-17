@@ -88,18 +88,15 @@ struct input_event {
     int32_t value;
 };
 
+#define INPUT_EVENT_RING_SIZE (PAGE_SIZE * 32)
+
 typedef struct dev_input_event {
     char *devname;
     char *physloc;
     vfs_node_t *devnode;
 
-    struct input_event *event_queue;
-    size_t event_queue_capacity;
-    size_t event_queue_head;
-    size_t event_queue_tail;
-    size_t event_queue_count;
-    bool event_queue_overflow;
-    spinlock_t event_queue_lock;
+    struct llist_header open_files;
+    spinlock_t open_files_lock;
 
     size_t timesOpened;
 
@@ -113,8 +110,6 @@ typedef struct dev_input_event {
     struct input_absinfo absinfo[ABS_CNT];
 
     event_bit_t event_bit;
-
-    int clock_id;
 
     char uniq[32];
 } dev_input_event_t;

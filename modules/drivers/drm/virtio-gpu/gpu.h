@@ -279,6 +279,7 @@ typedef struct virtio_gpu_device {
     uint32_t num_capsets;
     uint32_t next_resource_id;
     uint32_t next_context_id;
+    uint64_t next_fence_id;
     uint64_t supported_capset_ids;
     uint32_t scanout_id;
     uint32_t width;

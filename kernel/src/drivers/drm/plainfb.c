@@ -659,7 +659,6 @@ static int plainfb_add_fb2(drm_device_t *drm_dev,
 
 int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
                           fd_t *fd) {
-    (void)fd;
     plainfb_device_t *gpu_dev = drm_dev->data;
     if (!gpu_dev || !gpu_dev->framebuffer || !atomic) {
         return -ENODEV;
@@ -983,7 +982,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
     drm_framebuffer_free(&gpu_dev->resource_mgr, scanout_fb->id);
 
     if (atomic->flags & DRM_MODE_PAGE_FLIP_EVENT) {
-        ret = drm_defer_event(drm_dev, DRM_EVENT_FLIP_COMPLETE,
+        ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
                               atomic->user_data);
         if (ret < 0) {
             return ret;
@@ -1064,7 +1063,6 @@ static int plainfb_set_crtc(drm_device_t *drm_dev, struct drm_mode_crtc *crtc,
 
 static int plainfb_page_flip(drm_device_t *drm_dev,
                              struct drm_mode_crtc_page_flip *flip, fd_t *fd) {
-    (void)fd;
     plainfb_device_t *gpu_dev = drm_dev->data;
     if (!gpu_dev || !gpu_dev->framebuffer) {
         return -ENODEV;
@@ -1099,8 +1097,8 @@ static int plainfb_page_flip(drm_device_t *drm_dev,
     }
 
     if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) {
-        ret =
-            drm_defer_event(drm_dev, DRM_EVENT_FLIP_COMPLETE, flip->user_data);
+        ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
+                              flip->user_data);
         if (ret < 0) {
             return ret;
         }

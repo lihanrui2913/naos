@@ -108,16 +108,23 @@ fd_info_t *task_fd_info_clone(fd_info_t *old) {
     if (!new_info)
         return NULL;
 
+    bool failed = false;
     with_fd_info_lock(old, {
         for (size_t i = 0; i < old->max_fds; i++) {
             if (!old->fds[i].file)
                 continue;
             if (task_fd_slot_install(new_info, (int)i, old->fds[i].file,
-                                     old->fds[i].flags) < 0)
+                                     old->fds[i].flags) < 0) {
+                failed = true;
                 break;
+            }
         }
     });
 
+    if (failed) {
+        task_fd_info_put(new_info, NULL);
+        return NULL;
+    }
     return new_info;
 }
 

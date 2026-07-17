@@ -6,6 +6,14 @@ DEFINE_LLIST(device_list);
 uint64_t devices_idxs[DEV_MAX];
 spinlock_t device_lock = SPIN_INIT;
 
+#define DEVICE_FILE_MAGIC 0x44455646U
+
+struct device_file {
+    uint32_t magic;
+    uint64_t dev;
+    void *private_data;
+};
+
 static device_t *get_null_device();
 
 static bool device_minor_in_use(int subtype, uint64_t minor) {
@@ -97,24 +105,79 @@ static uint64_t device_install_internal(int type, int subtype, void *ptr,
 // 获取空设备
 static device_t *get_null_device() { return calloc(1, sizeof(device_t)); }
 
-ssize_t device_open(uint64_t dev, void *arg) {
-    device_t *device = device_get(dev);
-    if (!device)
-        return -ENODEV;
-    if (device->open) {
-        return device->open(device->ptr, arg);
-    }
+device_file_t *device_file_context(fd_t *fd) {
+    device_file_t *context = fd ? (device_file_t *)fd->private_data : NULL;
+
+    if (!context || context->magic != DEVICE_FILE_MAGIC)
+        return NULL;
+    return context;
+}
+
+device_t *device_file_device(fd_t *fd) {
+    device_file_t *context = device_file_context(fd);
+
+    return context ? device_get(context->dev) : NULL;
+}
+
+void *device_file_private(fd_t *fd) {
+    device_file_t *context = device_file_context(fd);
+
+    return context ? context->private_data : NULL;
+}
+
+int device_file_set_private(fd_t *fd, void *private_data) {
+    device_file_t *context = device_file_context(fd);
+
+    if (!context)
+        return -EBADF;
+    context->private_data = private_data;
     return 0;
 }
 
-ssize_t device_close(uint64_t dev, void *arg) {
+ssize_t device_open(uint64_t dev, fd_t *fd) {
     device_t *device = device_get(dev);
+    device_file_t *context;
+    ssize_t ret;
+
     if (!device)
         return -ENODEV;
-    if (device->close) {
-        return device->close(device->ptr, arg);
+    if (!fd)
+        return -EINVAL;
+    if (fd->private_data)
+        return -EBUSY;
+
+    context = calloc(1, sizeof(*context));
+    if (!context)
+        return -ENOMEM;
+    context->magic = DEVICE_FILE_MAGIC;
+    context->dev = dev;
+    fd->private_data = context;
+
+    ret = device->open ? device->open(device->ptr, fd) : 0;
+    if (ret < 0) {
+        fd->private_data = NULL;
+        memset(context, 0, sizeof(*context));
+        free(context);
     }
-    return 0;
+    return ret;
+}
+
+ssize_t device_close(uint64_t dev, fd_t *fd) {
+    device_t *device = device_get(dev);
+    device_file_t *context = device_file_context(fd);
+    ssize_t ret = 0;
+
+    if (!context || context->dev != dev)
+        return 0;
+    if (!device)
+        ret = -ENODEV;
+    else if (device->close)
+        ret = device->close(device->ptr, fd);
+
+    fd->private_data = NULL;
+    memset(context, 0, sizeof(*context));
+    free(context);
+    return ret;
 }
 
 ssize_t device_ioctl(uint64_t dev, int cmd, void *args, fd_t *fd) {
@@ -127,12 +190,12 @@ ssize_t device_ioctl(uint64_t dev, int cmd, void *args, fd_t *fd) {
     return -ENOTTY;
 }
 
-ssize_t device_poll(uint64_t dev, int events) {
+ssize_t device_poll(uint64_t dev, int events, fd_t *fd) {
     device_t *device = device_get(dev);
     if (!device)
         return -ENODEV;
     if (device->poll) {
-        return device->poll(device->ptr, events);
+        return device->poll(device->ptr, events, fd);
     }
     return -ENOSYS;
 }

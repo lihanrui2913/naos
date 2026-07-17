@@ -54,7 +54,10 @@ typedef struct unmap_release_batch {
 uint64_t translate_address(uint64_t *pgdir, uint64_t vaddr);
 
 uint64_t map_page(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
-                  uint64_t flags, bool force, bool flush);
+                  uint64_t flags, bool force, bool flush, bool *new_mapping);
+uint64_t map_pages(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
+                   uint64_t size, uint64_t flags, bool force,
+                   uint64_t *new_mappings);
 uint64_t unmap_page(uint64_t *pgdir, uint64_t vaddr);
 uint64_t unmap_page_defer_release(uint64_t *pgdir, uint64_t vaddr,
                                   unmap_release_batch_t *batch, bool flush,

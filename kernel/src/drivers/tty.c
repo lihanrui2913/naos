@@ -784,8 +784,9 @@ int tty_ioctl(void *dev, int cmd, void *args) {
     return tty->ops.ioctl(tty, cmd, (uint64_t)args);
 }
 
-int tty_poll(void *dev, int events) {
+int tty_poll(void *dev, int events, fd_t *fd) {
     tty_t *tty = dev;
+    (void)fd;
     return tty->ops.poll(tty, events);
 }
 

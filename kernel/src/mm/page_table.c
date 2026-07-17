@@ -155,78 +155,96 @@ void unmap_release_deferred_drain(void) {
     }
 }
 
-uint64_t map_page(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
-                  uint64_t flags, bool force, bool flush) {
-    ASSERT((vaddr & 0xfff) == 0);
-    ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
+typedef struct page_map_path {
+    uint64_t *leaf;
+    uint64_t *created_parent_tables[ARCH_MAX_PT_LEVEL - 1];
+    uint64_t created_parent_indices[ARCH_MAX_PT_LEVEL - 1];
+    uint64_t created_table_addrs[ARCH_MAX_PT_LEVEL - 1];
+    size_t created_tables;
+} page_map_path_t;
 
-    uint64_t levels = arch_page_table_levels();
-    if (!page_table_levels_valid(levels))
-        return (uint64_t)-1;
-    uint64_t indexs[ARCH_MAX_PT_LEVEL] = {0};
-    uint64_t *created_parent_tables[ARCH_MAX_PT_LEVEL - 1] = {0};
-    uint64_t created_parent_indices[ARCH_MAX_PT_LEVEL - 1] = {0};
-    uint64_t created_table_addrs[ARCH_MAX_PT_LEVEL - 1] = {0};
-    size_t created_tables = 0;
-    for (uint64_t i = 0; i < levels; i++) {
-        indexs[i] = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
+static void page_map_path_rollback(page_map_path_t *path) {
+    while (path->created_tables > 0) {
+        path->created_tables--;
+        path->created_parent_tables
+            [path->created_tables]
+            [path->created_parent_indices[path->created_tables]] = 0;
+        unmap_release_table(path->created_table_addrs[path->created_tables]);
     }
+}
+
+static bool page_map_find_leaf(uint64_t *pgdir, uint64_t vaddr, uint64_t flags,
+                               bool flush, uint64_t levels,
+                               page_map_path_t *path) {
+    memset(path, 0, sizeof(*path));
 
     for (uint64_t i = 0; i < levels - 1; i++) {
-        uint64_t index = indexs[i];
+        uint64_t index = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
         uint64_t addr = pgdir[index];
-        if (ARCH_PT_IS_LARGE(addr)) {
-            return (uint64_t)-1;
-        }
+        if (ARCH_PT_IS_LARGE(addr))
+            goto fail;
 
         if (!ARCH_PT_IS_TABLE(addr)) {
             uint64_t a = alloc_frames(1);
-            if (a == 0) {
-                return (uint64_t)-1;
-            }
+            if (a == 0)
+                goto fail;
             memset((uint64_t *)phys_to_virt(a), 0, PAGE_SIZE);
             pgdir[index] = arch_make_page_table_entry(a, flags);
-            created_parent_tables[created_tables] = pgdir;
-            created_parent_indices[created_tables] = index;
-            created_table_addrs[created_tables] = a;
-            created_tables++;
-        } else {
-            if ((flags & ARCH_PT_FLAG_USER) && !(addr & ARCH_PT_FLAG_USER)) {
-                uint64_t pa = ARCH_READ_PTE(addr);
-                uint64_t old_flags = ARCH_READ_PTE_FLAG(addr);
-                pgdir[index] =
-                    arch_make_page_table_entry(pa, old_flags | flags);
-                if (flush)
-                    arch_flush_tlb(vaddr);
-            }
+            path->created_parent_tables[path->created_tables] = pgdir;
+            path->created_parent_indices[path->created_tables] = index;
+            path->created_table_addrs[path->created_tables] = a;
+            path->created_tables++;
+        } else if ((flags & ARCH_PT_FLAG_USER) && !(addr & ARCH_PT_FLAG_USER)) {
+            uint64_t pa = ARCH_READ_PTE(addr);
+            uint64_t old_flags = ARCH_READ_PTE_FLAG(addr);
+            pgdir[index] = arch_make_page_table_entry(pa, old_flags | flags);
+            if (flush)
+                arch_flush_tlb(vaddr);
         }
 
         pgdir = (uint64_t *)phys_to_virt(ARCH_READ_PTE(pgdir[index]));
     }
 
-    uint64_t index = indexs[levels - 1];
-    bool had_old_mapping = (pgdir[index] & ARCH_PT_FLAG_VALID) != 0;
+    path->leaf = pgdir;
+    return true;
+
+fail:
+    page_map_path_rollback(path);
+    return false;
+}
+
+static uint64_t page_map_leaf(page_map_path_t *path, uint64_t index,
+                              uint64_t vaddr, uint64_t paddr, uint64_t flags,
+                              bool force, bool flush, bool *new_mapping) {
+    if (new_mapping)
+        *new_mapping = false;
+
+    bool had_old_mapping = (path->leaf[index] & ARCH_PT_FLAG_VALID) != 0;
     uint64_t old_paddr = 0;
     if (had_old_mapping) {
-        if (!force)
+        if (!force) {
+            path->created_tables = 0;
             return 0;
-        old_paddr = ARCH_READ_PTE(pgdir[index]);
+        }
+        old_paddr = ARCH_READ_PTE(path->leaf[index]);
     }
 
     if (paddr == (uint64_t)-1) {
         uint64_t phys = alloc_frames(1);
         if (phys == 0) {
             printk("Cannot allocate frame\n");
-            goto rollback_created_tables;
+            goto fail;
         }
         memset((void *)phys_to_virt(phys), 0, PAGE_SIZE);
         paddr = phys;
     } else if (paddr && (!had_old_mapping || old_paddr != paddr) &&
                !address_ref(paddr)) {
-        goto rollback_created_tables;
+        goto fail;
     }
 
-    pgdir[index] = ARCH_MAKE_PTE(paddr, flags);
+    path->leaf[index] = ARCH_MAKE_PTE(paddr, flags);
+    if (new_mapping)
+        *new_mapping = !had_old_mapping;
 
     if (flush || (had_old_mapping && old_paddr && old_paddr != paddr))
         arch_flush_tlb(vaddr);
@@ -234,16 +252,80 @@ uint64_t map_page(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
     if (had_old_mapping && old_paddr && old_paddr != paddr)
         address_release(old_paddr);
 
+    path->created_tables = 0;
     return 0;
 
-rollback_created_tables:
-    while (created_tables > 0) {
-        created_tables--;
-        created_parent_tables[created_tables]
-                             [created_parent_indices[created_tables]] = 0;
-        unmap_release_table(created_table_addrs[created_tables]);
-    }
+fail:
+    page_map_path_rollback(path);
     return (uint64_t)-1;
+}
+
+uint64_t map_page(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
+                  uint64_t flags, bool force, bool flush, bool *new_mapping) {
+    ASSERT((vaddr & 0xfff) == 0);
+    ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
+
+    if (new_mapping)
+        *new_mapping = false;
+
+    uint64_t levels = arch_page_table_levels();
+    if (!pgdir || !page_table_levels_valid(levels))
+        return (uint64_t)-1;
+
+    page_map_path_t path;
+    if (!page_map_find_leaf(pgdir, vaddr, flags, flush, levels, &path))
+        return (uint64_t)-1;
+
+    uint64_t index = PAGE_TABLE_LEVEL_INDEX(vaddr, levels, levels);
+    return page_map_leaf(&path, index, vaddr, paddr, flags, force, flush,
+                         new_mapping);
+}
+
+uint64_t map_pages(uint64_t *pgdir, uint64_t vaddr, uint64_t paddr,
+                   uint64_t size, uint64_t flags, bool force,
+                   uint64_t *new_mappings) {
+    ASSERT((vaddr & 0xfff) == 0);
+    ASSERT(paddr == (uint64_t)-1 || (paddr & 0xfff) == 0);
+
+    if (new_mappings)
+        *new_mappings = 0;
+    if (!size)
+        return 0;
+
+    uint64_t levels = arch_page_table_levels();
+    if (!pgdir || !page_table_levels_valid(levels))
+        return (uint64_t)-1;
+
+    uint64_t page_count = size / PAGE_SIZE + ((size % PAGE_SIZE) != 0);
+    uint64_t entries = (uint64_t)1 << ARCH_PT_OFFSET_PER_LEVEL;
+
+    for (uint64_t page = 0; page < page_count;) {
+        uint64_t offset = page * PAGE_SIZE;
+        uint64_t va = vaddr + offset;
+        if (va < vaddr)
+            return (uint64_t)-1;
+
+        page_map_path_t path;
+        if (!page_map_find_leaf(pgdir, va, flags, false, levels, &path))
+            return (uint64_t)-1;
+
+        uint64_t index = PAGE_TABLE_LEVEL_INDEX(va, levels, levels);
+        uint64_t chunk_pages = MIN(entries - index, page_count - page);
+        for (uint64_t i = 0; i < chunk_pages; i++, page++) {
+            uint64_t map_paddr =
+                paddr == (uint64_t)-1 ? (uint64_t)-1 : paddr + page * PAGE_SIZE;
+            bool new_mapping = false;
+            uint64_t ret =
+                page_map_leaf(&path, index + i, vaddr + page * PAGE_SIZE,
+                              map_paddr, flags, force, false, &new_mapping);
+            if (ret != 0)
+                return ret;
+            if (new_mapping && new_mappings)
+                (*new_mappings)++;
+        }
+    }
+
+    return 0;
 }
 
 uint64_t unmap_page_defer_release(uint64_t *pgdir, uint64_t vaddr,

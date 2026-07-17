@@ -149,7 +149,9 @@ static inline drm_file_t *drm_file_from_data(void *data) {
 }
 
 static inline drm_file_t *drm_file_from_vfs_file(fd_t *fd) {
-    drm_file_t *file = fd ? (drm_file_t *)fd->private_data : NULL;
+    drm_file_t *file = (drm_file_t *)device_file_private(fd);
+    if (!file && fd)
+        file = (drm_file_t *)fd->private_data;
     if (file && file->magic == DRM_FILE_MAGIC && file->dev) {
         return file;
     }
@@ -751,6 +753,13 @@ static int drm_leasefd_release(struct vfs_inode *inode, struct vfs_file *file) {
         spin_unlock(&dev->lease_lock);
     }
 
+    drm_cancel_file_events(drm_file);
+
+    if (drm_file->event_node) {
+        vfs_iput(drm_file->event_node);
+        drm_file->event_node = NULL;
+    }
+
     file->private_data = NULL;
     memset(drm_file, 0, sizeof(*drm_file));
     free(drm_file);
@@ -773,7 +782,7 @@ static ssize_t drm_leasefd_read(struct vfs_file *file, void *buf, size_t count,
     if (!drm_file) {
         return -EBADF;
     }
-    return drm_read(drm_file, buf, 0, count, file->f_flags);
+    return drm_read(drm_file, buf, 0, count, file);
 }
 
 static __poll_t drm_leasefd_poll(struct vfs_file *file,
@@ -783,7 +792,7 @@ static __poll_t drm_leasefd_poll(struct vfs_file *file,
     if (!drm_file) {
         return EPOLLNVAL;
     }
-    return (__poll_t)drm_poll(drm_file, EPOLLIN | EPOLLOUT | EPOLLPRI);
+    return (__poll_t)drm_poll(drm_file, EPOLLIN | EPOLLOUT | EPOLLPRI, file);
 }
 
 static void *drm_leasefd_mmap(struct vfs_file *file, void *addr, size_t offset,
@@ -968,6 +977,7 @@ static int drm_leasefd_create(drm_device_t *dev, drm_file_t *owner,
         free(lease_file);
         return ret;
     }
+    lease_file->event_node = vfs_igrab(file->f_inode);
 
     lease_file->lease_id = lease_id;
     (void)inode;

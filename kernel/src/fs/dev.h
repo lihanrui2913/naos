@@ -40,4 +40,4 @@ ssize_t inputdev_event_read(void *data, void *buf, uint64_t offset,
 ssize_t inputdev_event_write(void *data, const void *buf, uint64_t offset,
                              uint64_t len, uint64_t flags);
 ssize_t inputdev_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd);
-ssize_t inputdev_poll(void *data, size_t event);
+ssize_t inputdev_poll(void *data, size_t event, fd_t *fd);

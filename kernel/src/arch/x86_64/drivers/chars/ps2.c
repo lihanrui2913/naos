@@ -42,10 +42,7 @@ static bool ps2_input_now(dev_input_event_t *event, struct timespec *now) {
         return false;
 
     uint64_t nano = nano_time();
-    if (event->clock_id == CLOCK_REALTIME)
-        now->tv_sec = boot_get_boottime() + nano / 1000000000;
-    else
-        now->tv_sec = nano / 1000000000;
+    now->tv_sec = nano / 1000000000;
     now->tv_nsec = nano % 1000000000;
     return true;
 }

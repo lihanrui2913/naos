@@ -1291,9 +1291,6 @@ int page_cache_map_fault(struct vfs_file *file, uint64_t vaddr,
     }
     spin_unlock(&current_task->mm->lock);
 
-    if (mapped_new)
-        task_mm_flush_tlb_all(current_task->mm);
-
     if (mapped_new) {
         page_cache_mmap_inc_page(&inode->i_mapping, page->index);
         if (pt_flags & PT_FLAG_W)

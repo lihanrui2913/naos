@@ -5,7 +5,6 @@
 #include <mm/mm.h>
 
 static int eventn = 0;
-#define INPUT_EVENT_RING_SIZE (PAGE_SIZE * 32)
 
 spinlock_t inputdev_regist_lock = SPIN_INIT;
 
@@ -317,11 +316,6 @@ static size_t input_event_bit(void *data, uint64_t request, void *arg) {
             return (size_t)-EFAULT;
         break;
     }
-    case 0xa0:
-        if (copy_from_user(&event->clock_id, arg, sizeof(event->clock_id)))
-            return (size_t)-EFAULT;
-        ret = 0;
-        break;
     default:
         if (number >= 0x40 && number < (0x40 + ABS_CNT)) {
             uint16_t abs = number - 0x40;
@@ -374,7 +368,8 @@ dev_input_event_t *regist_input_dev(const char *device_name,
     }
     input_bitmap_set(input_event->evbit, EV_SYN);
     input_event->event_bit = input_event_bit;
-    input_event->clock_id = CLOCK_MONOTONIC;
+    llist_init_head(&input_event->open_files);
+    spin_init(&input_event->open_files_lock);
     strncpy(input_event->uniq, device_name, sizeof(input_event->uniq));
     input_event->devname = strdup(device_name);
     input_event->physloc = strdup("");
@@ -385,22 +380,6 @@ dev_input_event_t *regist_input_dev(const char *device_name,
         spin_unlock(&inputdev_regist_lock);
         return NULL;
     }
-    input_event->event_queue_capacity =
-        INPUT_EVENT_RING_SIZE / sizeof(struct input_event);
-    if (input_event->event_queue_capacity == 0) {
-        input_event->event_queue_capacity = 128;
-    }
-    input_event->event_queue =
-        calloc(input_event->event_queue_capacity, sizeof(struct input_event));
-    if (!input_event->event_queue) {
-        free(input_event->devname);
-        free(input_event->physloc);
-        free(input_event);
-        spin_unlock(&inputdev_regist_lock);
-        return NULL;
-    }
-    spin_init(&input_event->event_queue_lock);
-
     uint64_t dev = device_install(DEV_CHAR, DEV_INPUT, input_event, dirpath, 0,
                                   inputdev_open, inputdev_close, inputdev_ioctl,
                                   inputdev_poll, inputdev_event_read,
@@ -408,7 +387,6 @@ dev_input_event_t *regist_input_dev(const char *device_name,
     if (!dev) {
         free(input_event->devname);
         free(input_event->physloc);
-        free(input_event->event_queue);
         free(input_event);
         spin_unlock(&inputdev_regist_lock);
         return NULL;

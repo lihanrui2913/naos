@@ -1449,9 +1449,10 @@ static uint64_t mremap_map_resident_pages(task_mm_info_t *mm, uint64_t old_addr,
         if (!mremap_get_mapped_page(pgdir, src, &paddr, &flags))
             continue;
 
-        bool had_mapping = translate_address(pgdir, dst) != 0;
         uint64_t target_flags = mremap_target_pt_flags(flags, target_vm_flags);
-        if (map_page(pgdir, dst, paddr, target_flags, true, false) != 0) {
+        bool new_mapping = false;
+        if (map_page(pgdir, dst, paddr, target_flags, true, false,
+                     &new_mapping) != 0) {
             if (mapped)
                 __atomic_add_fetch(&mm->resident_pages, mapped,
                                    __ATOMIC_RELAXED);
@@ -1461,7 +1462,7 @@ static uint64_t mremap_map_resident_pages(task_mm_info_t *mm, uint64_t old_addr,
             return (uint64_t)-ENOMEM;
         }
 
-        if (!had_mapping && translate_address(pgdir, dst))
+        if (new_mapping)
             mapped++;
     }
 
