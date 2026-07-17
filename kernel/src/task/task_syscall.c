@@ -1979,7 +1979,6 @@ static uint64_t task_do_execve(int dirfd, const char *path_user,
                                uint64_t flags) {
     task_t *self = current_task;
     uint64_t exec_fail_ret = (uint64_t)-ENOEXEC;
-    char *cmdline = NULL;
     char *interpreter_path = NULL;
     int open_ret;
 
@@ -2560,15 +2559,6 @@ shell_fallback_done:
         goto exec_fail_restore_mm;
     }
 
-    string_builder_t *builder = create_string_builder(PAGE_SIZE * 8);
-    for (int i = 0; i < argv_count; i++) {
-        string_builder_append(builder, new_argv[i]);
-        if (i != argv_count - 1)
-            string_builder_append(builder, " ");
-    }
-    cmdline = builder->data;
-    free(builder);
-
     for (int i = 0; i < argv_count; i++) {
         if (new_argv[i]) {
             free(new_argv[i]);
@@ -2679,11 +2669,6 @@ shell_fallback_done:
     strncpy(self->name, path, TASK_NAME_MAX);
     self->name[TASK_NAME_MAX - 1] = '\0';
 
-    if (cmdline) {
-        free(cmdline);
-        cmdline = NULL;
-    }
-
     task_complete_vfork(self);
     self->clone_flags = 0;
     self->is_clone = false;
@@ -2711,8 +2696,6 @@ exec_fail_restore_mm:
         task_signal_free(new_signal);
     if (interpreter_path)
         free(interpreter_path);
-    if (cmdline)
-        free(cmdline);
     if (phdr_allocated)
         free(phdr);
     task_execve_free_string_array(new_argv, argv_count);
