@@ -4,6 +4,8 @@ MAKEFLAGS += -rR --no-print-directory
 
 include ../build/common-env.mk
 
+HOST_CC ?= cc
+
 # This is the name that our final executable will have.
 # Change as needed.
 override OUTPUT := kernel
@@ -27,6 +29,11 @@ else ifeq ($(BOOT_PROTOCOL), sbi)
     GLOBAL_CFLAGS += -DCONFIG_BOOT_SBI
 else ifeq ($(BOOT_PROTOCOL), laboot)
     GLOBAL_CFLAGS += -DCONFIG_BOOT_LABOOT
+else ifeq ($(BOOT_PROTOCOL), linux)
+    ifneq ($(ARCH),x86_64)
+        $(error Linux boot protocol is only supported on x86_64)
+    endif
+    GLOBAL_CFLAGS += -DCONFIG_BOOT_LINUX
 else
     $(error Boot protocol $(BOOT_PROTOCOL) not supported)
 endif
@@ -200,6 +207,12 @@ ifeq ($(BOOT_PROTOCOL), laboot)
 override SRCFILES += src/boot/laboot/boot.S
 override SRCFILES += src/boot/la_boot.c
 endif
+ifeq ($(BOOT_PROTOCOL), linux)
+override SRCFILES += src/boot/linux/init.c
+override SRCFILES += src/boot/linux/entry.S
+override SRCFILES += src/boot/linux/ap_trampoline.S
+override SRCFILES += src/boot/linux_boot.c
+endif
 override CFILES := $(filter %.c,$(SRCFILES))
 override ASFILES := $(filter %.S,$(SRCFILES))
 MODULE_VERIFY_MODE := $(if $(filter 0,$(MODULE_VERIFY)),unsigned,verified)
@@ -213,6 +226,12 @@ KALLSYMS_C := $(GENERATED_DIR)/kallsyms.c
 KALLSYMS_OBJ := $(KALLSYMS_C).o
 KALLSYMS_PRELINK := $(GENERATED_DIR)/kernel.prelink
 KALLSYMS_AWK := scripts/gen-kallsyms.awk
+
+ifeq ($(BOOT_PROTOCOL), linux)
+KALLSYMS_STAGE1_C := $(GENERATED_DIR)/kallsyms-stage1.c
+KALLSYMS_STAGE1_OBJ := $(KALLSYMS_STAGE1_C).o
+KALLSYMS_RELINK := $(GENERATED_DIR)/kernel.kallsyms-relink
+endif
 
 override OBJ += $(KALLSYMS_OBJ)
 
@@ -236,7 +255,11 @@ KALLSYMS_PRELINK_OBJ := $(filter-out $(KALLSYMS_OBJ),$(OBJ))
 
 # Default target. This must come first, before header dependencies.
 .PHONY: all
+ifeq ($(BOOT_PROTOCOL), linux)
+all: bin-$(ARCH)/bzImage
+else
 all: bin-$(ARCH)/$(OUTPUT)
+endif
 
 # Include header dependencies.
 -include $(HEADER_DEPS)
@@ -253,6 +276,40 @@ bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-$(ARCH)-$(BOOT_PROTOCOL).ld $(OBJ) $(K
 	$(call PRINT_STEP,LD,$@)
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(LINKER) $(LDFLAGS) $(OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a -o $@
+
+ifeq ($(BOOT_PROTOCOL), linux)
+LINUX_SETUP_OBJ := $(GENERATED_DIR)/linux-setup.o
+LINUX_SETUP_BIN := $(GENERATED_DIR)/linux-setup.bin
+LINUX_PAYLOAD_BIN := $(GENERATED_DIR)/linux-payload.bin
+LINUX_IMAGE_TOOL := $(GENERATED_DIR)/mk-linux-bzimage
+
+$(LINUX_SETUP_OBJ): src/boot/linux/setup.S
+	$(call PRINT_STEP,AS,$<)
+	$(Q)mkdir -p "$$(dirname $@)"
+	$(Q)$(CC) -m64 -c $< -o $@
+
+$(LINUX_SETUP_BIN): $(LINUX_SETUP_OBJ)
+	$(call PRINT_STEP,OBJCOPY,$@)
+	$(Q)$(OBJCOPY) -O binary -j .text $< $@
+
+$(LINUX_PAYLOAD_BIN): bin-$(ARCH)/$(OUTPUT)
+	$(call PRINT_STEP,OBJCOPY,$@)
+	$(Q)$(OBJCOPY) -O binary $< $@
+
+$(LINUX_IMAGE_TOOL): scripts/mk-linux-bzimage.c
+	$(call PRINT_STEP,HOSTCC,$<)
+	$(Q)mkdir -p "$$(dirname $@)"
+	$(Q)$(HOST_CC) -O2 -Wall -Wextra $< -o $@
+
+bin-$(ARCH)/bzImage: bin-$(ARCH)/$(OUTPUT) $(LINUX_SETUP_BIN) \
+                     $(LINUX_PAYLOAD_BIN) $(LINUX_IMAGE_TOOL)
+	$(call PRINT_STEP,BUILD,$@)
+	$(Q)init_end=`$(NM) -n bin-$(ARCH)/$(OUTPUT) | \
+		awk '$$3 == "__linux_payload_memory_end" { print "0x" $$1 }'`; \
+	init_size=$$((init_end - 0x100000)); \
+	$(LINUX_IMAGE_TOOL) $(LINUX_SETUP_BIN) $(LINUX_PAYLOAD_BIN) \
+		$$init_size $@
+endif
 
 ifeq ($(BOOT_PROTOCOL), sbi)
 $(SBI_INITRAMFS_ASM): $(SBI_INITRAMFS_IMAGE) GNUmakefile
@@ -290,10 +347,31 @@ $(KALLSYMS_PRELINK): GNUmakefile linker-$(ARCH)-$(BOOT_PROTOCOL).ld $(KALLSYMS_P
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(LINKER) $(LDFLAGS) $(KALLSYMS_PRELINK_OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a -o $@
 
+ifeq ($(BOOT_PROTOCOL), linux)
+$(KALLSYMS_STAGE1_C): $(KALLSYMS_PRELINK) $(KALLSYMS_AWK) GNUmakefile
+	$(call PRINT_STEP,GEN,$@)
+	$(Q)mkdir -p "$$(dirname $@)"
+	$(Q)$(NM) -n --defined-only $< | awk -f $(KALLSYMS_AWK) > $@
+
+$(KALLSYMS_STAGE1_OBJ): $(KALLSYMS_STAGE1_C)
+	$(call PRINT_STEP,CC,$<)
+	$(Q)$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(KALLSYMS_RELINK): GNUmakefile linker-$(ARCH)-$(BOOT_PROTOCOL).ld \
+                     $(KALLSYMS_PRELINK_OBJ) $(KALLSYMS_STAGE1_OBJ)
+	$(call PRINT_STEP,LD,$@)
+	$(Q)$(LINKER) $(LDFLAGS) $(KALLSYMS_PRELINK_OBJ) \
+		$(KALLSYMS_STAGE1_OBJ) $(PROJECT_ROOT)/libgcc_$(ARCH).a -o $@
+
+$(KALLSYMS_C): $(KALLSYMS_RELINK) $(KALLSYMS_AWK) GNUmakefile
+	$(call PRINT_STEP,GEN,$@)
+	$(Q)$(NM) -n --defined-only $< | awk -f $(KALLSYMS_AWK) > $@
+else
 $(KALLSYMS_C): $(KALLSYMS_PRELINK) $(KALLSYMS_AWK) GNUmakefile
 	$(call PRINT_STEP,GEN,$@)
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(NM) -n --defined-only $< | awk -f $(KALLSYMS_AWK) > $@
+endif
 
 $(KALLSYMS_OBJ): $(KALLSYMS_C)
 	$(call PRINT_STEP,CC,$<)

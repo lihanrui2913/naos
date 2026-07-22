@@ -13,6 +13,7 @@
 #define X64_PFEC_WRITE (1UL << 1)
 #define X64_PFEC_USER (1UL << 2)
 #define X64_PFEC_INSTR (1UL << 4)
+#define ILL_ILLOPC 1
 #define SEGV_MAPERR 1
 #define SEGV_ACCERR 2
 
@@ -113,6 +114,20 @@ static bool x64_deliver_user_sigsegv(struct pt_regs *regs, uint64_t fault_addr,
 
     task_commit_signal(current_task, SIGSEGV, &info);
 
+    return true;
+}
+
+static bool x64_deliver_user_sigill(struct pt_regs *regs) {
+    if (!regs || (regs->cs & 3) != 3 || !current_task)
+        return false;
+
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = SIGILL;
+    info.si_code = ILL_ILLOPC;
+    info._sifields._sigfault._addr = (void *)regs->rip;
+
+    task_commit_signal(current_task, SIGILL, &info);
     return true;
 }
 
@@ -413,13 +428,15 @@ void do_bounds(struct pt_regs *regs, uint64_t error_code) {
 // 6 #UD 无效/未定义的机器码
 void do_undefined_opcode(struct pt_regs *regs, uint64_t error_code) {
     (void)error_code;
-    dump_regs(regs, "do_undefined_opcode(6)");
 
     if ((regs->cs & 3) == 3) {
-        can_schedule = true;
-        task_exit(128 + SIGSEGV);
-        return;
+        if (x64_deliver_user_sigill(regs)) {
+            x64_handle_signal_on_user_return(regs);
+            return;
+        }
     }
+
+    dump_regs(regs, "do_undefined_opcode(6)");
 
     while (1)
         asm volatile("hlt");

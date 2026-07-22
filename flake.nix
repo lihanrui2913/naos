@@ -101,6 +101,7 @@
               gnutar
               gptfdisk
               gzip
+              grub2_efi
               lld
               llvm
               meson

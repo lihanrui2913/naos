@@ -168,7 +168,10 @@ static bool x64_tlb_shootdown_should_wait(void) {
     if (x64_in_irq_context())
         return false;
 
-    return !self || self->preempt_count == 0;
+    if (!self)
+        return arch_interrupt_enabled();
+
+    return self->preempt_count == 0;
 }
 
 static uint64_t x64_tlb_shootdown_enqueue_cpu(uint32_t cpu_id,
@@ -210,11 +213,22 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
     size_t count = 0;
     bool force_all = false;
     uint64_t complete_seq = 0;
+    bool irq_state = arch_interrupt_enabled();
 
-    spin_lock(&state->lock);
+    /*
+     * Keep the local CPU from re-entering this function after the queue has
+     * been detached but before completed_seq is published. Otherwise an IPI
+     * can complete a newer batch first and the outer invocation can either
+     * acknowledge it too early or overwrite completed_seq with an older
+     * value, leaving a sender spinning forever.
+     */
+    arch_disable_interrupt();
+    raw_spin_lock(&state->lock);
 
     while (state->head != state->tail && count < X64_TLB_SHOOTDOWN_QUEUE_SIZE) {
         queue[count++] = state->queue[state->head];
+        if (queue[count - 1].seq > complete_seq)
+            complete_seq = queue[count - 1].seq;
         state->head =
             (uint32_t)((state->head + 1) % X64_TLB_SHOOTDOWN_QUEUE_SIZE);
     }
@@ -226,11 +240,13 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
     state->force_seq = 0;
 
     if (count == 0 && !force_all) {
-        spin_unlock(&state->lock);
+        raw_spin_unlock(&state->lock);
+        if (irq_state)
+            arch_enable_interrupt();
         return;
     }
 
-    spin_unlock(&state->lock);
+    raw_spin_unlock(&state->lock);
 
     if (force_all) {
         arch_flush_tlb_all();
@@ -239,9 +255,6 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
         bool flush_all = false;
 
         for (size_t i = 0; i < count; i++) {
-            if (queue[i].seq > complete_seq)
-                complete_seq = queue[i].seq;
-
             /*
              * Requests for a non-current mm are already covered by the CR3
              * reload that happened when this CPU left that address space.
@@ -273,6 +286,9 @@ static void x64_tlb_shootdown_process_cpu(uint32_t cpu_id) {
      */
     memory_barrier();
     __atomic_store_n(&state->completed_seq, complete_seq, __ATOMIC_RELEASE);
+
+    if (irq_state)
+        arch_enable_interrupt();
 }
 
 void apic_tlb_shootdown_handle(void) {
@@ -283,6 +299,7 @@ void apic_tlb_shootdown_handle(void) {
 static bool x64_tlb_shootdown_wait_cpu(task_mm_info_t *mm, uint32_t self_cpu,
                                        uint32_t cpu, uint64_t seq) {
     x64_tlb_shootdown_state_t *state = &x64_tlb_shootdown[cpu];
+    uint32_t retry_spins = 0;
 
     while (__atomic_load_n(&state->completed_seq, __ATOMIC_ACQUIRE) < seq) {
         /*
@@ -300,6 +317,18 @@ static bool x64_tlb_shootdown_wait_cpu(task_mm_info_t *mm, uint32_t self_cpu,
          * processing only touches this CPU's per-CPU queue.
          */
         x64_tlb_shootdown_process_cpu(self_cpu);
+
+        /*
+         * Pending processing is idempotent, so it is safe to re-notify if the
+         * original fixed-vector IPI was lost around CPU/LAPIC startup or
+         * coalesced by unusual virtual APIC behavior.
+         */
+        if (++retry_spins == 65536) {
+            retry_spins = 0;
+            if (!irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR))
+                return false;
+        }
+
         arch_pause();
     }
 
@@ -345,7 +374,8 @@ static bool x64_tlb_shootdown_mm(task_mm_info_t *mm, uint64_t vaddr, bool all) {
             x64_tlb_shootdown_enqueue_cpu(cpu, mm_pgdir, vaddr, all);
         targets[cpu] = true;
         any_target = true;
-        irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR);
+        if (!irq_send_ipi(cpu, APIC_TLB_SHOOTDOWN_VECTOR))
+            wait = false;
     }
 
     if (!any_target)

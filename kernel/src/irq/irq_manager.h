@@ -20,7 +20,7 @@ typedef struct irq_action {
     bool used;
 } irq_action_t;
 
-typedef void (*irq_ipi_send_fn_t)(uint32_t cpu_id, uint64_t irq_num);
+typedef bool (*irq_ipi_send_fn_t)(uint32_t cpu_id, uint64_t irq_num);
 
 #define IRQ_FLAGS_MSIX (1UL << 0)
 #define IRQ_FLAGS_EDGE (1UL << 1)
@@ -28,7 +28,7 @@ typedef void (*irq_ipi_send_fn_t)(uint32_t cpu_id, uint64_t irq_num);
 #define IRQ_FLAGS_LAPIC IRQ_FLAGS_MSIX
 #endif
 
-void irq_regist_irq(uint64_t irq_num,
+bool irq_regist_irq(uint64_t irq_num,
                     void (*handler)(uint64_t irq_num, void *data,
                                     struct pt_regs *regs),
                     uint64_t arg, void *data, irq_controller_t *controller,

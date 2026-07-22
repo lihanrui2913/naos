@@ -81,16 +81,16 @@ static void riscv64_sched_ipi_handler(uint64_t irq_num, void *data,
     (void)regs;
 }
 
-static void riscv64_sched_ipi_send(uint32_t cpu_id, uint64_t irq_num) {
+static bool riscv64_sched_ipi_send(uint32_t cpu_id, uint64_t irq_num) {
     (void)irq_num;
     if (cpu_id >= cpu_count)
-        return;
+        return false;
 
     uint64_t hartid = cpuid_to_hartid[cpu_id];
     if (hartid >= 64)
-        return;
+        return false;
 
-    riscv64_sbi_send_ipi(1UL << hartid, 0);
+    return riscv64_sbi_send_ipi(1UL << hartid, 0) == 0;
 }
 
 static irq_controller_t riscv64_sched_ipi_controller = {

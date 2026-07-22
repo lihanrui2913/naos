@@ -29,6 +29,7 @@ uint64_t tsc_cycles_per_sec();
 #define ICR_DELIVERY_INIT 0x00000500
 #define ICR_DELIVERY_STARTUP 0x00000600
 #define ICR_DELIVERY_FIXED 0x00000000
+#define ICR_DELIVERY_PENDING 0x00001000
 #define ICR_DEST_PHYSICAL 0x00000000
 #define ICR_LEVEL_ASSERT 0x00004000
 #define ICR_LEVEL_DEASSERT 0x00000000
@@ -77,5 +78,5 @@ extern volatile struct limine_rsdp_request rsdp_request;
 
 void smp_init();
 void tss_init();
-void apic_send_ipi(uint32_t cpu_id, uint64_t irq_num);
+bool apic_send_ipi(uint32_t cpu_id, uint64_t irq_num);
 void apic_tlb_shootdown_handle(void);

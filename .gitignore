@@ -7,7 +7,7 @@
 /assets
 /modules-*
 /initramfs-*
-/obj-modules-*
+/obj-*
 /nvidia-open-*
 /*.lock
 *.iso

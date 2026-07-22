@@ -12,6 +12,8 @@ irq_action_t actions[ARCH_MAX_IRQ_NUM] = {0};
 irq_ipi_send_fn_t ipi_send_fns[ARCH_MAX_IRQ_NUM] = {0};
 uint64_t sched_ipi_irq = ARCH_MAX_IRQ_NUM;
 static uint64_t irq_counts[MAX_CPU_NUM][ARCH_MAX_IRQ_NUM] = {0};
+static uint64_t irq = IRQ_ALLOCATE_NUM_BASE;
+static spinlock_t irq_lock = SPIN_INIT;
 
 extern bool system_initialized;
 extern bool can_schedule;
@@ -81,23 +83,32 @@ void do_irq(struct pt_regs *regs, uint64_t irq_num) {
     }
 }
 
-void irq_regist_irq(uint64_t irq_num,
+bool irq_regist_irq(uint64_t irq_num,
                     void (*handler)(uint64_t irq_num, void *data,
                                     struct pt_regs *regs),
                     uint64_t arg, void *data, irq_controller_t *controller,
                     char *name, uint64_t flags) {
     if (irq_num >= ARCH_MAX_IRQ_NUM) {
         printk("irq_regist_irq: invalid irq_num %lu\n", irq_num);
-        return;
+        return false;
     }
 
+    spin_lock(&irq_lock);
     irq_action_t *action = &actions[irq_num];
-    memset(action, 0, sizeof(irq_action_t));
+    if (action->used) {
+        printk("irq_regist_irq: vector %lu already registered as %s\n", irq_num,
+               action->name ? action->name : "unknown");
+        spin_unlock(&irq_lock);
+        return false;
+    }
 
     action->handler = handler;
     action->data = data;
     action->irq_controller = controller;
     action->name = name;
+    action->flags = flags;
+    __atomic_store_n(&action->used, true, __ATOMIC_RELEASE);
+    spin_unlock(&irq_lock);
 
     if (action->irq_controller && action->irq_controller->install) {
         action->irq_controller->install(irq_num, arg, flags);
@@ -107,9 +118,7 @@ void irq_regist_irq(uint64_t irq_num,
         action->irq_controller->unmask(irq_num, flags);
     }
 
-    action->flags = flags;
-
-    action->used = true;
+    return true;
 }
 
 void irq_regist_ipi(uint64_t irq_num,
@@ -117,8 +126,7 @@ void irq_regist_ipi(uint64_t irq_num,
                                     struct pt_regs *regs),
                     uint64_t arg, void *data, irq_controller_t *controller,
                     char *name, uint64_t flags, irq_ipi_send_fn_t send_fn) {
-    irq_regist_irq(irq_num, handler, arg, data, controller, name, flags);
-    if (irq_num >= ARCH_MAX_IRQ_NUM)
+    if (!irq_regist_irq(irq_num, handler, arg, data, controller, name, flags))
         return;
 
     __atomic_store_n(&ipi_send_fns[irq_num], send_fn, __ATOMIC_RELEASE);
@@ -133,8 +141,7 @@ bool irq_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (!send_fn)
         return false;
 
-    send_fn(cpu_id, irq_num);
-    return true;
+    return send_fn(cpu_id, irq_num);
 }
 
 void irq_set_sched_ipi(uint64_t irq_num) {
@@ -184,9 +191,6 @@ void irq_stat_read(uint64_t *counts, size_t count, uint64_t *total) {
     if (total)
         *total = sum;
 }
-
-uint64_t irq = IRQ_ALLOCATE_NUM_BASE;
-spinlock_t irq_lock = SPIN_INIT;
 
 void irq_manager_init() { softirq_init(); }
 

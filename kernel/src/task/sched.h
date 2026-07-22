@@ -32,6 +32,7 @@ typedef struct sched_rq {
 
 void add_sched_entity(task_t *task, sched_rq_t *scheduler);
 void add_sched_entity_wakeup(task_t *task, sched_rq_t *scheduler);
+void sched_balance_wakeup(task_t *task);
 void remove_sched_entity(task_t *task, sched_rq_t *scheduler);
 void sched_account_runtime(task_t *task, uint64_t delta_ns);
 void sched_set_task_nice(task_t *task, int niceval);

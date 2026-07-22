@@ -103,10 +103,20 @@ uint64_t lapic_id() {
 
 extern uint32_t cpuid_to_lapicid[MAX_CPU_NUM];
 
-void apic_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
+static bool apic_wait_icr_idle(void) {
+    for (uint32_t spins = 0; spins < 1000000; spins++) {
+        if (!(lapic_read(LAPIC_ICR_LOW) & ICR_DELIVERY_PENDING))
+            return true;
+        arch_pause();
+    }
+
+    return false;
+}
+
+bool apic_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (cpu_id >= cpu_count || irq_num >= ARCH_MAX_IRQ_NUM ||
         cpu_id == current_cpu_id) {
-        return;
+        return false;
     }
 
     uint32_t flags = ICR_DELIVERY_FIXED | ICR_DEST_PHYSICAL |
@@ -116,23 +126,23 @@ void apic_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (x2apic_mode) {
         uint64_t icr = ((uint64_t)target_lapic_id << 32) | flags;
         wrmsr(0x800 + (LAPIC_ICR_LOW >> 4), icr);
+        return true;
     } else {
         bool irq_state = arch_interrupt_enabled();
+        bool sent = false;
         arch_disable_interrupt();
 
-        while (lapic_read(LAPIC_ICR_LOW) & (1 << 12)) {
-            arch_pause();
-        }
+        if (!apic_wait_icr_idle())
+            goto out;
 
         lapic_write(LAPIC_ICR_HIGH, target_lapic_id << 24);
         lapic_write(LAPIC_ICR_LOW, flags);
+        sent = apic_wait_icr_idle();
 
-        while (lapic_read(LAPIC_ICR_LOW) & (1 << 12)) {
-            arch_pause();
-        }
-
+    out:
         if (irq_state)
             arch_enable_interrupt();
+        return sent;
     }
 }
 
@@ -527,7 +537,7 @@ uint64_t general_ap_entry() {
 
     raw_spin_unlock(&ap_startup_lock);
 
-    while (!task_initialized) {
+    while (!__atomic_load_n(&task_initialized, __ATOMIC_ACQUIRE)) {
         arch_pause();
     }
 

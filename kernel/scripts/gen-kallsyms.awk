@@ -25,6 +25,10 @@ $1 ~ /^[0-9a-fA-F]+$/ && $2 !~ /^[Uu]$/ && $3 != "" {
     if (name ~ /^\$/) {
         next;
     }
+    if (name == "kallsyms_names" || name == "kallsyms_symbols" ||
+        name == "kallsyms_num") {
+        next;
+    }
 
     count++;
     addrs[count] = $1;

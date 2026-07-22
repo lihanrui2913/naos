@@ -279,10 +279,26 @@ uacpi_status uacpi_kernel_install_interrupt_handler(
     uacpi_u32 irq, uacpi_interrupt_handler irq_handler, uacpi_handle ctx,
     uacpi_handle *out_irq_handle) {
     uacpi_irq_handler_arg_t *arg = malloc(sizeof(uacpi_irq_handler_arg_t));
+    if (!arg)
+        return UACPI_STATUS_OUT_OF_MEMORY;
+
+    int vector = irq_allocate_irqnum();
+    if (vector < 0 || vector >= ARCH_MAX_IRQ_NUM) {
+        free(arg);
+        return UACPI_STATUS_INTERNAL_ERROR;
+    }
+
     arg->irq_handler = irq_handler;
     arg->ctx = ctx;
-    irq_regist_irq(irq + 32, uacpi_irq_handler, irq, arg, &apic_controller,
-                   "uacpi_irq_handler", 0);
+    if (!irq_regist_irq(vector, uacpi_irq_handler, irq, arg, &apic_controller,
+                        "uacpi_irq_handler", 0)) {
+        irq_deallocate_irqnum(vector);
+        free(arg);
+        return UACPI_STATUS_INTERNAL_ERROR;
+    }
+
+    if (out_irq_handle)
+        *out_irq_handle = arg;
     return UACPI_STATUS_OK;
 }
 

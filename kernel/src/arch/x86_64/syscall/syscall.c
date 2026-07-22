@@ -935,7 +935,6 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
         goto done;
     }
 
-    x64_fpu_save(self->arch_context->fpu_ctx);
     arch_enable_interrupt();
     irq_enabled_for_syscall = true;
 
@@ -1016,5 +1015,4 @@ done:
 
     if (irq_enabled_for_syscall)
         arch_disable_interrupt();
-    x64_fpu_restore(self->arch_context->fpu_ctx);
 }

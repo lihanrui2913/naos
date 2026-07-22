@@ -728,10 +728,10 @@ static void gic_v2_send_eoi(uint32_t irq) {
     dsb(sy);
 }
 
-static void gic_v2_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
+static bool gic_v2_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (cpu_id >= cpu_count || cpu_id == current_cpu_id ||
         irq_num >= PPI_INTR_BASE) {
-        return;
+        return false;
     }
 
     uint32_t target_mask = gic_v2_cpu_sgi_target_mask[cpu_id];
@@ -739,7 +739,7 @@ static void gic_v2_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
         if (cpu_id >= 8) {
             printk("GICv2: cannot send SGI %lu to cpu %u without target mask\n",
                    irq_num, cpu_id);
-            return;
+            return false;
         }
         target_mask = 1U << cpu_id;
     }
@@ -748,6 +748,7 @@ static void gic_v2_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     *(volatile uint32_t *)(gicd_base_virt + GICD_SGIR) =
         ((target_mask & 0xFF) << 16) | (uint32_t)(irq_num & 0xF);
     dsb(ishst);
+    return true;
 }
 
 static void gicd_v3_init(void) {
@@ -891,10 +892,10 @@ static void gic_v3_send_eoi(uint32_t irq) {
     isb();
 }
 
-static void gic_v3_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
+static bool gic_v3_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (cpu_id >= cpu_count || cpu_id == current_cpu_id ||
         irq_num >= PPI_INTR_BASE) {
-        return;
+        return false;
     }
 
     uint64_t mpidr = cpuid_to_mpidr[cpu_id];
@@ -903,7 +904,7 @@ static void gic_v3_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (aff0 >= 16) {
         printk("GICv3: cannot send SGI %lu to cpu %u with aff0=%lu\n", irq_num,
                cpu_id, aff0);
-        return;
+        return false;
     }
 
     uint64_t sgi1r = ((uint64_t)gic_mpidr_aff3(mpidr) << 48) |
@@ -914,6 +915,7 @@ static void gic_v3_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     dsb(ishst);
     asm volatile("msr ICC_SGI1R_EL1, %0" : : "r"(sgi1r) : "memory");
     isb();
+    return true;
 }
 
 void gic_configure_irq(uint32_t irq, uint32_t flags) {
@@ -1031,12 +1033,12 @@ void gic_msi_free_irq(uint16_t irq_num) {
     }
 }
 
-static void gic_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
+static bool gic_send_ipi(uint32_t cpu_id, uint64_t irq_num) {
     if (gic_version == GIC_VERSION_V2) {
-        gic_v2_send_ipi(cpu_id, irq_num);
-    } else {
-        gic_v3_send_ipi(cpu_id, irq_num);
+        return gic_v2_send_ipi(cpu_id, irq_num);
     }
+
+    return gic_v3_send_ipi(cpu_id, irq_num);
 }
 
 static void gic_resched_ipi_handler(uint64_t irq_num, void *data,

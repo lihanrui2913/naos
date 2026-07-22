@@ -1950,7 +1950,6 @@ void task_init() {
 
     softirqd_task =
         task_create("softirqd", softirqd_thread, 0, KTHREAD_PRIORITY);
-    task_set_flag(softirqd_task, TASK_FLAG_CPU_PINNED);
     remove_sched_entity(softirqd_task, &schedulers[softirqd_task->cpu_id]);
     softirqd_task->state = TASK_BLOCKING;
     softirqd_task->blocking_reason = "waiting_for_softirq";
@@ -2198,6 +2197,7 @@ void task_unblock(task_t *task, int reason) {
         spin_unlock(&task->block_lock);
     }
 
+    sched_balance_wakeup(task);
     add_sched_entity_wakeup(task, &schedulers[task->cpu_id]);
 
 ret:
