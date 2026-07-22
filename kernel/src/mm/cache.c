@@ -101,12 +101,9 @@ static void pcache_lru_touch(page_cache_page_t *page) {
     if (!page)
         return;
 
-    spin_lock(&pcache_lru_lock);
-    if (page->on_lru && !page->reclaiming) {
-        llist_delete(&page->lru);
-        llist_append(&pcache_lru, &page->lru);
-    }
-    spin_unlock(&pcache_lru_lock);
+    /* Cache hits are much hotter than reclaim. Defer LRU list mutation to
+     * the reclaimer so readers on different CPUs do not bounce one lock. */
+    __atomic_store_n(&page->referenced, true, __ATOMIC_RELAXED);
 }
 
 static void pcache_lru_move_tail_locked(page_cache_page_t *page) {
@@ -569,6 +566,11 @@ static bool pcache_lru_reclaim_oldest(uint64_t *scanned_out) {
             continue;
         if (scanned_out)
             (*scanned_out)++;
+        if (__atomic_exchange_n(&candidate->referenced, false,
+                                __ATOMIC_RELAXED)) {
+            pcache_lru_move_tail_locked(candidate);
+            continue;
+        }
         if (!spin_trylock(&mapping->lock)) {
             pcache_lru_move_tail_locked(candidate);
             continue;

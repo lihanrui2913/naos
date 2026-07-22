@@ -771,18 +771,15 @@ static void task_set_thread_group_pgid_locked(task_t *task, int64_t pgid) {
         return;
 
     uint64_t tgid = task_effective_tgid(task);
-    if (!task_pid_map.buckets)
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (!bucket)
         return;
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *peer = (task_t *)entry->value;
-        if (!peer || task_effective_tgid(peer) != tgid)
-            continue;
-
+    struct llist_header *node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *peer = list_entry(node, task_t, tgid_node);
+        node = node->next;
         task_set_pgid_locked(peer, pgid);
     }
 }
@@ -792,18 +789,15 @@ static void task_set_thread_group_sid_locked(task_t *task, int64_t sid) {
         return;
 
     uint64_t tgid = task_effective_tgid(task);
-    if (!task_pid_map.buckets)
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (!bucket)
         return;
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *peer = (task_t *)entry->value;
-        if (!peer || task_effective_tgid(peer) != tgid)
-            continue;
-
+    struct llist_header *node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *peer = list_entry(node, task_t, tgid_node);
+        node = node->next;
         peer->sid = sid;
     }
 }
@@ -889,6 +883,7 @@ void task_cleanup_partial(task_t *task, bool kernel_mm) {
 
     spin_lock(&task_queue_lock);
     task_detach_children_from_parent_locked(task);
+    task_tgid_index_detach_locked(task);
     task_pid_index_remove_locked(task);
     task_parent_index_detach_locked(task, true);
     task_pgid_index_detach_locked(task);
@@ -1003,6 +998,7 @@ void free_task(task_t *ptr) {
 
     spin_lock(&task_queue_lock);
     task_detach_children_from_parent_locked(ptr);
+    task_tgid_index_detach_locked(ptr);
     task_pid_index_remove_locked(ptr);
     task_parent_index_detach_locked(ptr, true);
     task_pgid_index_detach_locked(ptr);
@@ -1811,18 +1807,15 @@ static int task_execve_dethread(task_t *self) {
         bool others_alive = false;
 
         spin_lock(&task_queue_lock);
-        if (task_pid_map.buckets) {
-            for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-                hashmap_entry_t *entry = &task_pid_map.buckets[i];
-                if (!hashmap_entry_is_occupied(entry))
-                    continue;
-
-                task_t *task = (task_t *)entry->value;
+        task_index_bucket_t *bucket =
+            task_index_bucket_lookup(&task_tgid_map, tgid);
+        if (bucket) {
+            struct llist_header *node = bucket->tasks.next;
+            while (node != &bucket->tasks) {
+                task_t *task = list_entry(node, task_t, tgid_node);
+                node = node->next;
                 if (!task || task == self || task->state == TASK_DIED ||
-                    !task->arch_context) {
-                    continue;
-                }
-                if (task_effective_tgid(task) != tgid)
+                    !task->arch_context)
                     continue;
 
                 others_alive = true;
@@ -3170,9 +3163,7 @@ uint64_t sys_getrusage(int who, struct rusage *ru) {
         return (uint64_t)-EFAULT;
 
     uint64_t now_ns = nano_time();
-    uint64_t runtime_delta_ns = task_account_runtime_ns(current_task, now_ns);
-    if (runtime_delta_ns)
-        sched_account_runtime(current_task, runtime_delta_ns);
+    task_account_runtime_ns(current_task, now_ns);
 
     struct rusage result;
 
@@ -3531,6 +3522,7 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
         ptrace_attach_child(self, child);
 
     spin_lock(&task_queue_lock);
+    task_tgid_index_attach_locked(child);
     task_parent_index_attach_locked(child);
     task_pgid_index_attach_locked(child);
     spin_unlock(&task_queue_lock);
@@ -3553,17 +3545,9 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     }
     if (!ptrace_trace_fork) {
         add_sched_entity(child, &schedulers[child->cpu_id]);
-        if (child->cpu_id != current_cpu_id) {
-            irq_trigger_sched_ipi(child->cpu_id);
-        }
     }
 
     on_new_task_call(child);
-    for (size_t i = 0; child->fd_info && i < child->fd_info->max_fds; i++) {
-        if (child->fd_info->fds[i].file) {
-            on_open_file_call(child, i);
-        }
-    }
 
     if (ptrace_trace_fork)
         ptrace_stop_for_fork_event(self, ptrace_fork_event, child->pid);

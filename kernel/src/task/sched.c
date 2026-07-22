@@ -81,10 +81,6 @@ static inline bool sched_entity_eligible_locked(uint64_t min_vruntime,
     return se->vruntime <= min_vruntime;
 }
 
-static inline uint64_t sched_add_vruntime(uint64_t base, uint64_t delta) {
-    return delta > UINT64_MAX - base ? UINT64_MAX : base + delta;
-}
-
 static inline void sched_run_node_reset(rb_node_t *node) {
     if (node)
         memset(node, 0, sizeof(*node));
@@ -174,9 +170,9 @@ static bool sched_entity_preempts_curr_locked(sched_rq_t *scheduler,
 
     uint64_t curr_vruntime = curr->vruntime;
     uint64_t curr_deadline = curr->deadline;
-    if (curr->exec_start_ns && now_ns > curr->exec_start_ns) {
+    if (curr->account_start_ns && now_ns > curr->account_start_ns) {
         uint64_t runtime =
-            sched_calc_delta_fair(now_ns - curr->exec_start_ns, curr->task);
+            sched_calc_delta_fair(now_ns - curr->account_start_ns, curr->task);
 
         curr_vruntime += runtime;
         curr_deadline += runtime;
@@ -221,6 +217,8 @@ static void sched_entity_enqueue_locked(sched_rq_t *scheduler,
         scheduler->cleanup_queued = true;
     scheduler->nr_queued++;
     scheduler->nr_running++;
+    __atomic_store_n(&scheduler->nr_running_snapshot, scheduler->nr_running,
+                     __ATOMIC_RELAXED);
     scheduler->load_weight += sched_task_weight(entity->task);
 }
 
@@ -237,6 +235,8 @@ static void sched_entity_dequeue_locked(sched_rq_t *scheduler,
         scheduler->nr_queued--;
     if (scheduler->nr_running)
         scheduler->nr_running--;
+    __atomic_store_n(&scheduler->nr_running_snapshot, scheduler->nr_running,
+                     __ATOMIC_RELAXED);
 
     uint64_t weight = sched_task_weight(entity->task);
     scheduler->load_weight =
@@ -257,11 +257,10 @@ static void sched_entity_reweight_current_locked(sched_rq_t *scheduler,
     if (!task)
         return;
 
-    if (task->last_sched_in_ns && now_ns > task->last_sched_in_ns) {
-        uint64_t delta_ns = now_ns - task->last_sched_in_ns;
+    if (entity->account_start_ns && now_ns > entity->account_start_ns) {
+        uint64_t delta_ns = now_ns - entity->account_start_ns;
 
-        task->last_sched_in_ns = now_ns;
-        task->user_time_ns += delta_ns;
+        entity->account_start_ns = now_ns;
         if (old_weight == SCHED_NICE_0_LOAD)
             entity->vruntime += delta_ns;
         else
@@ -287,8 +286,11 @@ static void sched_curr_attach_locked(sched_rq_t *scheduler,
     entity->rq = scheduler;
     entity->on_rq = false;
     scheduler->nr_running++;
+    __atomic_store_n(&scheduler->nr_running_snapshot, scheduler->nr_running,
+                     __ATOMIC_RELAXED);
     scheduler->load_weight += sched_task_weight(entity->task);
     entity->exec_start_ns = now_ns;
+    entity->account_start_ns = now_ns;
     entity->slice_ns = sched_entity_slice_locked(scheduler, entity);
     entity->deadline = sched_entity_deadline_locked(scheduler, entity);
 }
@@ -300,6 +302,8 @@ static void sched_curr_detach_locked(sched_rq_t *scheduler,
 
     if (scheduler->nr_running)
         scheduler->nr_running--;
+    __atomic_store_n(&scheduler->nr_running_snapshot, scheduler->nr_running,
+                     __ATOMIC_RELAXED);
 
     uint64_t weight = sched_task_weight(entity->task);
     scheduler->load_weight =
@@ -325,22 +329,28 @@ static void sched_add_entity(task_t *task, sched_rq_t *scheduler, bool wakeup) {
     uint32_t target_cpu = task->cpu_id;
     uint64_t now_ns = nano_time();
 
-    raw_spin_lock(&scheduler->lock);
+    /*
+     * Scheduler entry points are also called from interruptible syscall
+     * context (clone, wakeups and affinity/nice changes).  Keep local IRQs
+     * disabled while a runqueue lock is held, otherwise a timer interrupt can
+     * re-enter the scheduler on this CPU and spin forever on its own lock.
+     */
+    spin_lock(&scheduler->lock);
 
     entity->task = task;
 
     if (scheduler->idle == entity) {
-        raw_spin_unlock(&scheduler->lock);
+        spin_unlock(&scheduler->lock);
         return;
     }
 
     if (entity->on_rq || sched_entity_is_current_locked(scheduler, entity)) {
-        raw_spin_unlock(&scheduler->lock);
+        spin_unlock(&scheduler->lock);
         return;
     }
 
     if (entity->rq && entity->rq != scheduler) {
-        raw_spin_unlock(&scheduler->lock);
+        spin_unlock(&scheduler->lock);
         return;
     }
 
@@ -355,19 +365,20 @@ static void sched_add_entity(task_t *task, sched_rq_t *scheduler, bool wakeup) {
     sched_entity_enqueue_locked(scheduler, entity);
     sched_update_min_vruntime_locked(scheduler);
 
-    if (scheduler->curr && scheduler->curr != scheduler->idle &&
-        scheduler->curr->task && scheduler->curr->task != task &&
+    if (scheduler->curr && scheduler->curr->task &&
+        scheduler->curr->task != task &&
         sched_entity_preempts_curr_locked(scheduler, entity, now_ns))
         resched_task = scheduler->curr->task;
     should_ping_cpu =
         target_cpu < cpu_count && target_cpu != current_cpu_id &&
         sched_entity_preempts_curr_locked(scheduler, entity, now_ns);
 
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
 
+    bool newly_requested = false;
     if (resched_task)
-        sched_request_resched(resched_task);
-    if (should_ping_cpu)
+        newly_requested = task_set_need_resched_once(resched_task);
+    if (should_ping_cpu && (!resched_task || newly_requested))
         irq_trigger_sched_ipi(target_cpu);
 }
 
@@ -379,78 +390,13 @@ void add_sched_entity_wakeup(task_t *task, sched_rq_t *scheduler) {
     sched_add_entity(task, scheduler, true);
 }
 
-void sched_balance_wakeup(task_t *task) {
-    if (!task || !task->sched_info || cpu_count <= 1 ||
-        task_has_flag(task, TASK_FLAG_CPU_PINNED) || task_is_on_cpu(task) ||
-        task->timeout_queued || task->signal_timer_queued)
-        return;
-
-    uint32_t source_cpu = task->cpu_id;
-    if (source_cpu >= cpu_count || source_cpu >= MAX_CPU_NUM)
-        return;
-
-    struct sched_entity *entity = task->sched_info;
-    if (entity->rq || entity->on_rq)
-        return;
-
-    uint32_t target_cpu = source_cpu;
-    size_t source_load = sched_rq_nr_running(&schedulers[source_cpu]);
-    size_t target_load = source_load;
-
-    for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM; cpu++) {
-        if (cpu == source_cpu)
-            continue;
-
-        size_t load = sched_rq_nr_running(&schedulers[cpu]);
-        if (load < target_load) {
-            target_cpu = cpu;
-            target_load = load;
-            if (!load)
-                break;
-        }
-    }
-
-    /* Keep cache affinity unless moving the task improves the post-wakeup
-     * imbalance. */
-    if (target_cpu == source_cpu || target_load + 1 >= source_load)
-        return;
-
-    sched_rq_t *source = &schedulers[source_cpu];
-    sched_rq_t *target = &schedulers[target_cpu];
-    sched_rq_t *first = source_cpu < target_cpu ? source : target;
-    sched_rq_t *second = source_cpu < target_cpu ? target : source;
-
-    raw_spin_lock(&first->lock);
-    raw_spin_lock(&second->lock);
-
-    if (task->cpu_id != source_cpu || task_is_on_cpu(task) || entity->rq ||
-        entity->on_rq || task_has_flag(task, TASK_FLAG_CPU_PINNED) ||
-        task->timeout_queued || task->signal_timer_queued ||
-        target->nr_running + 1 >= source->nr_running)
-        goto out;
-
-    uint64_t lag = entity->vruntime > source->min_vruntime
-                       ? entity->vruntime - source->min_vruntime
-                       : 0;
-
-    /* Per-CPU virtual clocks diverge. Carry only the entity's lag instead of
-     * its absolute vruntime or a migrated sleeper could be starved for an
-     * arbitrarily long time on the destination CPU. */
-    entity->vruntime = sched_add_vruntime(target->min_vruntime, lag);
-    task->cpu_id = target_cpu;
-
-out:
-    raw_spin_unlock(&second->lock);
-    raw_spin_unlock(&first->lock);
-}
-
 void remove_sched_entity(task_t *task, sched_rq_t *scheduler) {
     if (__builtin_expect(!task || !scheduler || !task->sched_info, 0))
         return;
 
     struct sched_entity *entity = task->sched_info;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     if (entity->on_rq && entity->rq == scheduler) {
         sched_entity_dequeue_locked(scheduler, entity, true);
@@ -458,11 +404,11 @@ void remove_sched_entity(task_t *task, sched_rq_t *scheduler) {
         sched_curr_detach_locked(scheduler, entity);
     }
 
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
 }
 
-void sched_account_runtime(task_t *task, uint64_t delta_ns) {
-    if (!task || !task->sched_info || !delta_ns)
+void sched_account_runtime_until(task_t *task, uint64_t now_ns) {
+    if (!task || !task->sched_info)
         return;
 
     struct sched_entity *entity = task->sched_info;
@@ -473,15 +419,20 @@ void sched_account_runtime(task_t *task, uint64_t delta_ns) {
     if (!scheduler)
         return;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     bool was_queued = entity->on_rq && entity->rq == scheduler;
     if (was_queued)
         sched_entity_dequeue_locked(scheduler, entity, true);
 
+    uint64_t delta_ns =
+        entity->account_start_ns && now_ns > entity->account_start_ns
+            ? now_ns - entity->account_start_ns
+            : 0;
     entity->vruntime += sched_calc_delta_fair(delta_ns, task);
 
     if (sched_entity_is_current_locked(scheduler, entity)) {
+        entity->account_start_ns = now_ns;
         entity->slice_ns = sched_entity_slice_locked(scheduler, entity);
         entity->deadline = sched_entity_deadline_locked(scheduler, entity);
     }
@@ -491,7 +442,7 @@ void sched_account_runtime(task_t *task, uint64_t delta_ns) {
 
     sched_update_min_vruntime_locked(scheduler);
 
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
 }
 
 void sched_set_task_nice(task_t *task, int niceval) {
@@ -522,7 +473,7 @@ void sched_set_task_nice(task_t *task, int niceval) {
         return;
     }
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     if (entity->on_rq && entity->rq == scheduler) {
         sched_entity_dequeue_locked(scheduler, entity, true);
@@ -538,7 +489,7 @@ void sched_set_task_nice(task_t *task, int niceval) {
 
     sched_update_min_vruntime_locked(scheduler);
 
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
 }
 
 static struct sched_entity *sched_first_eligible_locked(sched_rq_t *scheduler,
@@ -606,8 +557,14 @@ static struct sched_entity *sched_pick_eevdf_locked(sched_rq_t *scheduler,
     if (eligible)
         return eligible;
 
-    return excluded ? sched_pick_min_fallback_locked(scheduler, excluded)
-                    : NULL;
+    /*
+     * The augmented minimum is an optimisation, not a correctness condition.
+     * In particular, rotations/deletions can leave a transiently conservative
+     * subtree minimum.  Never report an empty runqueue while a READY entity is
+     * still present: doing so sends the CPU to idle and strands that task until
+     * an unrelated interrupt happens to run the scheduler again.
+     */
+    return sched_pick_min_fallback_locked(scheduler, excluded);
 }
 
 static void sched_drop_dead_queued_locked(sched_rq_t *scheduler) {
@@ -644,7 +601,7 @@ bool sched_should_preempt(sched_rq_t *scheduler, task_t *curr_task,
 
     struct sched_entity *curr = curr_task->sched_info;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     if (scheduler->idle && curr_task == scheduler->idle->task) {
         should_preempt = scheduler->nr_queued != 0;
@@ -692,7 +649,7 @@ bool sched_should_preempt(sched_rq_t *scheduler, task_t *curr_task,
         should_preempt = true;
 
 out:
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
     return should_preempt;
 }
 
@@ -705,7 +662,7 @@ uint64_t sched_next_preempt_deadline(sched_rq_t *scheduler, task_t *curr_task,
 
     struct sched_entity *curr = curr_task->sched_info;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     if (scheduler->idle && curr == scheduler->idle)
         goto out;
@@ -730,7 +687,7 @@ uint64_t sched_next_preempt_deadline(sched_rq_t *scheduler, task_t *curr_task,
 out_now:
     deadline = now_ns;
 out:
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
     return deadline;
 }
 
@@ -742,7 +699,7 @@ static task_t *sched_pick_next_task_internal(sched_rq_t *scheduler,
     struct sched_entity *deferred_enqueue = NULL;
     uint64_t now_ns = nano_time();
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
 
     if (scheduler->cleanup_queued)
         sched_drop_dead_queued_locked(scheduler);
@@ -809,7 +766,7 @@ static task_t *sched_pick_next_task_internal(sched_rq_t *scheduler,
 
 out:
     sched_update_min_vruntime_locked(scheduler);
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
     return next_task;
 }
 
@@ -834,9 +791,9 @@ size_t sched_rq_nr_running(sched_rq_t *scheduler) {
     if (!scheduler)
         return 0;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
     nr_running = scheduler->nr_running;
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
     return nr_running;
 }
 
@@ -846,8 +803,15 @@ size_t sched_rq_nr_queued(sched_rq_t *scheduler) {
     if (!scheduler)
         return 0;
 
-    raw_spin_lock(&scheduler->lock);
+    spin_lock(&scheduler->lock);
     nr_queued = scheduler->nr_queued;
-    raw_spin_unlock(&scheduler->lock);
+    spin_unlock(&scheduler->lock);
     return nr_queued;
+}
+
+size_t sched_rq_nr_running_snapshot(sched_rq_t *scheduler) {
+    if (!scheduler)
+        return 0;
+
+    return __atomic_load_n(&scheduler->nr_running_snapshot, __ATOMIC_RELAXED);
 }

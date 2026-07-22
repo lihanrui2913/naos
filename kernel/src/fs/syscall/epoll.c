@@ -10,6 +10,7 @@
 #define EPOLL_OUT_EVENTS (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)
 #define EPOLL_PRI_EVENTS (EPOLLPRI | EPOLLMSG)
 #define EPOLLFS_MAGIC 0x65706f6cULL
+#define EPOLL_STACK_EVENTS 64
 
 typedef struct epollfs_info {
     spinlock_t lock;
@@ -580,10 +581,20 @@ static uint64_t do_epoll_wait(struct vfs_file *epoll_file,
     while (true) {
         vfs_poll_wait_table_t table;
         vfs_poll_wait_table_init(&table, current_task);
+        /*
+         * Every watched file already owns a persistent epoll_watch entry
+         * which forwards state changes to the epoll inode.  Wait on that one
+         * inode instead of allocating and attaching a temporary wait entry to
+         * every watched file on every epoll_wait().  Firefox keeps large epoll
+         * sets and calls this path very frequently, so the old behaviour was
+         * both O(n) allocation churn and O(n) wait-queue locking per call.
+         */
+        table.pt.events = EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLHUP;
+        vfs_poll_wait(epoll_file, &table.pt);
 
         spin_lock(&epoll->lock);
-        int ready = epoll_collect_ready_locked(epoll, events, maxevents,
-                                               &table.pt, true);
+        int ready =
+            epoll_collect_ready_locked(epoll, events, maxevents, NULL, true);
         if (ready > 0) {
             spin_unlock(&epoll->lock);
             vfs_poll_wait_table_cleanup(&table);
@@ -789,7 +800,8 @@ static size_t do_epoll_pwait(struct vfs_file *epoll_file,
 uint64_t sys_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
                         int timeout) {
     struct vfs_file *epoll_file;
-    struct epoll_event *kevents;
+    struct epoll_event stack_events[EPOLL_STACK_EVENTS];
+    struct epoll_event *kevents = stack_events;
     uint64_t ret;
     size_t events_bytes;
 
@@ -805,19 +817,24 @@ uint64_t sys_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
     if (!epoll_file)
         return (uint64_t)-EBADF;
 
-    kevents = calloc((size_t)maxevents, sizeof(*kevents));
-    if (!kevents) {
-        vfs_file_put(epoll_file);
-        return (uint64_t)-ENOMEM;
+    if (maxevents > EPOLL_STACK_EVENTS) {
+        kevents = calloc((size_t)maxevents, sizeof(*kevents));
+        if (!kevents) {
+            vfs_file_put(epoll_file);
+            return (uint64_t)-ENOMEM;
+        }
     }
 
     ret = do_epoll_wait(epoll_file, kevents, maxevents,
                         timeout < 0 ? -1 : (int64_t)timeout * 1000000LL);
-    if ((int64_t)ret >= 0 && copy_to_user(events, kevents, events_bytes)) {
-        ret = (uint64_t)-EFAULT;
+    if ((int64_t)ret > 0) {
+        size_t ready_bytes = (size_t)ret * sizeof(*kevents);
+        if (copy_to_user(events, kevents, ready_bytes))
+            ret = (uint64_t)-EFAULT;
     }
 
-    free(kevents);
+    if (kevents != stack_events)
+        free(kevents);
     vfs_file_put(epoll_file);
     return ret;
 }
@@ -853,7 +870,8 @@ uint64_t sys_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
 uint64_t sys_epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
                          int timeout, sigset_t *sigmask, size_t sigsetsize) {
     struct vfs_file *epoll_file;
-    struct epoll_event *kevents;
+    struct epoll_event stack_events[EPOLL_STACK_EVENTS];
+    struct epoll_event *kevents = stack_events;
     sigset_t newmask = 0;
     const sigset_t *sigmask_ptr = NULL;
     uint64_t ret;
@@ -881,20 +899,25 @@ uint64_t sys_epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
         sigmask_ptr = &newmask;
     }
 
-    kevents = calloc((size_t)maxevents, sizeof(*kevents));
-    if (!kevents) {
-        vfs_file_put(epoll_file);
-        return (uint64_t)-ENOMEM;
+    if (maxevents > EPOLL_STACK_EVENTS) {
+        kevents = calloc((size_t)maxevents, sizeof(*kevents));
+        if (!kevents) {
+            vfs_file_put(epoll_file);
+            return (uint64_t)-ENOMEM;
+        }
     }
 
     ret = do_epoll_pwait(epoll_file, kevents, maxevents,
                          timeout < 0 ? -1 : (int64_t)timeout * 1000000LL,
                          sigmask_ptr, sigsetsize);
-    if ((int64_t)ret >= 0 && copy_to_user(events, kevents, events_bytes)) {
-        ret = (uint64_t)-EFAULT;
+    if ((int64_t)ret > 0) {
+        size_t ready_bytes = (size_t)ret * sizeof(*kevents);
+        if (copy_to_user(events, kevents, ready_bytes))
+            ret = (uint64_t)-EFAULT;
     }
 
-    free(kevents);
+    if (kevents != stack_events)
+        free(kevents);
     vfs_file_put(epoll_file);
     return ret;
 }
@@ -903,7 +926,8 @@ uint64_t sys_epoll_pwait2(int epfd, struct epoll_event *events, int maxevents,
                           struct timespec *timeout, sigset_t *sigmask,
                           size_t sigsetsize) {
     struct vfs_file *epoll_file;
-    struct epoll_event *kevents;
+    struct epoll_event stack_events[EPOLL_STACK_EVENTS];
+    struct epoll_event *kevents = stack_events;
     sigset_t newmask = 0;
     const sigset_t *sigmask_ptr = NULL;
     int64_t timeout_ns = -1;
@@ -945,19 +969,24 @@ uint64_t sys_epoll_pwait2(int epfd, struct epoll_event *events, int maxevents,
         sigmask_ptr = &newmask;
     }
 
-    kevents = calloc((size_t)maxevents, sizeof(*kevents));
-    if (!kevents) {
-        vfs_file_put(epoll_file);
-        return (uint64_t)-ENOMEM;
+    if (maxevents > EPOLL_STACK_EVENTS) {
+        kevents = calloc((size_t)maxevents, sizeof(*kevents));
+        if (!kevents) {
+            vfs_file_put(epoll_file);
+            return (uint64_t)-ENOMEM;
+        }
     }
 
     ret = do_epoll_pwait(epoll_file, kevents, maxevents, timeout_ns,
                          sigmask_ptr, sigsetsize);
-    if ((int64_t)ret >= 0 && copy_to_user(events, kevents, events_bytes)) {
-        ret = (uint64_t)-EFAULT;
+    if ((int64_t)ret > 0) {
+        size_t ready_bytes = (size_t)ret * sizeof(*kevents);
+        if (copy_to_user(events, kevents, ready_bytes))
+            ret = (uint64_t)-EFAULT;
     }
 
-    free(kevents);
+    if (kevents != stack_events)
+        free(kevents);
     vfs_file_put(epoll_file);
     return ret;
 }

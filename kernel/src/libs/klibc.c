@@ -15,21 +15,26 @@ static inline bool klibc_page_table_levels_valid(uint64_t levels) {
 void spin_init(spinlock_t *lock) { memset(lock, 0, sizeof(spinlock_t)); }
 
 void raw_spin_lock(spinlock_t *sl) {
-    while (__sync_lock_test_and_set(&sl->lock, 1)) {
+    while (__atomic_exchange_n(&sl->lock, 1, __ATOMIC_ACQUIRE)) {
+        /* Spin on shared reads. Repeating a locked exchange while another CPU
+         * owns the lock continuously invalidates its cacheline and scales
+         * particularly badly when several CPUs contend for global locks. */
+        while (__atomic_load_n(&sl->lock, __ATOMIC_RELAXED)) {
 #if defined(__aarch64__)
-        asm volatile("wfe");
+            asm volatile("wfe");
 #else
-        arch_pause();
+            arch_pause();
 #endif
+        }
     }
 }
 
 bool raw_spin_trylock(spinlock_t *lock) {
-    return !__sync_lock_test_and_set(&lock->lock, 1);
+    return !__atomic_exchange_n(&lock->lock, 1, __ATOMIC_ACQUIRE);
 }
 
 void raw_spin_unlock(spinlock_t *sl) {
-    __sync_lock_release(&sl->lock);
+    __atomic_store_n(&sl->lock, 0, __ATOMIC_RELEASE);
 
 #if defined(__aarch64__)
     asm volatile("sev");

@@ -14,6 +14,7 @@ typedef int (*wait_queue_wake_func_t)(wait_queue_entry_t *entry,
 typedef struct wait_queue_head {
     spinlock_t lock;
     struct llist_header entries;
+    uint64_t wake_seq;
 } wait_queue_head_t;
 
 struct wait_queue_entry {
@@ -22,6 +23,7 @@ struct wait_queue_entry {
     uint32_t events;
     wait_queue_wake_func_t wake;
     void *private_data;
+    uint64_t wake_seq;
 };
 
 void wait_queue_init(wait_queue_head_t *queue);

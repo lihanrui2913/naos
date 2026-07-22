@@ -30,6 +30,7 @@ uint64_t next_task_pid = 1;
 hashmap_t task_pid_map = HASHMAP_INIT;
 hashmap_t task_parent_map = HASHMAP_INIT;
 hashmap_t task_pgid_map = HASHMAP_INIT;
+hashmap_t task_tgid_map = HASHMAP_INIT;
 rb_root_t task_timeout_roots[MAX_CPU_NUM];
 rb_root_t task_signal_timer_roots[MAX_CPU_NUM];
 spinlock_t task_timeout_locks[MAX_CPU_NUM];
@@ -39,6 +40,8 @@ static uint64_t task_signal_timer_next_ns[MAX_CPU_NUM];
 static deadline_source_t sched_tick_deadline_sources[MAX_CPU_NUM];
 static deadline_source_t task_timeout_deadline_sources[MAX_CPU_NUM];
 static deadline_source_t task_signal_timer_deadline_sources[MAX_CPU_NUM];
+#define TASK_TIMER_PENDING_WORDS ((MAX_CPU_NUM + 63U) / 64U)
+static uint64_t task_timer_pending_cpus[TASK_TIMER_PENDING_WORDS];
 spinlock_t should_free_lock = SPIN_INIT;
 DEFINE_LLIST(should_free_tasks);
 static spinlock_t should_free_mm_lock = SPIN_INIT;
@@ -94,6 +97,7 @@ fd_info_t *task_fd_info_alloc(size_t max_fds) {
     }
 
     fd_info->max_fds = max_fds;
+    fd_info->next_fd = 0;
     llist_init_head(&fd_info->signalfd_refs);
     spin_init(&fd_info->fdt_lock);
     task_fd_info_ref_init(fd_info, 1);
@@ -234,6 +238,12 @@ int task_fd_slot_install(fd_info_t *fd_info, int fd, struct vfs_file *file,
         return ret;
     }
 
+    if ((size_t)fd == fd_info->next_fd) {
+        while (fd_info->next_fd < fd_info->max_fds &&
+               fd_info->fds[fd_info->next_fd].file)
+            fd_info->next_fd++;
+    }
+
     return 0;
 }
 
@@ -255,6 +265,8 @@ struct vfs_file *task_fd_slot_take(fd_info_t *fd_info, int fd,
     fd_info->fds[fd].file = NULL;
     fd_info->fds[fd].flags = 0;
     vfs_file_fd_ref_put(file);
+    if ((size_t)fd < fd_info->next_fd)
+        fd_info->next_fd = (size_t)fd;
     return file;
 }
 
@@ -383,7 +395,8 @@ int task_install_file(task_t *task, struct vfs_file *file,
     with_fd_info_lock(fd_info, {
         size_t limit =
             MIN(fd_info->max_fds, task->rlim[RLIMIT_NOFILE].rlim_cur);
-        for (size_t i = (size_t)min_fd; i < limit; ++i) {
+        size_t scan_start = MAX((size_t)min_fd, fd_info->next_fd);
+        for (size_t i = scan_start; i < limit; ++i) {
             if (fd_info->fds[i].file)
                 continue;
             if (task_fd_slot_install(fd_info, (int)i, file, fd_flags) < 0)
@@ -539,6 +552,25 @@ static void task_sighand_put(task_sighand_t *sighand) {
     }
 }
 
+static task_cpu_account_t *task_cpu_account_alloc(void) {
+    task_cpu_account_t *account = calloc(1, sizeof(*account));
+    if (account)
+        account->ref_count = 1;
+    return account;
+}
+
+static void task_cpu_account_get(task_cpu_account_t *account) {
+    if (account)
+        __atomic_add_fetch(&account->ref_count, 1, __ATOMIC_RELAXED);
+}
+
+static void task_cpu_account_put(task_cpu_account_t *account) {
+    if (!account)
+        return;
+    if (__atomic_sub_fetch(&account->ref_count, 1, __ATOMIC_ACQ_REL) == 0)
+        free(account);
+}
+
 task_signal_info_t *task_signal_create_empty(void) {
     task_signal_info_t *signal = calloc(1, sizeof(task_signal_info_t));
     if (!signal)
@@ -547,6 +579,12 @@ task_signal_info_t *task_signal_create_empty(void) {
     signal->altstack.ss_flags = SS_DISABLE;
     signal->sighand = task_sighand_alloc();
     if (!signal->sighand) {
+        free(signal);
+        return NULL;
+    }
+    signal->cpu_account = task_cpu_account_alloc();
+    if (!signal->cpu_account) {
+        task_sighand_put(signal->sighand);
         free(signal);
         return NULL;
     }
@@ -570,6 +608,12 @@ task_signal_info_t *task_signal_clone(task_t *parent, uint64_t flags) {
     } else if (!(flags & CLONE_CLEAR_SIGHAND)) {
         memcpy(signal->sighand->actions, parent->signal->sighand->actions,
                sizeof(signal->sighand->actions));
+    }
+
+    if (flags & CLONE_THREAD) {
+        task_cpu_account_put(signal->cpu_account);
+        signal->cpu_account = parent->signal->cpu_account;
+        task_cpu_account_get(signal->cpu_account);
     }
 
     signal->blocked = parent->signal->blocked;
@@ -601,6 +645,9 @@ task_signal_info_t *task_signal_reset_after_exec(task_t *task) {
     signal->blocked = task->signal->blocked;
     signal->signal = task->signal->signal;
     signal->pending_signal = task->signal->pending_signal;
+    task_cpu_account_put(signal->cpu_account);
+    signal->cpu_account = task->signal->cpu_account;
+    task_cpu_account_get(signal->cpu_account);
     spin_unlock(&task->signal->sighand->siglock);
 
     return signal;
@@ -611,6 +658,7 @@ void task_signal_free(task_signal_info_t *signal) {
         return;
 
     task_sighand_put(signal->sighand);
+    task_cpu_account_put(signal->cpu_account);
     free(signal);
 }
 
@@ -632,13 +680,23 @@ void task_membarrier_checkpoint(task_t *task) {
     if (seq == 0)
         return;
 
-    uint64_t seen =
+    uint64_t task_seen =
         __atomic_load_n(&task->membarrier_seen_seq, __ATOMIC_RELAXED);
-    if (seen >= seq)
+    uint32_t cpu_id = current_cpu_id;
+    uint64_t cpu_seen =
+        cpu_id < MAX_CPU_NUM
+            ? __atomic_load_n(&mm->membarrier_cpu_seen_seq[cpu_id],
+                              __ATOMIC_RELAXED)
+            : seq;
+    if (task_seen >= seq && cpu_seen >= seq)
         return;
 
     memory_barrier();
-    __atomic_store_n(&task->membarrier_seen_seq, seq, __ATOMIC_RELEASE);
+    if (task_seen < seq)
+        __atomic_store_n(&task->membarrier_seen_seq, seq, __ATOMIC_RELEASE);
+    if (cpu_id < MAX_CPU_NUM && cpu_seen < seq)
+        __atomic_store_n(&mm->membarrier_cpu_seen_seq[cpu_id], seq,
+                         __ATOMIC_RELEASE);
 }
 
 static void task_init_default_rlimits(task_t *task) {
@@ -652,7 +710,8 @@ static void task_init_default_rlimits(task_t *task) {
     task->rlim[RLIMIT_STACK] = (struct rlimit){
         USER_STACK_END - USER_STACK_START, USER_STACK_END - USER_STACK_START};
     task->rlim[RLIMIT_NPROC] = (struct rlimit){MAX_TASK_NUM, MAX_TASK_NUM};
-    task->rlim[RLIMIT_NOFILE] = (struct rlimit){MAX_FD_NUM, MAX_FD_NUM};
+    task->rlim[RLIMIT_NOFILE] =
+        (struct rlimit){DEFAULT_NOFILE_LIMIT, MAX_FD_NUM};
     task->rlim[RLIMIT_CORE] = (struct rlimit){0, 0};
 }
 
@@ -1025,12 +1084,21 @@ static void task_signal_timer_softirq_cpu(uint32_t cpu_id) {
 }
 
 static void task_timer_softirq(void) {
-    for (uint32_t cpu_id = 0; cpu_id < cpu_count && cpu_id < MAX_CPU_NUM;
-         cpu_id++)
-        task_timeout_softirq_cpu(cpu_id);
-    for (uint32_t cpu_id = 0; cpu_id < cpu_count && cpu_id < MAX_CPU_NUM;
-         cpu_id++)
-        task_signal_timer_softirq_cpu(cpu_id);
+    for (uint32_t word = 0; word < TASK_TIMER_PENDING_WORDS; word++) {
+        uint64_t pending = __atomic_exchange_n(&task_timer_pending_cpus[word],
+                                               0, __ATOMIC_ACQ_REL);
+
+        while (pending) {
+            uint32_t bit = (uint32_t)__builtin_ctzll(pending);
+            uint32_t cpu_id = word * 64U + bit;
+            pending &= pending - 1;
+
+            if (cpu_id >= cpu_count || cpu_id >= MAX_CPU_NUM)
+                continue;
+            task_timeout_softirq_cpu(cpu_id);
+            task_signal_timer_softirq_cpu(cpu_id);
+        }
+    }
 }
 
 static void task_enqueue_should_free_locked(task_t *task) {
@@ -1058,8 +1126,8 @@ static bool task_should_free_pending(void) {
 }
 
 static void task_schedule_reap_softirq(void) {
-    softirq_raise(SOFTIRQ_TASK_REAP);
-    sched_wake_softirqd(current_cpu_id);
+    if (softirq_raise(SOFTIRQ_TASK_REAP))
+        sched_wake_softirqd(current_cpu_id);
 }
 
 void task_schedule_reap(void) { task_schedule_reap_softirq(); }
@@ -1169,20 +1237,15 @@ size_t task_thread_group_count(uint64_t tgid) {
         return 0;
 
     spin_lock(&task_queue_lock);
-    if (task_pid_map.buckets) {
-        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-            hashmap_entry_t *entry = &task_pid_map.buckets[i];
-            if (!hashmap_entry_is_occupied(entry))
-                continue;
-
-            task_t *task = (task_t *)entry->value;
-            if (!task || task->state == TASK_DIED || !task->arch_context) {
-                continue;
-            }
-
-            if (task_effective_tgid(task) == tgid) {
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (bucket) {
+        struct llist_header *node = bucket->tasks.next;
+        while (node != &bucket->tasks) {
+            task_t *task = list_entry(node, task_t, tgid_node);
+            node = node->next;
+            if (task && task->state != TASK_DIED && task->arch_context)
                 count++;
-            }
         }
     }
     spin_unlock(&task_queue_lock);
@@ -1204,18 +1267,17 @@ static bool task_is_signal_group_representative_locked(task_t *task,
     }
 
     uint64_t tgid = task_effective_tgid(task);
-    if (!tgid || !task_pid_map.buckets)
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (!tgid || !bucket)
         return true;
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *peer = (task_t *)entry->value;
+    struct llist_header *node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *peer = list_entry(node, task_t, tgid_node);
+        node = node->next;
         if (!peer || peer == task || peer->state == TASK_DIED ||
-            !peer->arch_context || task_effective_tgid(peer) != tgid ||
-            (skip_kernel && peer->is_kernel)) {
+            !peer->arch_context || (skip_kernel && peer->is_kernel)) {
             continue;
         }
 
@@ -1239,15 +1301,15 @@ static task_t *task_pick_thread_group_signal_target_locked(uint64_t tgid,
                                                            bool skip_kernel) {
     task_t *fallback = NULL;
 
-    if (!tgid || !task_pid_map.buckets)
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (!tgid || !bucket)
         return NULL;
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *task = (task_t *)entry->value;
+    struct llist_header *node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *task = list_entry(node, task_t, tgid_node);
+        node = node->next;
         if (!task_signalable_user_task_locked(task, tgid, skip_kernel))
             continue;
 
@@ -1274,7 +1336,9 @@ static int task_kill_thread_group_locked(uint64_t tgid, int sig, int code,
                                          bool skip_kernel) {
     int sent = 0;
 
-    if (!tgid || !task_pid_map.buckets)
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    if (!tgid || !bucket)
         return 0;
 
     if (!task_signal_forces_group_exit(sig)) {
@@ -1287,24 +1351,20 @@ static int task_kill_thread_group_locked(uint64_t tgid, int sig, int code,
         return 1;
     }
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *task = (task_t *)entry->value;
+    struct llist_header *node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *task = list_entry(node, task_t, tgid_node);
+        node = node->next;
         if (!task_signalable_user_task_locked(task, tgid, skip_kernel))
             continue;
 
         task_mark_group_exit_locked(task, 128 + sig);
     }
 
-    for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-        hashmap_entry_t *entry = &task_pid_map.buckets[i];
-        if (!hashmap_entry_is_occupied(entry))
-            continue;
-
-        task_t *task = (task_t *)entry->value;
+    node = bucket->tasks.next;
+    while (node != &bucket->tasks) {
+        task_t *task = list_entry(node, task_t, tgid_node);
+        node = node->next;
         if (!task_signalable_user_task_locked(task, tgid, skip_kernel))
             continue;
 
@@ -1430,6 +1490,35 @@ void task_index_bucket_destroy_if_empty(hashmap_t *map, uint64_t key) {
     free(bucket);
 }
 
+void task_tgid_index_attach_locked(task_t *task) {
+    uint64_t tgid = task_effective_tgid(task);
+
+    if (!task || !task->pid || !tgid || !llist_empty(&task->tgid_node))
+        return;
+
+    task_index_bucket_t *bucket =
+        task_index_bucket_get_or_create(&task_tgid_map, tgid);
+    if (!bucket)
+        return;
+
+    llist_append(&bucket->tasks, &task->tgid_node);
+    bucket->count++;
+}
+
+void task_tgid_index_detach_locked(task_t *task) {
+    uint64_t tgid = task_effective_tgid(task);
+
+    if (!task || !tgid || llist_empty(&task->tgid_node))
+        return;
+
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, tgid);
+    llist_delete(&task->tgid_node);
+    if (bucket && bucket->count)
+        bucket->count--;
+    task_index_bucket_destroy_if_empty(&task_tgid_map, tgid);
+}
+
 void task_parent_index_attach_locked(task_t *task) {
     if (!task_should_index_parent(task) || !llist_empty(&task->parent_node)) {
         return;
@@ -1517,21 +1606,18 @@ static task_t *task_pick_reaper_locked(task_t *task) {
         return leader;
     }
 
-    if (task_pid_map.buckets) {
-        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-            hashmap_entry_t *entry = &task_pid_map.buckets[i];
-            if (!hashmap_entry_is_occupied(entry)) {
-                continue;
-            }
-
-            task_t *candidate = (task_t *)entry->value;
+    task_index_bucket_t *bucket =
+        task_index_bucket_lookup(&task_tgid_map, current_tgid);
+    if (bucket) {
+        struct llist_header *node = bucket->tasks.next;
+        while (node != &bucket->tasks) {
+            task_t *candidate = list_entry(node, task_t, tgid_node);
+            node = node->next;
             if (!task_is_live_locked(candidate) || candidate == task) {
                 continue;
             }
 
-            if (task_effective_tgid(candidate) == current_tgid) {
-                return candidate;
-            }
+            return candidate;
         }
     }
 
@@ -1641,19 +1727,20 @@ bool can_schedule = false;
 extern int unix_socket_fsid;
 extern int unix_accept_fsid;
 
-uint32_t cpu_idx = 0;
+static uint32_t cpu_idx = 0;
 
 uint32_t alloc_cpu_id() {
     if (!cpu_count)
         return 0;
 
-    uint32_t start = cpu_idx % cpu_count;
+    uint32_t start =
+        __atomic_fetch_add(&cpu_idx, 1, __ATOMIC_RELAXED) % cpu_count;
     uint32_t best = start;
     size_t best_running = SIZE_MAX;
 
     for (uint32_t offset = 0; offset < cpu_count; offset++) {
         uint32_t cpu = (start + offset) % cpu_count;
-        size_t nr_running = sched_rq_nr_running(&schedulers[cpu]);
+        size_t nr_running = sched_rq_nr_running_snapshot(&schedulers[cpu]);
 
         if (nr_running < best_running) {
             best = cpu;
@@ -1663,7 +1750,6 @@ uint32_t alloc_cpu_id() {
         }
     }
 
-    cpu_idx = (best + 1) % cpu_count;
     return best;
 }
 
@@ -1675,6 +1761,7 @@ task_t *get_free_task() {
             llist_init_head(&task->free_node);
             llist_init_head(&task->parent_node);
             llist_init_head(&task->pgid_node);
+            llist_init_head(&task->tgid_node);
             llist_init_head(&task->tick_work_node);
             spin_init(&task->block_lock);
             spin_init(&task->fd_info_lock);
@@ -1689,30 +1776,27 @@ task_t *get_free_task() {
         }
     }
 
-    spin_lock(&task_queue_lock);
-
-    uint64_t pid = next_task_pid;
-
     task_t *task = (task_t *)malloc(sizeof(task_t));
-    if (!task) {
-        spin_unlock(&task_queue_lock);
+    if (!task)
         return NULL;
-    }
+
     memset(task, 0, sizeof(task_t));
     llist_init_head(&task->free_node);
     llist_init_head(&task->parent_node);
     llist_init_head(&task->pgid_node);
+    llist_init_head(&task->tgid_node);
     llist_init_head(&task->tick_work_node);
     spin_init(&task->block_lock);
     spin_init(&task->fd_info_lock);
     wait_queue_init(&task->child_wait);
     task->tick_work_queue_id = UINT32_MAX;
     task->state = TASK_CREATING;
-    task->pid = pid;
     task->cpu_id = alloc_cpu_id();
     task->start_time_ns = nano_time();
+
+    spin_lock(&task_queue_lock);
+    task->pid = next_task_pid++;
     task_pid_index_add_locked(task);
-    next_task_pid++;
     spin_unlock(&task_queue_lock);
     return task;
 }
@@ -1801,7 +1885,7 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
 
     task_init_default_rlimits(task);
 
-    task->fd_info = task_fd_info_alloc(MAX_FD_NUM);
+    task->fd_info = task_fd_info_alloc(FD_TABLE_INITIAL_SIZE);
     if (!task->fd_info)
         goto fail;
     {
@@ -1847,6 +1931,10 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
 
     task->state = TASK_READY;
     task->current_state = TASK_READY;
+
+    spin_lock(&task_queue_lock);
+    task_tgid_index_attach_locked(task);
+    spin_unlock(&task_queue_lock);
 
     task->sched_info = calloc(1, sizeof(struct sched_entity));
     if (!task->sched_info)
@@ -1897,6 +1985,7 @@ void task_init() {
     ASSERT(hashmap_init(&task_pid_map, 512) == 0);
     ASSERT(hashmap_init(&task_parent_map, 512) == 0);
     ASSERT(hashmap_init(&task_pgid_map, 512) == 0);
+    ASSERT(hashmap_init(&task_tgid_map, 512) == 0);
     for (uint32_t cpu = 0; cpu < MAX_CPU_NUM; cpu++) {
         task_timeout_roots[cpu] = RB_ROOT_INIT;
         task_signal_timer_roots[cpu] = RB_ROOT_INIT;
@@ -1927,6 +2016,8 @@ void task_init() {
         schedulers[cpu].min_vruntime = 0;
         schedulers[cpu].load_weight = 0;
         schedulers[cpu].nr_running = 0;
+        __atomic_store_n(&schedulers[cpu].nr_running_snapshot, 0,
+                         __ATOMIC_RELAXED);
         schedulers[cpu].nr_queued = 0;
         spin_init(&schedulers[cpu].lock);
     }
@@ -1950,6 +2041,10 @@ void task_init() {
 
     softirqd_task =
         task_create("softirqd", softirqd_thread, 0, KTHREAD_PRIORITY);
+    /* There is one global softirq worker, not one worker per CPU.  Keep it on
+     * its assigned CPU so timer/reap wakeups from different CPUs do not bounce
+     * the same kernel stack and softirq state across the machine. */
+    task_set_flag(softirqd_task, TASK_FLAG_CPU_PINNED);
     remove_sched_entity(softirqd_task, &schedulers[softirqd_task->cpu_id]);
     softirqd_task->state = TASK_BLOCKING;
     softirqd_task->blocking_reason = "waiting_for_softirq";
@@ -2155,17 +2250,23 @@ ret:
     return result;
 }
 
-void task_unblock(task_t *task, int reason) {
-    if (!task || task->state == TASK_DIED) {
-        return;
-    }
-
+bool task_unblock_prepare(task_t *task, int reason,
+                          task_unblock_token_t *token) {
     bool irq_state = arch_interrupt_enabled();
-    bool cancel_timeout = false;
+
+    if (token)
+        memset(token, 0, sizeof(*token));
+    if (!task || !token)
+        return false;
 
     arch_disable_interrupt();
 
     spin_lock(&task->block_lock);
+
+    if (task->state == TASK_DIED) {
+        spin_unlock(&task->block_lock);
+        goto ret;
+    }
 
     if (task->state != TASK_BLOCKING && task->state != TASK_UNINTERRUPTABLE) {
         if (!task->block_preparing) {
@@ -2175,6 +2276,7 @@ void task_unblock(task_t *task, int reason) {
         task->status = reason;
         task->force_wakeup_ns = UINT64_MAX;
         task->wake_pending = true;
+        token->accepted = true;
         spin_unlock(&task->block_lock);
         goto ret;
     }
@@ -2184,10 +2286,33 @@ void task_unblock(task_t *task, int reason) {
     task->block_preparing = false;
 
     task->blocking_reason = NULL;
-    cancel_timeout = task->force_wakeup_ns != UINT64_MAX;
     task->wake_pending = false;
+    token->task = task;
+    token->accepted = true;
+    token->prepared = true;
+    token->cancel_timeout = task->force_wakeup_ns != UINT64_MAX;
 
     spin_unlock(&task->block_lock);
+
+ret:
+    if (irq_state)
+        arch_enable_interrupt();
+    return token->prepared;
+}
+
+void task_unblock_finish(task_unblock_token_t *token) {
+    if (!token || !token->prepared || !token->task)
+        return;
+
+    task_t *task = token->task;
+    bool cancel_timeout = token->cancel_timeout;
+
+    /* The token may live on the blocked task's syscall stack. Consume it
+     * before enqueueing that task, because a remote CPU can run and unwind the
+     * stack as soon as add_sched_entity_wakeup() sends its IPI. */
+    token->task = NULL;
+    token->prepared = false;
+    token->cancel_timeout = false;
 
     if (cancel_timeout) {
         task_timeout_cancel(task);
@@ -2197,13 +2322,19 @@ void task_unblock(task_t *task, int reason) {
         spin_unlock(&task->block_lock);
     }
 
-    sched_balance_wakeup(task);
+    /* Preserve CPU affinity across short sleeps.  Migrating on every
+     * futex/socket/epoll wakeup makes IPC-heavy applications bounce their
+     * working set and shared mm between CPUs, multiplying cache coherency,
+     * scheduler IPI and TLB shootdown costs.  New tasks are still distributed
+     * by alloc_cpu_id(); periodic balancing can be added separately. */
     add_sched_entity_wakeup(task, &schedulers[task->cpu_id]);
+}
 
-ret:
-    if (irq_state) {
-        arch_enable_interrupt();
-    }
+void task_unblock(task_t *task, int reason) {
+    task_unblock_token_t token;
+
+    if (task_unblock_prepare(task, reason, &token))
+        task_unblock_finish(&token);
 }
 
 void task_cleanup_fd_info(task_t *task) {
@@ -2364,22 +2495,15 @@ uint64_t task_exit(int64_t code) {
         spin_unlock(&self->signal->sighand->siglock);
     }
 
-    if (task_pid_map.buckets) {
-        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-            hashmap_entry_t *entry = &task_pid_map.buckets[i];
-            if (!hashmap_entry_is_occupied(entry)) {
-                continue;
-            }
-
-            task_t *task = (task_t *)entry->value;
+    task_index_bucket_t *group =
+        task_index_bucket_lookup(&task_tgid_map, current_tgid);
+    if (group) {
+        struct llist_header *node = group->tasks.next;
+        while (node != &group->tasks) {
+            task_t *task = list_entry(node, task_t, tgid_node);
+            node = node->next;
             if (!task || task == self || task->state == TASK_DIED ||
                 !task->arch_context) {
-                continue;
-            }
-
-            uint64_t task_tgid =
-                task->tgid > 0 ? (uint64_t)task->tgid : task->pid;
-            if (task_tgid != current_tgid) {
                 continue;
             }
 
@@ -2459,25 +2583,37 @@ void sched_wake_softirqd(uint32_t cpu_id) {
     if (!softirqd_task)
         return;
 
-    uint32_t worker_cpu = softirqd_task->cpu_id;
+    (void)cpu_id;
+    /* task_unblock() enqueues the worker and sends the remote reschedule IPI
+     * when one is required.  Sending another IPI here doubles the interrupt
+     * traffic whenever a non-owner CPU raises timer/reap softirq work. */
     task_unblock(softirqd_task, EOK);
-    if (worker_cpu < cpu_count && worker_cpu != current_cpu_id) {
-        irq_trigger_sched_ipi(worker_cpu);
-    }
 }
 
 void sched_check_wakeup() {
-    uint64_t next = deadline_next_ns_for_cpu(current_cpu_id);
-
-    if (next == UINT64_MAX)
+    uint32_t cpu_id = current_cpu_id;
+    if (cpu_id >= MAX_CPU_NUM)
         return;
 
     uint64_t now = nano_time();
-    if (next > now)
+    uint64_t timeout_next =
+        __atomic_load_n(&task_timeout_next_ns[cpu_id], __ATOMIC_ACQUIRE);
+    uint64_t signal_next =
+        __atomic_load_n(&task_signal_timer_next_ns[cpu_id], __ATOMIC_ACQUIRE);
+
+    /*
+     * The deadline queue also contains the scheduler preemption deadline.
+     * The IRQ exit path handles that deadline directly; treating every
+     * scheduler tick as a task-timer expiry wakes the single softirq worker
+     * cross-CPU and makes it scan every CPU once per time slice.
+     */
+    if (timeout_next > now && signal_next > now)
         return;
 
-    softirq_raise(SOFTIRQ_TIMER);
-    sched_wake_softirqd(current_cpu_id);
+    __atomic_fetch_or(&task_timer_pending_cpus[cpu_id / 64U],
+                      1ULL << (cpu_id % 64U), __ATOMIC_ACQ_REL);
+    if (softirq_raise(SOFTIRQ_TIMER))
+        sched_wake_softirqd(current_cpu_id);
 }
 
 uint64_t sched_next_wakeup_ns(void) {
@@ -2555,9 +2691,8 @@ void schedule(uint64_t sched_flags) {
     if (!prev->last_sched_in_ns && prev->current_state == TASK_RUNNING)
         prev->last_sched_in_ns = now_ns;
 
-    uint64_t runtime_delta_ns = task_account_runtime_ns(prev, now_ns);
-    if (runtime_delta_ns)
-        sched_account_runtime(prev, runtime_delta_ns);
+    task_account_runtime_ns(prev, now_ns);
+    sched_account_runtime_until(prev, now_ns);
 
     bool must_resched =
         task_need_resched(prev) || (sched_flags & SCHED_FLAG_YIELD) ||
@@ -2601,6 +2736,7 @@ void schedule(uint64_t sched_flags) {
         task_mm_mark_cpu_inactive(prev->mm, cpu_id);
         task_mm_mark_cpu_active(next->mm, cpu_id);
     }
+    task_membarrier_checkpoint(next);
     switch_to(prev, next);
 
 ret:

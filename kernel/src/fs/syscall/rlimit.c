@@ -91,6 +91,13 @@ uint64_t sys_prlimit64(uint64_t pid, int resource,
         if (copy_from_user(&value, new_rlim, sizeof(value))) {
             return (uint64_t)-EFAULT;
         }
+        if (value.rlim_cur > value.rlim_max)
+            return (uint64_t)-EINVAL;
+        /* Match Linux's nr_open ceiling: userspace may lower RLIMIT_NOFILE,
+         * but the kernel must not advertise a hard limit its fd table cannot
+         * represent. */
+        if (resource == RLIMIT_NOFILE && value.rlim_max > MAX_FD_NUM)
+            return (uint64_t)-EPERM;
         target->rlim[resource] = value;
     }
 

@@ -33,6 +33,7 @@ typedef struct task_mm_info {
     uint64_t stack_end;
     uint64_t resident_pages;
     uint64_t membarrier_private_expedited_seq;
+    uint64_t membarrier_cpu_seen_seq[MAX_CPU_NUM];
     bool membarrier_private_expedited_registered;
 } task_mm_info_t;
 
@@ -97,6 +98,16 @@ static inline void task_mm_mark_cpu_inactive(task_mm_info_t *mm,
     size_t word = cpu_id / 64;
     uint64_t bit = 1ULL << (cpu_id % 64);
     __atomic_and_fetch(&mm->active_cpu_mask[word], ~bit, __ATOMIC_RELEASE);
+}
+
+static inline bool task_mm_cpu_active(task_mm_info_t *mm, uint32_t cpu_id) {
+    if (!mm || cpu_id >= MAX_CPU_NUM)
+        return false;
+
+    size_t word = cpu_id / 64;
+    uint64_t bit = 1ULL << (cpu_id % 64);
+    return (__atomic_load_n(&mm->active_cpu_mask[word], __ATOMIC_ACQUIRE) &
+            bit) != 0;
 }
 
 bool task_mm_flush_tlb_page(task_mm_info_t *mm, uint64_t vaddr);

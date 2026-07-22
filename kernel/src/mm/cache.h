@@ -18,6 +18,7 @@ typedef struct page_cache_page {
     bool truncated;
     bool on_lru;
     bool reclaiming;
+    bool referenced;
 } page_cache_page_t;
 
 typedef struct page_cache_stats {

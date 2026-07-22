@@ -1984,7 +1984,7 @@ static size_t unix_socket_install_pending_files(fd_t **pending_files,
             int new_fd = -1;
             size_t limit = MIN(fd_info->max_fds,
                                current_task->rlim[RLIMIT_NOFILE].rlim_cur);
-            for (size_t fd_idx = 0; fd_idx < limit; fd_idx++) {
+            for (size_t fd_idx = fd_info->next_fd; fd_idx < limit; fd_idx++) {
                 if (fd_info->fds[fd_idx].file == NULL) {
                     new_fd = (int)fd_idx;
                     break;

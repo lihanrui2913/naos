@@ -36,6 +36,11 @@ typedef struct futex_key {
     uintptr_t ctx;
 } futex_key_t;
 
+typedef struct futex_wake_list {
+    struct futex_wait *head;
+    struct futex_wait *tail;
+} futex_wake_list_t;
+
 static inline uint32_t futex_bucket_id_for_key(const futex_key_t *key) {
     uint64_t hash;
 
@@ -364,17 +369,41 @@ static futex_bucket_t *futex_lock_wait_bucket(struct futex_wait *wait) {
     }
 }
 
-static void futex_signal_waiter(struct futex_wait *wait) {
-    task_t *task = wait ? wait->task : NULL;
-
-    if (!task || task->state == TASK_DIED)
+static void futex_queue_waiter_wake(struct futex_wait *wait,
+                                    futex_wake_list_t *wake_list) {
+    if (!wait || !wake_list || !wait->task)
         return;
 
-    task_unblock(task, EOK);
+    if (!task_unblock_prepare(wait->task, EOK, &wait->unblock_token))
+        return;
+
+    wait->next = NULL;
+    if (wake_list->tail)
+        wake_list->tail->next = wait;
+    else
+        wake_list->head = wait;
+    wake_list->tail = wait;
+}
+
+static void futex_finish_wake_list(futex_wake_list_t *wake_list) {
+    struct futex_wait *wait = wake_list ? wake_list->head : NULL;
+
+    while (wait) {
+        struct futex_wait *next = wait->next;
+        wait->next = NULL;
+        task_unblock_finish(&wait->unblock_token);
+        wait = next;
+    }
+
+    if (wake_list) {
+        wake_list->head = NULL;
+        wake_list->tail = NULL;
+    }
 }
 
 static int futex_wake_locked(futex_bucket_t *bucket, const futex_key_t *key,
-                             int val, uint32_t bitset) {
+                             int val, uint32_t bitset,
+                             futex_wake_list_t *wake_list) {
     if (val <= 0)
         return 0;
 
@@ -415,7 +444,7 @@ static int futex_wake_locked(futex_bucket_t *bucket, const futex_key_t *key,
 
             curr->next = NULL;
             curr->queued = false;
-            futex_signal_waiter(curr);
+            futex_queue_waiter_wake(curr, wake_list);
             woke++;
             curr = next;
             continue;
@@ -587,10 +616,12 @@ static uint64_t sys_futex_wake_key(const futex_key_t *key, int val,
         return (uint64_t)-EINVAL;
 
     futex_bucket_t *bucket = futex_bucket_for_key(key, NULL);
+    futex_wake_list_t wake_list = {0};
 
     spin_lock(&bucket->lock);
-    int count = futex_wake_locked(bucket, key, val, bitset);
+    int count = futex_wake_locked(bucket, key, val, bitset, &wake_list);
     spin_unlock(&bucket->lock);
+    futex_finish_wake_list(&wake_list);
     return count;
 }
 
@@ -688,6 +719,7 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
         uint32_t bucket2_id;
         futex_bucket_t *bucket1 = futex_bucket_for_key(&key1, &bucket1_id);
         futex_bucket_t *bucket2 = futex_bucket_for_key(&key2, &bucket2_id);
+        futex_wake_list_t wake_list = {0};
 
         int oldval = 0;
         if (!futex_read_user_word(uaddr2, &oldval))
@@ -738,7 +770,8 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
             return (uint64_t)-EFAULT;
         }
 
-        int ret_count = futex_wake_locked(bucket1, &key1, val, 0xFFFFFFFF);
+        int ret_count =
+            futex_wake_locked(bucket1, &key1, val, 0xFFFFFFFF, &wake_list);
 
         bool wake_uaddr2 = false;
         switch (cmp_type) {
@@ -766,10 +799,12 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
 
         if (wake_uaddr2) {
             int val2 = (int)(uintptr_t)timeout;
-            ret_count += futex_wake_locked(bucket2, &key2, val2, 0xFFFFFFFF);
+            ret_count +=
+                futex_wake_locked(bucket2, &key2, val2, 0xFFFFFFFF, &wake_list);
         }
 
         futex_unlock_bucket_pair(bucket1, bucket1_id, bucket2, bucket2_id);
+        futex_finish_wake_list(&wake_list);
         return ret_count;
     }
     case FUTEX_LOCK_PI: {
@@ -858,6 +893,7 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
             return ret;
 
         futex_bucket_t *bucket = futex_bucket_for_key(&key, NULL);
+        futex_wake_list_t wake_list = {0};
 
         int owner = 0;
         if (!futex_read_user_word(uaddr, &owner))
@@ -876,8 +912,9 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
             spin_unlock(&bucket->lock);
             return (uint64_t)-EFAULT;
         }
-        futex_wake_locked(bucket, &key, 1, 0xFFFFFFFF);
+        futex_wake_locked(bucket, &key, 1, 0xFFFFFFFF, &wake_list);
         spin_unlock(&bucket->lock);
+        futex_finish_wake_list(&wake_list);
         return 0;
     }
     case FUTEX_REQUEUE:
@@ -906,6 +943,7 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
             futex_bucket_for_key(&src_key, &src_bucket_id);
         futex_bucket_t *dst_bucket =
             futex_bucket_for_key(&dst_key, &dst_bucket_id);
+        futex_wake_list_t wake_list = {0};
 
         int uval3;
         if (!futex_read_user_word(uaddr, &uval3))
@@ -928,8 +966,8 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
             return (uint64_t)-EAGAIN;
         }
 
-        int wake_count =
-            futex_wake_locked(src_bucket, &src_key, val, 0xFFFFFFFF);
+        int wake_count = futex_wake_locked(src_bucket, &src_key, val,
+                                           0xFFFFFFFF, &wake_list);
         int requeue_count = 0;
 
         if (nr_requeue > 0) {
@@ -978,6 +1016,7 @@ uint64_t sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
 
         futex_unlock_bucket_pair(src_bucket, src_bucket_id, dst_bucket,
                                  dst_bucket_id);
+        futex_finish_wake_list(&wake_list);
         return wake_count + requeue_count;
     }
     default:

@@ -1,7 +1,6 @@
 #include <arch/arch.h>
 #include <drivers/clockevent.h>
 #include <drivers/logger.h>
-#include <irq/softirq.h>
 #include <task/task.h>
 
 static clockevent_device_t *active_clockevent;
@@ -80,7 +79,5 @@ void clockevent_program_event(uint64_t monotonic_deadline_ns) {
 
 void clockevent_handle_irq(void) {
     __atomic_store_n(&clockevent_deadline_ns, UINT64_MAX, __ATOMIC_RELEASE);
-
-    softirq_raise(SOFTIRQ_TIMER);
-    sched_wake_softirqd(current_cpu_id);
+    sched_check_wakeup();
 }

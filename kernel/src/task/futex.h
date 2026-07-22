@@ -11,6 +11,7 @@ struct futex_wait {
     uint32_t bucket_id;
     uint32_t bitset; // For FUTEX_WAIT_BITSET
     bool queued;
+    task_unblock_token_t unblock_token;
 };
 
 #define FUTEX_OP_SET 0         // *uaddr2 = oparg

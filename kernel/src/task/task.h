@@ -136,6 +136,13 @@ static inline void task_set_need_resched(task_t *task) {
     __atomic_store_n(&task->need_resched, true, __ATOMIC_RELEASE);
 }
 
+static inline bool task_set_need_resched_once(task_t *task) {
+    if (!task)
+        return false;
+
+    return !__atomic_exchange_n(&task->need_resched, true, __ATOMIC_ACQ_REL);
+}
+
 static inline void task_clear_need_resched(task_t *task) {
     if (!task)
         return;
@@ -215,6 +222,9 @@ static inline uint64_t task_account_runtime_ns(task_t *task, uint64_t now_ns) {
     task->last_sched_in_ns = now_ns;
 
     task->user_time_ns += delta;
+    if (task->signal && task->signal->cpu_account)
+        __atomic_add_fetch(&task->signal->cpu_account->runtime_ns, delta,
+                           __ATOMIC_RELAXED);
     return delta;
 }
 
@@ -230,6 +240,10 @@ static inline bool task_should_index_pgid(task_t *task, int64_t pgid) {
 }
 
 extern hashmap_t task_pid_map;
+extern hashmap_t task_tgid_map;
+
+void task_tgid_index_attach_locked(task_t *task);
+void task_tgid_index_detach_locked(task_t *task);
 
 static inline task_t *task_lookup_by_pid_nolock(uint64_t pid) {
     if (pid == 0)
@@ -341,6 +355,17 @@ uint64_t task_exit(int64_t code);
 
 int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
                const char *blocking_reason);
+
+typedef struct task_unblock_token {
+    task_t *task;
+    bool accepted;
+    bool prepared;
+    bool cancel_timeout;
+} task_unblock_token_t;
+
+bool task_unblock_prepare(task_t *task, int reason,
+                          task_unblock_token_t *token);
+void task_unblock_finish(task_unblock_token_t *token);
 void task_unblock(task_t *task, int reason);
 void task_prepare_block(task_t *task);
 void task_cancel_block_prepare(task_t *task);

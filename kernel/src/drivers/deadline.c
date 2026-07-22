@@ -113,7 +113,11 @@ void deadline_source_update(deadline_source_t *source, uint64_t deadline_ns) {
 
     deadline_refresh_next_locked(queue);
     new_next = __atomic_load_n(&queue->next_cached_ns, __ATOMIC_ACQUIRE);
-    should_reprogram = new_next != old_next;
+    /* A remote CPU only needs an interrupt when its deadline moves earlier.
+     * If the earliest source is cancelled or postponed, the already armed
+     * (earlier) timer will fire harmlessly and reprogram itself. */
+    should_reprogram = source->cpu_id == current_cpu_id ? new_next != old_next
+                                                        : new_next < old_next;
     spin_unlock(&queue->lock);
 
     if (should_reprogram)

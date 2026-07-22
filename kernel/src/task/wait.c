@@ -32,6 +32,7 @@ void wait_queue_init(wait_queue_head_t *queue) {
 
     spin_init(&queue->lock);
     llist_init_head(&queue->entries);
+    queue->wake_seq = 0;
 }
 
 void wait_queue_entry_init(wait_queue_entry_t *entry, task_t *task,
@@ -45,6 +46,7 @@ void wait_queue_entry_init(wait_queue_entry_t *entry, task_t *task,
     entry->events = events;
     entry->wake = wake;
     entry->private_data = private_data;
+    entry->wake_seq = 0;
 }
 
 void wait_queue_add(wait_queue_head_t *queue, wait_queue_entry_t *entry) {
@@ -84,15 +86,21 @@ int wait_queue_wake_entry(wait_queue_entry_t *entry, uint32_t events,
 
 int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
                     int reason) {
-    task_t *wake_tasks[64] = {0};
+    task_unblock_token_t wake_tokens[64] = {0};
     int woke = 0;
+    uint64_t wake_seq;
 
     if (!queue)
         return 0;
 
-    bool process_callbacks = true;
+    spin_lock(&queue->lock);
+    wake_seq = ++queue->wake_seq;
+    if (!wake_seq)
+        wake_seq = ++queue->wake_seq;
+    spin_unlock(&queue->lock);
+
     while (nr <= 0 || woke < nr) {
-        int wake_count = 0;
+        int finish_count = 0;
 
         spin_lock(&queue->lock);
         struct llist_header *node = queue->entries.next;
@@ -105,6 +113,8 @@ int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
 
             if (!wait_queue_events_match(entry->events, events))
                 continue;
+            if (entry->wake_seq >= wake_seq)
+                continue;
 
             if (entry->wake) {
                 /*
@@ -112,7 +122,8 @@ int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
                  * (epoll watch entries). Keep those callbacks under the queue
                  * lock until they grow an explicit refcount.
                  */
-                if (process_callbacks && entry->wake(entry, events, reason)) {
+                entry->wake_seq = wake_seq;
+                if (entry->wake(entry, events, reason)) {
                     woke++;
                     if (nr > 0 && woke >= nr)
                         break;
@@ -127,20 +138,27 @@ int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
                 task->state != TASK_UNINTERRUPTABLE && !task->block_preparing)
                 continue;
 
-            wake_tasks[wake_count++] = task;
+            task_unblock_token_t token;
+            task_unblock_prepare(task, reason, &token);
+            if (!token.accepted)
+                continue;
+
+            entry->wake_seq = wake_seq;
+            if (token.prepared)
+                wake_tokens[finish_count++] = token;
             woke++;
             if (nr > 0 && woke >= nr)
                 break;
-            if (wake_count >= (int)(sizeof(wake_tasks) / sizeof(wake_tasks[0])))
+            if (finish_count >=
+                (int)(sizeof(wake_tokens) / sizeof(wake_tokens[0])))
                 break;
         }
         spin_unlock(&queue->lock);
 
-        for (int i = 0; i < wake_count; i++)
-            task_unblock(wake_tasks[i], reason);
+        for (int i = 0; i < finish_count; i++)
+            task_unblock_finish(&wake_tokens[i]);
 
-        process_callbacks = false;
-        if (wake_count < (int)(sizeof(wake_tasks) / sizeof(wake_tasks[0])))
+        if (finish_count < (int)(sizeof(wake_tokens) / sizeof(wake_tokens[0])))
             break;
     }
 

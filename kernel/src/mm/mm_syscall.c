@@ -276,38 +276,19 @@ static uint64_t membarrier_supported_mask(void) {
            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
 }
 
-static bool membarrier_task_matches_mm(task_t *task, task_mm_info_t *mm,
-                                       task_t *self) {
-    return task && task != self && task->mm == mm &&
-           task->current_state == TASK_RUNNING && task->state != TASK_DIED;
-}
-
-static void membarrier_collect_target_cpus(task_mm_info_t *mm, task_t *self,
+static void membarrier_collect_target_cpus(task_mm_info_t *mm,
+                                           uint32_t self_cpu,
                                            bool cpu_targets[MAX_CPU_NUM]) {
     memset(cpu_targets, 0, sizeof(bool) * MAX_CPU_NUM);
 
-    spin_lock(&task_queue_lock);
-    if (task_pid_map.buckets) {
-        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-            hashmap_entry_t *entry = &task_pid_map.buckets[i];
-            if (!hashmap_entry_is_occupied(entry))
-                continue;
-
-            task_t *task = (task_t *)entry->value;
-            if (!membarrier_task_matches_mm(task, mm, self))
-                continue;
-
-            if (task->cpu_id < cpu_count && task->cpu_id < MAX_CPU_NUM)
-                cpu_targets[task->cpu_id] = true;
-        }
-    }
-    spin_unlock(&task_queue_lock);
+    for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM; cpu++)
+        cpu_targets[cpu] = cpu != self_cpu && task_mm_cpu_active(mm, cpu);
 }
 
-static bool membarrier_private_expedited_wait(task_mm_info_t *mm, task_t *self,
+static bool membarrier_private_expedited_wait(task_mm_info_t *mm,
                                               uint64_t seq) {
     bool cpu_targets[MAX_CPU_NUM];
-    membarrier_collect_target_cpus(mm, self, cpu_targets);
+    membarrier_collect_target_cpus(mm, current_cpu_id, cpu_targets);
 
     for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM; cpu++) {
         if (cpu_targets[cpu])
@@ -318,26 +299,21 @@ static bool membarrier_private_expedited_wait(task_mm_info_t *mm, task_t *self,
     while (true) {
         bool pending = false;
 
-        spin_lock(&task_queue_lock);
-        if (task_pid_map.buckets) {
-            for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-                hashmap_entry_t *entry = &task_pid_map.buckets[i];
-                if (!hashmap_entry_is_occupied(entry))
-                    continue;
+        for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM; cpu++) {
+            if (!cpu_targets[cpu])
+                continue;
+            if (!task_mm_cpu_active(mm, cpu)) {
+                cpu_targets[cpu] = false;
+                continue;
+            }
 
-                task_t *task = (task_t *)entry->value;
-                if (!membarrier_task_matches_mm(task, mm, self))
-                    continue;
-
-                uint64_t seen = __atomic_load_n(&task->membarrier_seen_seq,
-                                                __ATOMIC_ACQUIRE);
-                if (seen < seq) {
-                    pending = true;
-                    break;
-                }
+            uint64_t seen = __atomic_load_n(&mm->membarrier_cpu_seen_seq[cpu],
+                                            __ATOMIC_ACQUIRE);
+            if (seen < seq) {
+                pending = true;
+                break;
             }
         }
-        spin_unlock(&task_queue_lock);
 
         if (!pending)
             return true;
@@ -345,7 +321,9 @@ static bool membarrier_private_expedited_wait(task_mm_info_t *mm, task_t *self,
         if ((++spin_count & 0xfff) == 0) {
             for (uint32_t cpu = 0; cpu < cpu_count && cpu < MAX_CPU_NUM;
                  cpu++) {
-                if (cpu_targets[cpu])
+                if (cpu_targets[cpu] && task_mm_cpu_active(mm, cpu) &&
+                    __atomic_load_n(&mm->membarrier_cpu_seen_seq[cpu],
+                                    __ATOMIC_ACQUIRE) < seq)
                     irq_trigger_sched_ipi(cpu);
             }
         }
@@ -2332,11 +2310,8 @@ uint64_t sys_membarrier(int cmd, unsigned int flags, int cpu_id) {
 
         uint64_t seq = __atomic_add_fetch(&mm->membarrier_private_expedited_seq,
                                           1, __ATOMIC_ACQ_REL);
-        memory_barrier();
-        __atomic_store_n(&self->membarrier_seen_seq, seq, __ATOMIC_RELEASE);
-        return membarrier_private_expedited_wait(mm, self, seq)
-                   ? 0
-                   : (uint64_t)-EIO;
+        task_membarrier_checkpoint(self);
+        return membarrier_private_expedited_wait(mm, seq) ? 0 : (uint64_t)-EIO;
     }
 
     default:

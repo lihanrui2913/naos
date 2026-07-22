@@ -124,6 +124,14 @@ static uint64_t linux_sample_cpu_clock(clockid_t clock_id,
     uint64_t sample = 0;
     bool found = false;
 
+    if (!perthread && which != LINUX_CPUCLOCK_VIRT && current_task &&
+        task_effective_tgid(current_task) == target_id &&
+        current_task->signal && current_task->signal->cpu_account) {
+        *sample_ns = __atomic_load_n(
+            &current_task->signal->cpu_account->runtime_ns, __ATOMIC_RELAXED);
+        return 0;
+    }
+
     spin_lock(&task_queue_lock);
 
     if (perthread) {
@@ -132,15 +140,23 @@ static uint64_t linux_sample_cpu_clock(clockid_t clock_id,
             sample = linux_task_cpu_clock_sample(task, which);
             found = true;
         }
-    } else if (task_pid_map.buckets) {
-        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
-            hashmap_entry_t *entry = &task_pid_map.buckets[i];
-            if (entry->state != HASHMAP_ENTRY_OCCUPIED)
+    } else {
+        task_index_bucket_t *bucket =
+            task_index_bucket_lookup(&task_tgid_map, target_id);
+        struct llist_header *node = bucket ? bucket->tasks.next : NULL;
+        while (bucket && node != &bucket->tasks) {
+            task_t *task = list_entry(node, task_t, tgid_node);
+            node = node->next;
+            if (!task || task->state == TASK_DIED || !task->arch_context)
                 continue;
 
-            task_t *task = (task_t *)entry->value;
-            if (!task || task_effective_tgid(task) != target_id)
-                continue;
+            if (which != LINUX_CPUCLOCK_VIRT && task->signal &&
+                task->signal->cpu_account) {
+                sample = __atomic_load_n(&task->signal->cpu_account->runtime_ns,
+                                         __ATOMIC_RELAXED);
+                found = true;
+                break;
+            }
 
             sample += linux_task_cpu_clock_sample(task, which);
             found = true;
@@ -897,24 +913,7 @@ void syscall_handler_init() {
 
 static inline uint64_t syscall_account_running_ns(task_t *task,
                                                   uint64_t now_ns) {
-    if (!task || !task->last_sched_in_ns || now_ns <= task->last_sched_in_ns)
-        return 0;
-    uint64_t delta = now_ns - task->last_sched_in_ns;
-    task->user_time_ns += delta;
-    task->last_sched_in_ns = now_ns;
-    return delta;
-}
-
-static inline void syscall_charge_sched_runtime(task_t *task,
-                                                uint64_t delta_ns) {
-    if (!task || !delta_ns)
-        return;
-
-    bool irq_state = arch_interrupt_enabled();
-    arch_disable_interrupt();
-    sched_account_runtime(task, delta_ns);
-    if (irq_state)
-        arch_enable_interrupt();
+    return task_account_runtime_ns(task, now_ns);
 }
 
 void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
@@ -951,8 +950,7 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     uint64_t arg6 = regs->r9;
 
     if (self)
-        syscall_charge_sched_runtime(
-            self, syscall_account_running_ns(self, nano_time()));
+        syscall_account_running_ns(self, nano_time());
     uint64_t syscall_user_base = self ? self->user_time_ns : 0;
 
     if (idx >= MAX_SYSCALL_NUM) {
@@ -982,10 +980,8 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
 
 done:
     if (self) {
-        uint64_t syscall_kernel_delta =
-            syscall_account_running_ns(self, nano_time());
+        syscall_account_running_ns(self, nano_time());
 
-        syscall_charge_sched_runtime(self, syscall_kernel_delta);
         if (self->user_time_ns > syscall_user_base)
             self->system_time_ns += self->user_time_ns - syscall_user_base;
     }

@@ -3,9 +3,7 @@
 #include <libs/string_builder.h>
 
 typedef struct cgroup_assignment {
-    struct llist_header node;
     uint64_t pid;
-    cgroup_hierarchy_t *hierarchy;
     cgroup_t *cgroup;
 } cgroup_assignment_t;
 
@@ -15,6 +13,8 @@ struct cgroup_hierarchy {
     bool unified;
     char *controllers;
     cgroup_t *root;
+    /* PID lookups are on the task creation, exit and /proc hot paths. */
+    hashmap_t assignments;
 };
 
 struct cgroup {
@@ -32,7 +32,6 @@ static cgroup_hierarchy_t *cgroup_unified_hierarchy;
 static cgroup_t *cgroup_root_node;
 static uint64_t cgroup_next_hierarchy_id = 1;
 DEFINE_LLIST(cgroup_hierarchies);
-DEFINE_LLIST(cgroup_assignments);
 
 void cgroup_lock(void) { spin_lock(&cgroup_global_lock); }
 
@@ -128,6 +127,14 @@ cgroup_hierarchy_t *cgroup_register_hierarchy(const char *controllers,
         cgroup_unlock();
         return NULL;
     }
+    if (hashmap_init(&hierarchy->assignments, 64) < 0) {
+        if (hierarchy->root != cgroup_root_node)
+            cgroup_put(hierarchy->root);
+        free(hierarchy->controllers);
+        free(hierarchy);
+        cgroup_unlock();
+        return NULL;
+    }
 
     llist_init_head(&hierarchy->node);
     llist_append(&cgroup_hierarchies, &hierarchy->node);
@@ -214,13 +221,9 @@ void cgroup_set_frozen(cgroup_t *cgroup, bool frozen) {
 
 static cgroup_assignment_t *
 cgroup_find_assignment_locked(uint64_t pid, cgroup_hierarchy_t *hierarchy) {
-    cgroup_assignment_t *entry, *tmp;
-
-    llist_for_each(entry, tmp, &cgroup_assignments, node) {
-        if (entry->pid == pid && entry->hierarchy == hierarchy)
-            return entry;
-    }
-    return NULL;
+    return hierarchy ? (cgroup_assignment_t *)hashmap_get(
+                           &hierarchy->assignments, pid)
+                     : NULL;
 }
 
 static cgroup_t *
@@ -266,7 +269,7 @@ int cgroup_attach_task_pid_locked(uint64_t pid, cgroup_t *cgroup) {
     if (!cgroup || cgroup == cgroup_hierarchy_root(hierarchy)) {
         if (!entry)
             return 0;
-        llist_delete(&entry->node);
+        hashmap_remove(&hierarchy->assignments, pid);
         free(entry);
         return 0;
     }
@@ -281,10 +284,11 @@ int cgroup_attach_task_pid_locked(uint64_t pid, cgroup_t *cgroup) {
         return -ENOMEM;
 
     entry->pid = pid;
-    entry->hierarchy = hierarchy;
     entry->cgroup = cgroup;
-    llist_init_head(&entry->node);
-    llist_append(&cgroup_assignments, &entry->node);
+    if (hashmap_put(&hierarchy->assignments, pid, entry) < 0) {
+        free(entry);
+        return -ENOMEM;
+    }
     return 0;
 }
 
@@ -314,12 +318,12 @@ void cgroup_on_exit_task(task_t *task) {
         return;
 
     cgroup_lock();
-    cgroup_assignment_t *entry, *tmp;
-    llist_for_each(entry, tmp, &cgroup_assignments, node) {
-        if (entry->pid != task->pid)
-            continue;
-        llist_delete(&entry->node);
-        free(entry);
+    cgroup_hierarchy_t *hierarchy, *tmp;
+    llist_for_each(hierarchy, tmp, &cgroup_hierarchies, node) {
+        cgroup_assignment_t *entry =
+            hashmap_remove(&hierarchy->assignments, task->pid);
+        if (entry)
+            free(entry);
     }
     cgroup_unlock();
 }
@@ -403,7 +407,6 @@ char *cgroup_task_proc_text(task_t *task) {
 void cgroup_init(void) {
     spin_init(&cgroup_global_lock);
     llist_init_head(&cgroup_hierarchies);
-    llist_init_head(&cgroup_assignments);
     cgroup_root_node = cgroup_create(NULL, "");
     ASSERT(cgroup_root_node);
     ASSERT(cgroup_register_hierarchy(NULL, true));

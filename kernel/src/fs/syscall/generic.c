@@ -3068,7 +3068,7 @@ static uint64_t dup_to_free_slot(task_t *self, uint64_t fd, uint64_t start,
         uint64_t i;
         size_t limit =
             MIN(fd_info->max_fds, self->rlim[RLIMIT_NOFILE].rlim_cur);
-        for (i = start; i < limit; i++) {
+        for (i = MAX(start, fd_info->next_fd); i < limit; i++) {
             if (!fd_info->fds[i].file)
                 break;
         }

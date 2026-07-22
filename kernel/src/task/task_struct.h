@@ -107,7 +107,9 @@ typedef struct kernel_timer {
 
 #define MAX_TIMERS_NUM 8
 
-#define MAX_FD_NUM 512
+#define FD_TABLE_INITIAL_SIZE 64
+#define DEFAULT_NOFILE_LIMIT 1024
+#define MAX_FD_NUM 131072
 #define MAX_SHM_NUM 32
 
 typedef struct fd_entry {
@@ -124,6 +126,7 @@ typedef struct signalfd_ref {
 typedef struct fd_info {
     fd_entry_t *fds;
     size_t max_fds;
+    size_t next_fd;
     struct llist_header signalfd_refs;
     spinlock_t fdt_lock;
     volatile int ref_count;
@@ -304,6 +307,11 @@ typedef struct pending_signal {
     siginfo_t info[MAXSIG];
 } pending_signal_t;
 
+typedef struct task_cpu_account {
+    volatile uint64_t runtime_ns;
+    volatile int ref_count;
+} task_cpu_account_t;
+
 typedef struct task_sighand {
     spinlock_t siglock;
     int ref_count;
@@ -320,6 +328,7 @@ typedef struct task_signal_info {
     uint8_t sigsuspend_active;
     stack_t altstack;
     task_sighand_t *sighand;
+    task_cpu_account_t *cpu_account;
 } task_signal_info_t;
 
 typedef struct task_keyring task_keyring_t;
@@ -332,6 +341,7 @@ typedef struct task {
     struct llist_header free_node;
     struct llist_header parent_node;
     struct llist_header pgid_node;
+    struct llist_header tgid_node;
     struct llist_header tick_work_node;
     uint64_t pid;
     struct task *parent;

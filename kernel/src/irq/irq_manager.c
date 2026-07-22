@@ -12,6 +12,7 @@ irq_action_t actions[ARCH_MAX_IRQ_NUM] = {0};
 irq_ipi_send_fn_t ipi_send_fns[ARCH_MAX_IRQ_NUM] = {0};
 uint64_t sched_ipi_irq = ARCH_MAX_IRQ_NUM;
 static uint64_t irq_counts[MAX_CPU_NUM][ARCH_MAX_IRQ_NUM] = {0};
+static bool sched_ipi_pending[MAX_CPU_NUM] = {0};
 static uint64_t irq = IRQ_ALLOCATE_NUM_BASE;
 static spinlock_t irq_lock = SPIN_INIT;
 
@@ -35,6 +36,12 @@ void do_irq(struct pt_regs *regs, uint64_t irq_num) {
     uint64_t cpu_id = current_cpu_id;
     uint64_t stat_cpu = cpu_id < MAX_CPU_NUM ? cpu_id : 0;
     __atomic_fetch_add(&irq_counts[stat_cpu][irq_num], 1, __ATOMIC_RELAXED);
+
+    /* Clear before processing the request. A concurrent producer either sees
+     * the old pending request, whose handler will observe its state, or sends
+     * a fresh IPI after this point. */
+    if (irq_is_sched_ipi(irq_num))
+        __atomic_store_n(&sched_ipi_pending[stat_cpu], false, __ATOMIC_RELEASE);
 
     irq_action_t *action = &actions[irq_num];
 
@@ -155,10 +162,18 @@ void irq_set_sched_ipi(uint64_t irq_num) {
 
 bool irq_trigger_sched_ipi(uint32_t cpu_id) {
     uint64_t irq_num = __atomic_load_n(&sched_ipi_irq, __ATOMIC_ACQUIRE);
-    if (irq_num >= ARCH_MAX_IRQ_NUM)
+    if (irq_num >= ARCH_MAX_IRQ_NUM || cpu_id >= cpu_count ||
+        cpu_id >= MAX_CPU_NUM || cpu_id == current_cpu_id)
         return false;
 
-    return irq_send_ipi(cpu_id, irq_num);
+    if (__atomic_exchange_n(&sched_ipi_pending[cpu_id], true, __ATOMIC_ACQ_REL))
+        return true;
+
+    if (irq_send_ipi(cpu_id, irq_num))
+        return true;
+
+    __atomic_store_n(&sched_ipi_pending[cpu_id], false, __ATOMIC_RELEASE);
+    return false;
 }
 
 bool irq_is_registered(uint64_t irq_num) {

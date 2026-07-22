@@ -14,6 +14,7 @@ struct sched_entity {
     uint64_t deadline;
     uint64_t slice_ns;
     uint64_t exec_start_ns;
+    uint64_t account_start_ns;
     uint64_t subtree_min_vruntime;
     bool on_rq;
 };
@@ -25,6 +26,7 @@ typedef struct sched_rq {
     uint64_t min_vruntime;
     uint64_t load_weight;
     size_t nr_running;
+    size_t nr_running_snapshot;
     size_t nr_queued;
     bool cleanup_queued;
     spinlock_t lock;
@@ -32,9 +34,8 @@ typedef struct sched_rq {
 
 void add_sched_entity(task_t *task, sched_rq_t *scheduler);
 void add_sched_entity_wakeup(task_t *task, sched_rq_t *scheduler);
-void sched_balance_wakeup(task_t *task);
 void remove_sched_entity(task_t *task, sched_rq_t *scheduler);
-void sched_account_runtime(task_t *task, uint64_t delta_ns);
+void sched_account_runtime_until(task_t *task, uint64_t now_ns);
 void sched_set_task_nice(task_t *task, int niceval);
 bool sched_should_preempt(sched_rq_t *scheduler, task_t *curr_task,
                           uint64_t now_ns);
@@ -46,3 +47,4 @@ task_t *sched_pick_next_task(sched_rq_t *scheduler);
 task_t *sched_pick_next_task_excluding(sched_rq_t *scheduler, task_t *excluded);
 size_t sched_rq_nr_running(sched_rq_t *scheduler);
 size_t sched_rq_nr_queued(sched_rq_t *scheduler);
+size_t sched_rq_nr_running_snapshot(sched_rq_t *scheduler);

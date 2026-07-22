@@ -414,6 +414,16 @@ static int lwip_socket_bind_netif(lwip_socket_state_t *sock,
     }
 
     LOCK_TCPIP_CORE();
+    /*
+     * A netconn can outlive its PCB after an asynchronous close or reset.
+     * The PCB must be checked while holding the core lock: checking it before
+     * taking the lock would still race with the tcpip thread clearing it.
+     */
+    if (!sock->conn->pcb.ip) {
+        ret = -EINVAL;
+        goto out;
+    }
+
     switch (NETCONNTYPE_GROUP(netconn_type(sock->conn))) {
     case NETCONN_TCP:
         tcp_bind_netif(sock->conn->pcb.tcp, netif);
@@ -428,6 +438,7 @@ static int lwip_socket_bind_netif(lwip_socket_state_t *sock,
         ret = -EOPNOTSUPP;
         break;
     }
+out:
     UNLOCK_TCPIP_CORE();
 
     return ret;
@@ -983,14 +994,18 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
             if (optlen < sizeof(int)) {
                 return -EINVAL;
             }
-            sock->reuseaddr = value ? true : false;
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             if (value) {
                 ip_set_option(sock->conn->pcb.ip, SOF_REUSEADDR);
             } else {
                 ip_reset_option(sock->conn->pcb.ip, SOF_REUSEADDR);
             }
             UNLOCK_TCPIP_CORE();
+            sock->reuseaddr = value ? true : false;
             return 0;
         case SO_REUSEPORT:
             if (optlen < sizeof(int)) {
@@ -1002,27 +1017,35 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
             if (optlen < sizeof(int)) {
                 return -EINVAL;
             }
-            sock->keepalive = value ? true : false;
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             if (value) {
                 ip_set_option(sock->conn->pcb.ip, SOF_KEEPALIVE);
             } else {
                 ip_reset_option(sock->conn->pcb.ip, SOF_KEEPALIVE);
             }
             UNLOCK_TCPIP_CORE();
+            sock->keepalive = value ? true : false;
             return 0;
         case SO_BROADCAST:
             if (optlen < sizeof(int)) {
                 return -EINVAL;
             }
-            sock->broadcast = value ? true : false;
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             if (value) {
                 ip_set_option(sock->conn->pcb.ip, SOF_BROADCAST);
             } else {
                 ip_reset_option(sock->conn->pcb.ip, SOF_BROADCAST);
             }
             UNLOCK_TCPIP_CORE();
+            sock->broadcast = value ? true : false;
             return 0;
         case SO_DONTROUTE:
             if (optlen < sizeof(int)) {
@@ -1141,6 +1164,10 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
                 return -EINVAL;
             }
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             sock->conn->pcb.ip->ttl = (u8_t)value;
             UNLOCK_TCPIP_CORE();
             return 0;
@@ -1149,6 +1176,10 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
                 return -EINVAL;
             }
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             sock->conn->pcb.ip->tos = (u8_t)value;
             UNLOCK_TCPIP_CORE();
             return 0;
@@ -1206,6 +1237,10 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
         }
 
         LOCK_TCPIP_CORE();
+        if (!sock->conn->pcb.tcp) {
+            UNLOCK_TCPIP_CORE();
+            return -EINVAL;
+        }
         switch (optname) {
         case TCP_NODELAY:
             if (value) {
@@ -1246,6 +1281,10 @@ static int lwip_socket_setsockopt_impl(lwip_socket_state_t *sock, int level,
                 return -EINVAL;
             }
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             sock->conn->pcb.ip->ttl = (u8_t)value;
             UNLOCK_TCPIP_CORE();
             return 0;
@@ -1388,11 +1427,19 @@ static int lwip_socket_getsockopt_impl(lwip_socket_state_t *sock, int level,
         switch (optname) {
         case IP_TTL:
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             value = sock->conn->pcb.ip->ttl;
             UNLOCK_TCPIP_CORE();
             break;
         case IP_TOS:
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             value = sock->conn->pcb.ip->tos;
             UNLOCK_TCPIP_CORE();
             break;
@@ -1436,6 +1483,10 @@ static int lwip_socket_getsockopt_impl(lwip_socket_state_t *sock, int level,
         }
 
         LOCK_TCPIP_CORE();
+        if (!sock->conn->pcb.tcp) {
+            UNLOCK_TCPIP_CORE();
+            return -EINVAL;
+        }
         switch (optname) {
         case TCP_NODELAY:
             *(int *)optval = tcp_nagle_disabled(sock->conn->pcb.tcp);
@@ -1470,6 +1521,10 @@ static int lwip_socket_getsockopt_impl(lwip_socket_state_t *sock, int level,
             break;
         case IPV6_UNICAST_HOPS:
             LOCK_TCPIP_CORE();
+            if (!sock->conn->pcb.ip) {
+                UNLOCK_TCPIP_CORE();
+                return -EINVAL;
+            }
             value = sock->conn->pcb.ip->ttl;
             UNLOCK_TCPIP_CORE();
             break;
